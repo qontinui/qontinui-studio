@@ -62,7 +62,9 @@ Publication is safe against failures, crashes and concurrent runs:
   live is refused (`already_live`).
 - **D7 runs on a preview of this batch, before anything goes live.** A site
   declares `ui_bridge_url`, `preview_url`, `preview_dir` and
-  `preview_manifest_url`, all four or none:
+  `preview_manifest_url`, all four or none, and none of them with a `#fragment`.
+  A hash-routed preview URL would put D7's batch and attempt binding inside
+  the fragment, where navigation is a same-document change.
   - `ui_bridge_url` is the `/control/*` prefix of the UI Bridge in the browser
     showing the preview. The preview page must run the UI Bridge React
     auto-registration provider with media discovery on. An injected/seeded

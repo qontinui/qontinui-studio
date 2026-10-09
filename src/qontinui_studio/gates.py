@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -281,10 +281,10 @@ def preview_target(site: Site, batch_id: str, attempt: str) -> str:
     loaded THIS attempt — a tab still showing an earlier attempt's document
     for the same batch never matches."""
     assert site.preview_url is not None
-    sep = "&" if "?" in site.preview_url else "?"
-    return (
-        f"{site.preview_url}{sep}{urlencode({'studio_batch': batch_id, 'studio_attempt': attempt})}"
-    )
+    parts = urlsplit(site.preview_url)
+    params = urlencode({"studio_batch": batch_id, "studio_attempt": attempt})
+    query = f"{parts.query}&{params}" if parts.query else params
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -320,7 +320,10 @@ def same_page(actual: str | None, target: str) -> bool:
         return False
     if normalise_url(actual) != normalise_url(target):
         return False
-    got, want = parse_qs(urlparse(actual).query), parse_qs(urlparse(target).query)
+    a, t = urlparse(actual), urlparse(target)
+    if a.fragment != t.fragment:
+        return False
+    got, want = parse_qs(a.query), parse_qs(t.query)
     return all(got.get(k) == want.get(k) for k in ("studio_batch", "studio_attempt"))
 
 

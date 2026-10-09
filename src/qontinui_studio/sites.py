@@ -225,6 +225,16 @@ class Site(BaseModel):
                 raise ValueError(why)
         if self.preview_url and urlparse(self.preview_url).scheme not in ("http", "https"):
             raise ValueError(f"preview_url must be an http(s) URL, got '{self.preview_url}'")
+        for field_name in ("ui_bridge_url", "preview_url", "preview_manifest_url"):
+            value = getattr(self, field_name)
+            if value and "#" in value:
+                # A hash-routed URL puts D7's batch/attempt binding inside the
+                # fragment: navigation becomes a same-document change that keeps
+                # the old DOM, and the query D7 checks is empty.
+                raise ValueError(
+                    f"{field_name} must not contain a #fragment (got '{value}'); D7 binds "
+                    "the preview to a batch through the real query string"
+                )
         if self.preview_dir is not None:
             preview, live = self.preview_dir.resolve(), self.publish_dir.resolve()
             if preview == live or preview.is_relative_to(live) or live.is_relative_to(preview):

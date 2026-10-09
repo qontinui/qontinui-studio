@@ -189,3 +189,62 @@ def test_r8_slot_names_cannot_make_media_ids_collide() -> None:
     names = ["hero", "hero-img", "img-hero", "picture-hero", "og", "picture", "img"]
     ids = [mid for n in names for mid in slot_media_ids(n)]
     assert len(ids) == len(set(ids))
+
+
+# ---- ninth review ----------------------------------------------------------------
+
+
+def test_r9_fragment_urls_are_refused(tmp_path: Path) -> None:
+    import pytest as _pytest
+
+    from qontinui_studio.sites import Site
+
+    base = {
+        "id": "spa",
+        "name": "SPA",
+        "kind": "demo",
+        "commercial": False,
+        "publish_dir": str(tmp_path / "live"),
+        "preview_dir": str(tmp_path / "preview"),
+        "ui_bridge_url": "http://preview.test/__ui-bridge",
+        "preview_url": "http://preview.test/app/",
+        "preview_manifest_url": "http://preview.test/app/studio-manifest.json",
+        "slots": {"hero": {"width": 64, "height": 36}},
+    }
+    assert Site.model_validate(base)
+    for field_name, value in (
+        ("preview_url", "http://preview.test/app/#/home"),
+        ("preview_manifest_url", "http://preview.test/app/studio-manifest.json#x"),
+        ("ui_bridge_url", "http://preview.test/__ui-bridge#x"),
+    ):
+        with _pytest.raises(ValueError, match="must not contain a #fragment"):
+            Site.model_validate({**base, field_name: value})
+
+
+def test_r9_target_params_land_in_the_query_and_fragments_must_match(tmp_path: Path) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    from qontinui_studio import gates
+    from qontinui_studio.sites import Site
+
+    site = Site.model_validate(
+        {
+            "id": "s",
+            "name": "s",
+            "kind": "demo",
+            "commercial": False,
+            "publish_dir": str(tmp_path / "live"),
+            "preview_dir": str(tmp_path / "preview"),
+            "ui_bridge_url": "http://preview.test/__ui-bridge",
+            "preview_url": "http://preview.test/app/?lang=de",
+            "preview_manifest_url": "http://preview.test/app/studio-manifest.json",
+            "slots": {"hero": {"width": 64, "height": 36}},
+        }
+    )
+    target = gates.preview_target(site, "B", "new")
+    q = parse_qs(urlparse(target).query)
+    assert q == {"lang": ["de"], "studio_batch": ["B"], "studio_attempt": ["new"]}
+    assert gates.same_page(target, target)
+    assert not gates.same_page(target + "#other", target)
+    stale = "http://preview.test/app/?lang=de&studio_batch=A&studio_attempt=old"
+    assert not gates.same_page(stale, target)
