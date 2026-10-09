@@ -226,8 +226,13 @@ class Bridge:
 SHA = "a" * 64
 
 
-def _img(src: str, width: int = 1600, state: str = "loaded") -> dict[str, object]:
-    return {"mediaMetadata": {"src": src, "naturalWidth": width, "loadingState": state}}
+def _img(
+    src: str, width: int = 1600, state: str = "loaded", mid: str = "studio-hero"
+) -> dict[str, object]:
+    return {
+        "id": mid,
+        "mediaMetadata": {"src": src, "naturalWidth": width, "loadingState": state},
+    }
 
 
 def _run(site: Site, bridge: Bridge, files: dict[str, dict[str, str]], fetch=None):  # type: ignore[no-untyped-def]
@@ -248,7 +253,8 @@ def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
     files = {"hero": {"hero.webp": SHA}}
     good = Bridge("same", [_img(f"/hero.webp?sha={SHA}")])
     assert [g.outcome for g in _run(site, good, files)] == ["pass", "pass", "pass"]
-    assert good.navigated == ["http://127.0.0.1:3000/index.html?studio_batch=batch-1"]
+    [nav] = good.navigated
+    assert nav.startswith("http://127.0.0.1:3000/index.html?studio_batch=batch-1&studio_attempt=")
 
     stale = Bridge(None, [_img(f"/hero.webp?sha={SHA}")])  # the tab never moved
     [nav] = _run(site, stale, files)
@@ -258,7 +264,10 @@ def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
     assert _run(site, broken, files)[-1].failed
     missing = Bridge("same", [_img(f"/other.webp?sha={SHA}")])
     last = _run(site, missing, files)[-1]
-    assert last.failed and "not rendered" in last.detail
+    assert last.failed and "not one of the slot's files" in last.detail
+    nothing = Bridge("same", [_img(f"/hero.webp?sha={SHA}", mid="img-illustrative")])
+    last = _run(site, nothing, files)[-1]
+    assert last.failed and 'data-media-id="studio-hero"' in last.detail
 
 
 @pytest.mark.parametrize(
@@ -311,11 +320,14 @@ def test_d7_images_must_come_from_the_preview_with_this_batchs_sha() -> None:
         ],
     }
     g = d7_images(site, snap, files, lambda u: b"")
-    assert g.failed and "not rendered from the preview" in g.detail
+    assert g.failed and "not one of the slot's files on the preview" in g.detail
     snap["elements"] = [_img(f"/hero.webp?sha={SHA}")]  # avif missing
     g = d7_images(site, snap, files, lambda u: b"")
     assert g.failed and "hero.avif" in g.detail
-    snap["elements"] = [_img("/hero.webp?sha=" + "c" * 64), _img("/hero.avif?sha=" + "b" * 64)]
+    snap["elements"] = [
+        _img("/hero.webp?sha=" + "c" * 64),
+        _img("/hero.avif?sha=" + "b" * 64, mid="studio-hero-img"),
+    ]
     g = d7_images(site, snap, files, lambda u: b"")
     assert g.failed and "not this batch's hero.webp" in g.detail
 

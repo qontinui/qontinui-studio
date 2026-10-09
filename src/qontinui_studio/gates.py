@@ -14,6 +14,7 @@ import hashlib
 import posixpath
 import re
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -228,8 +229,9 @@ class BridgeError(Exception):
 
 class HttpUiBridge:
     """The UI Bridge control API over HTTP. ``base_url`` is the prefix the
-    ``/control/*`` routes hang off, e.g. ``http://127.0.0.1:3000/__ui-bridge``
-    for the injection proxy in front of a preview server."""
+    ``/control/*`` routes hang off for the bridge of the browser showing the
+    preview; the preview page must run the React auto-registration provider
+    with media discovery (an injected bridge registers no media)."""
 
     def __init__(self, base_url: str, http: httpx.Client | None = None) -> None:
         self.base = base_url.rstrip("/")
@@ -266,12 +268,16 @@ class HttpUiBridge:
         return self._body(self.http.post(f"{self.base}/control/page-health"))
 
 
-def preview_target(site: Site, batch_id: str) -> str:
-    """The preview URL for one batch: the batch id rides in the query string,
-    so the bridged page's own URL proves which batch it loaded."""
+def preview_target(site: Site, batch_id: str, attempt: str) -> str:
+    """The preview URL for one D7 attempt: the batch id AND a fresh attempt
+    token ride in the query string, so the bridged page's own URL proves it
+    loaded THIS attempt — a tab still showing an earlier attempt's document
+    for the same batch never matches."""
     assert site.preview_url is not None
     sep = "&" if "?" in site.preview_url else "?"
-    return f"{site.preview_url}{sep}{urlencode({'studio_batch': batch_id})}"
+    return (
+        f"{site.preview_url}{sep}{urlencode({'studio_batch': batch_id, 'studio_attempt': attempt})}"
+    )
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -300,14 +306,15 @@ def origin(url: str) -> tuple[str, str, int | None]:
     return scheme, host, port
 
 
-def same_page(actual: str | None, target: str, batch_id: str) -> bool:
-    """Whether the bridged page's URL is this batch's preview: same origin and
-    path (browser-normalised) and ``studio_batch`` = this batch."""
+def same_page(actual: str | None, target: str) -> bool:
+    """Whether the bridged page's URL is ``target``: same origin and path
+    (browser-normalised) and the same ``studio_batch`` and ``studio_attempt``."""
     if not actual:
         return False
     if normalise_url(actual) != normalise_url(target):
         return False
-    return parse_qs(urlparse(actual).query).get("studio_batch") == [batch_id]
+    got, want = parse_qs(urlparse(actual).query), parse_qs(urlparse(target).query)
+    return all(got.get(k) == want.get(k) for k in ("studio_batch", "studio_attempt"))
 
 
 def _current_url(snapshot: dict[str, Any]) -> str | None:
@@ -316,30 +323,66 @@ def _current_url(snapshot: dict[str, Any]) -> str | None:
     return url if isinstance(url, str) else None
 
 
-def _media(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
+def slot_media_ids(slot: str) -> tuple[str, str]:
+    """The ``data-media-id`` a site template gives a studio slot's ``<picture>``
+    and its ``<img>``. UI Bridge's ``generateMediaId`` honours an explicit
+    ``data-media-id`` first; without it, ids come from the alt text (the same
+    site-wide label on every slot) or sibling index and COLLIDE, and the
+    registry silently drops every duplicate — so D7 identifies slots by these
+    ids, never by guessing from file names."""
+    return f"studio-{slot}", f"studio-{slot}-img"
+
+
+def _media(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Media elements by id."""
+    out: dict[str, dict[str, Any]] = {}
     for element in snapshot.get("elements") or []:
-        meta = element.get("mediaMetadata") if isinstance(element, dict) else None
-        if isinstance(meta, dict) and isinstance(meta.get("src"), str):
-            out.append(meta)
+        if not isinstance(element, dict):
+            continue
+        meta = element.get("mediaMetadata")
+        if isinstance(meta, dict) and isinstance(element.get("id"), str):
+            out[element["id"]] = meta
     return out
 
 
+NO_MEDIA = (
+    "the preview's UI Bridge reports no media elements at all; D7 needs the React "
+    "auto-registration provider with media discovery (an injected/seeded bridge "
+    "registers interactive elements only)"
+)
+
+
 def _slot_elements(
-    site: Site, page_url: str, media: list[dict[str, Any]], files: dict[str, str]
-) -> list[tuple[dict[str, Any], str, list[str] | None]]:
-    """(element, file name, ?sha= values) for every media element whose source
-    resolves under the preview's origin and names one of ``files``."""
+    site: Site, page_url: str, media: dict[str, dict[str, Any]], slot: str, files: dict[str, str]
+) -> tuple[list[tuple[str, dict[str, Any], str | None, list[str] | None]], list[str]]:
+    """The slot's elements, found by ``data-media-id``: (id, metadata, file
+    name or None when the source is not one of the slot's files on the preview
+    origin, ?sha= values). Also returns the problems seen while matching."""
     assert site.preview_url is not None
     preview_origin = origin(site.preview_url)
-    found = []
-    for m in media:
-        src = urljoin(page_url, m["src"])
+    picture_id, img_id = slot_media_ids(slot)
+    found: list[tuple[str, dict[str, Any], str | None, list[str] | None]] = []
+    problems: list[str] = []
+    for mid in (picture_id, img_id):
+        meta = media.get(mid)
+        if meta is None:
+            continue
+        src_raw = meta.get("src")
+        if not isinstance(src_raw, str):
+            found.append((mid, meta, None, None))
+            continue
+        src = urljoin(page_url, src_raw)
         parsed = urlparse(src)
         name = PurePosixPath(parsed.path).name
-        if origin(src) == preview_origin and name in files:
-            found.append((m, name, parse_qs(parsed.query).get("sha")))
-    return found
+        if origin(src) != preview_origin or name not in files:
+            problems.append(
+                f"slot '{slot}' element '{mid}' shows {src_raw}, which is not one of the "
+                f"slot's files on the preview ({site.preview_url})"
+            )
+            found.append((mid, meta, None, None))
+            continue
+        found.append((mid, meta, name, parse_qs(parsed.query).get("sha")))
+    return found, problems
 
 
 def _srcset_urls(meta: dict[str, Any]) -> list[str]:
@@ -373,8 +416,8 @@ def images_settled(
     for slot, files in slot_files.items():
         if not site.slots[slot].rendered:
             continue
-        found = _slot_elements(site, page_url, media, files)
-        if not found or any(m.get("loadingState") == "pending" for m, _, _ in found):
+        found, _ = _slot_elements(site, page_url, media, slot, files)
+        if not found or any(m.get("loadingState") == "pending" for _, m, _, _ in found):
             return False
     return True
 
@@ -425,28 +468,43 @@ def d7_images(
     page_url = _current_url(snapshot) or site.preview_url
     media = _media(snapshot)
     problems: list[str] = []
+    if any(site.slots[slot].rendered for slot in slot_files) and not media:
+        return GateResult("d7_images", subject, "fail", NO_MEDIA)
     for slot, files in sorted(slot_files.items()):
         to_fetch = dict(files)
         if site.slots[slot].rendered:
-            found = _slot_elements(site, page_url, media, files)
+            found, matched_problems = _slot_elements(site, page_url, media, slot, files)
+            problems += matched_problems
+            if not found:
+                picture_id, img_id = slot_media_ids(slot)
+                problems.append(
+                    f"slot '{slot}' is not on the preview page: no element with "
+                    f'data-media-id="{picture_id}" or "{img_id}"'
+                )
+                continue
             shown_ok = False
-            for m, name, tag in found:
+            for mid, m, name, tag in found:
+                if name is None:
+                    continue
                 state = m.get("loadingState")
                 if tag != [files[name]]:
-                    problems.append(f"slot '{slot}' {m['src']} is not this batch's {name} (?sha=)")
+                    problems.append(
+                        f"slot '{slot}' element '{mid}' shows {m['src']}, not this batch's "
+                        f"{name} (?sha=)"
+                    )
                 elif state == "lazy":
                     problems.append(
-                        f"slot '{slot}' image {m['src']} is lazy-loaded; studio slots must be "
+                        f"slot '{slot}' element '{mid}' is lazy-loaded; studio slots must be "
                         'rendered with loading="eager" so D7 can see them load'
                     )
                 elif state == "pending":
-                    problems.append(f"slot '{slot}' image {m['src']} did not finish loading")
+                    problems.append(f"slot '{slot}' element '{mid}' did not finish loading")
                 elif (
                     not (isinstance(m.get("naturalWidth"), int | float) and m["naturalWidth"] > 0)
                     or state != "loaded"
                 ):
                     problems.append(
-                        f"slot '{slot}' image {m['src']} did not load "
+                        f"slot '{slot}' element '{mid}' ({m['src']}) did not load "
                         f"(naturalWidth={m.get('naturalWidth')}, state={state})"
                     )
                 else:
@@ -461,12 +519,6 @@ def d7_images(
                         problems.append(
                             f"slot '{slot}' source {url} is not this batch's {sname} (?sha=)"
                         )
-            if not found:
-                problems.append(
-                    f"slot '{slot}' ({', '.join(sorted(files))}) is not rendered from the "
-                    f"preview ({site.preview_url}) — maybe served from another host, or not at all"
-                )
-                continue
             if not shown_ok:
                 continue
         for name, sha in sorted(to_fetch.items()):
@@ -500,7 +552,7 @@ def d7_preview_page(
     subject = f"site {site.id}"
     if not (site.ui_bridge_url and site.preview_url):
         return [d7_page_health(site)]
-    target = preview_target(site, batch_id)
+    target = preview_target(site, batch_id, uuid.uuid4().hex)
     stop = monotonic() + deadline_s
     bridge: UiBridge | None = None
     navigated = False
@@ -516,7 +568,7 @@ def d7_preview_page(
                 navigated = True
             snap = bridge.snapshot()
             seen = _current_url(snap)
-            if same_page(seen, target, batch_id):
+            if same_page(seen, target):
                 before = snap
                 break
         except Exception as e:  # e.g. the tab is re-registering after navigation
@@ -544,7 +596,7 @@ def d7_preview_page(
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
         else:
-            if not same_page(_current_url(snap), target, batch_id):
+            if not same_page(_current_url(snap), target):
                 results.append(
                     GateResult(
                         "d7_navigate",

@@ -164,7 +164,9 @@ def test_d7_runs_on_the_preview_before_anything_goes_live(
     out = run_brief(ctx, write_brief())
     assert out.status == "published", out.publish and out.publish.failures
     assert seen["live_exists"] is False
-    assert seen["url"] == f"http://preview.test/cafe/index.html?studio_batch={out.batch_id}"
+    assert str(seen["url"]).startswith(
+        f"http://preview.test/cafe/index.html?studio_batch={out.batch_id}&studio_attempt="
+    )
     shown = seen["preview"]
     assert isinstance(shown, dict) and shown["slots"]["hero"]["batch_id"] == out.batch_id
     assert out.publish is not None

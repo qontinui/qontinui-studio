@@ -64,8 +64,10 @@ Publication is safe against failures, crashes and concurrent runs:
   declares `ui_bridge_url`, `preview_url`, `preview_dir` and
   `preview_manifest_url`, all four or none:
   - `ui_bridge_url` is the `/control/*` prefix of the UI Bridge in the browser
-    showing the preview, e.g. the injection proxy in front of the preview
-    server. Ports 9875 and 9876 (the supervisor's and runner's own UIs) are
+    showing the preview. The preview page must run the UI Bridge React
+    auto-registration provider with media discovery on. An injected/seeded
+    bridge registers interactive elements only, so it reports no media and D7
+    refuses it with that message. Ports 9875 and 9876 (the supervisor's and runner's own UIs) are
     refused on any host that is this machine. The host is judged exactly as
     httpx will request it, after IDNA normalisation (`127。0。0。1` becomes
     `127.0.0.1`), and then resolved. It is refused if it is local in any
@@ -76,8 +78,11 @@ Publication is safe against failures, crashes and concurrent runs:
   - The studio writes the live files, this batch's files and the merged
     manifest into `preview_dir`, and confirms the preview serves exactly that
     manifest (by sha256).
-  - It drives the bridge to `preview_url?studio_batch=<batch>` with
-    `POST /control/page/navigate`. It then polls `GET /control/snapshot` until
+  - It drives the bridge to
+    `preview_url?studio_batch=<batch>&studio_attempt=<fresh uuid>` with
+    `POST /control/page/navigate`. The attempt token changes on every D7 run,
+    including an unpublish restore's, so a tab still showing an earlier
+    attempt's document never matches. It then polls `GET /control/snapshot` until
     `page.url` is that page, or a 30 s deadline passes. A bridge error while
     the tab re-registers is retried.
   - URLs are compared as a browser reports them: lowercase scheme and host,
@@ -89,7 +94,15 @@ Publication is safe against failures, crashes and concurrent runs:
     page moving, until every changed slot's images have settled (loaded or
     failed). It then checks every changed slot. A browser renders a
     multi-format slot through `<picture>`, fetches ONE file, and the bridge
-    reports that image's `currentSrc`. So:
+    reports that image's `currentSrc`.
+
+    Slot elements are found by their `data-media-id`, never by file name:
+    `studio-<slot>` for the `<picture>` and `studio-<slot>-img` for the
+    `<img>`. UI Bridge's `generateMediaId` uses an explicit `data-media-id`
+    first. Without one, it derives the id from the alt text, which is the same
+    site-wide label on every slot, or from the sibling index. Those ids
+    collide, and the registry silently drops duplicates. A missing id is
+    refused by name. Then:
     - at least one image must show one of the slot's files from the preview's
       origin, carrying `?sha=<that file's sha256>` and loaded
       (`naturalWidth > 0`, `loadingState == "loaded"`);
@@ -145,12 +158,18 @@ Publication is safe against failures, crashes and concurrent runs:
 A site template renders each studio slot from `studio-manifest.json`:
 
 ```html
-<picture>
+<picture data-media-id="studio-hero">
   <source type="image/avif" srcset="hero.avif?sha={{ slots.hero.sha256.avif }}">
-  <img src="hero.webp?sha={{ slots.hero.sha256.webp }}" loading="eager"
+  <img data-media-id="studio-hero-img"
+       src="hero.webp?sha={{ slots.hero.sha256.webp }}" loading="eager"
        alt="{{ slots.hero.label }}">
 </picture>
 ```
+
+- Every slot's `<picture>` and `<img>` carry `data-media-id="studio-<slot>"`
+  and `data-media-id="studio-<slot>-img"`. D7 finds slots only by these ids.
+- The preview page runs the UI Bridge React auto-registration provider with
+  media discovery.
 
 - Every file URL carries `?sha=<sha256>` from the manifest. It busts caches,
   and D7 checks it.

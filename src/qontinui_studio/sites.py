@@ -168,11 +168,11 @@ class Site(BaseModel):
     # writes the site's live files plus the batch's files and merged manifest
     # into ``preview_dir``; a preview server serves that directory at
     # ``preview_url`` (the page) and ``preview_manifest_url`` (the manifest).
-    # The page is loaded in a browser carrying the UI Bridge (e.g. the
-    # injection proxy in front of the preview server); ``ui_bridge_url`` is the
-    # prefix its ``/control/*`` routes hang off, e.g.
-    # ``http://127.0.0.1:3000/__ui-bridge``. It must be the PREVIEW's bridge —
-    # never the runner's own UI (127.0.0.1:9876), which is refused.
+    # The page runs the UI Bridge React auto-registration provider with media
+    # discovery (an injected/seeded bridge registers no media, which D7
+    # refuses); ``ui_bridge_url`` is the prefix its ``/control/*`` routes hang
+    # off. It must be the PREVIEW's bridge — never the runner's or the
+    # supervisor's own UI (ports 9876/9875 on this machine), which is refused.
     # D7 is REQUIRED with no waiver: a site without all four is never published to.
     ui_bridge_url: str | None = None
     preview_url: str | None = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -207,6 +208,58 @@ def browser_href(url: str) -> str:
     return urlunsplit((scheme, host, norm, p.query, p.fragment))
 
 
+def slugify(text: str, max_length: int = 30) -> str:
+    """UI Bridge media-discovery.ts slugify."""
+    text = re.sub(r"[^a-z0-9\s-]", "", text.lower())
+    return re.sub(r"\s+", "-", text)[:max_length].rstrip("-")
+
+
+class DomNode:
+    """Just enough DOM for generateMediaId: a tag, its attributes, and its
+    parent's children (as tags) for the sibling/child-index fallbacks. (A plain
+    class: review harnesses load this file without registering the module,
+    which @dataclass cannot handle.)"""
+
+    def __init__(
+        self,
+        tag: str,
+        attrs: dict[str, str] | None = None,
+        parent: DomNode | None = None,
+        children: list[str] | None = None,
+    ) -> None:
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.parent = parent
+        self.children = children or []
+
+
+def generate_media_id(el: DomNode) -> str:
+    """A port of UI Bridge ``generateMediaId`` (media-discovery.ts): explicit
+    ``data-media-id`` first, then alt / aria-label / title, then the src file
+    name, then ancestor context (none here: plain sections), sibling index,
+    and finally the child index."""
+    explicit = el.attrs.get("data-media-id")
+    if explicit:
+        return explicit
+    prefix = "picture" if el.tag == "picture" else el.tag
+    for attr in ("alt", "aria-label", "title"):
+        value = el.attrs.get(attr, "").strip()
+        if value and slugify(value):
+            return f"{prefix}-{slugify(value)}"
+    src = el.attrs.get("src")
+    if src:
+        filename = src.split("/")[-1].split("?")[0].split("#")[0]
+        stem = re.sub(r"\.[^.]+$", "", filename)
+        if slugify(stem, 20):
+            return f"{prefix}-{slugify(stem, 20)}"
+    if el.parent is not None:
+        same = [c for c in el.parent.children if c == el.tag]
+        if len(same) > 1:
+            return f"{prefix}-{same.index(el.tag)}"
+        return f"{prefix}-child-{el.parent.children.index(el.tag)}"
+    return f"{prefix}-root"
+
+
 class FakeBridge:
     """A fake UI Bridge in front of one site's preview server. ``navigate``
     "loads" a URL and reports it browser-normalised as ``page.url``;
@@ -230,14 +283,21 @@ class FakeBridge:
         site_dir = self.preview.previews / self.site
         elements: list[dict[str, object]] = []
         manifest_path = site_dir / "studio-manifest.json"
-        if manifest_path.is_file():
+        if not self.preview.media_discovery:
+            elements.append({"id": "a-home", "type": "link"})
+        elif manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text())
-            for entry in manifest.get("slots", {}).values():
-                # A browser renders the slot as
-                #   <picture><source type=image/avif srcset="hero.avif?sha=…">
-                #            <img src="hero.webp?sha=…"></picture>
-                # and fetches ONE file (avif when offered); the bridge reports
-                # one image element whose src is its currentSrc.
+            registered: set[str] = set()
+            for slot, entry in manifest.get("slots", {}).items():
+                # The template renders each slot in its own <section> as
+                #   <picture data-media-id="studio-<slot>">
+                #     <source type=image/avif srcset="hero.avif?sha=…">
+                #     <img data-media-id="studio-<slot>-img" src="hero.webp?sha=…"
+                #          alt="<label>" loading="eager">
+                #   </picture><p><label></p>
+                # A browser fetches ONE file (avif when offered); the bridge
+                # registers the <picture> and the <img>, each with the id
+                # generateMediaId mints, and SKIPS a duplicate id.
                 files, shas = entry.get("files", {}), entry.get("sha256", {})
                 if not files:
                     continue
@@ -259,18 +319,35 @@ class FakeBridge:
                     for f in files
                     if f != fallback
                 ]
-                elements.append(
-                    {
-                        "id": f"img-{name}",
-                        "category": "media",
-                        "mediaMetadata": {
-                            "src": f"/{self.site}/{name}?sha={shas.get(fmt, '')}",
-                            "sources": sources,
-                            "naturalWidth": width,
-                            "loadingState": self.preview.loading_state(width),
-                        },
-                    }
+                img_meta = {
+                    "src": f"/{self.site}/{name}?sha={shas.get(fmt, '')}",
+                    "naturalWidth": width,
+                    "loadingState": self.preview.loading_state(width),
+                    "mediaType": "image",
+                }
+                picture_meta = {**img_meta, "mediaType": "picture", "sources": sources}
+                explicit = self.preview.template_media_ids
+                section = DomNode("section", children=["picture", "p"])
+                picture = DomNode(
+                    "picture",
+                    {"data-media-id": f"studio-{slot}"} if explicit else {},
+                    parent=section,
                 )
+                img_attrs = {
+                    "alt": entry.get("label", ""),
+                    "src": f"{files[fallback]}?sha={shas.get(fallback, '')}",
+                }
+                if explicit:
+                    img_attrs["data-media-id"] = f"studio-{slot}-img"
+                img = DomNode(
+                    "img", img_attrs, parent=DomNode("picture", children=["source", "img"])
+                )
+                for node, meta in ((picture, picture_meta), (img, img_meta)):
+                    mid = generate_media_id(node)
+                    if mid in registered:  # registerMediaElement: duplicate id -> skipped
+                        continue
+                    registered.add(mid)
+                    elements.append({"id": mid, "category": "media", "mediaMetadata": meta})
         return {"page": {"url": self.url}, "elements": elements}
 
     def page_health(self) -> dict[str, object]:
@@ -292,6 +369,11 @@ class FakePreview:
         self.stale_url: dict[str, str] = {}
         # Snapshots that report images still decoding before they settle.
         self.pending_snapshots = 0
+        # The README site template gives every slot an explicit data-media-id;
+        # False models a template without them (ids collide and are dropped).
+        self.template_media_ids = True
+        # False models an injected/seeded bridge that registers no media.
+        self.media_discovery = True
 
     def loading_state(self, width: int) -> str:
         if self.pending_snapshots > 0:
