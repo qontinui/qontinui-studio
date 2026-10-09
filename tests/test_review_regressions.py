@@ -201,7 +201,15 @@ def test_r6_a_crash_mid_unpublish_is_rolled_back_by_recovery(
     monkeypatch.setattr(publish_mod, "atomic_write", dying)
     monkeypatch.setattr(publish_mod.Journal, "roll_back", lambda self: [])
     with pytest.raises(Crash):
-        unpublish_batch(ctx.conn, ctx.sites, second.batch_id, ctx.notifier, ctx.clock)
+        unpublish_batch(
+            ctx.conn,
+            ctx.sites,
+            second.batch_id,
+            ctx.notifier,
+            ctx.clock,
+            bridge=ctx.bridge,
+            fetch=ctx.fetch,
+        )
     monkeypatch.undo()
     barber = studio_root / "published" / "barber"
     assert list(barber.glob(f"{JOURNAL_PREFIX}*.json"))
@@ -242,7 +250,7 @@ def test_r9_double_drive_publishes_once_and_unpublish_does_not_restore_itself(
         "SELECT COUNT(*) FROM publications WHERE batch_id = ? AND superseded_by IS NULL", (batch,)
     ).fetchone()[0]
     assert rows == 4  # 2 sites x 2 formats, published once
-    unpublish_batch(a.conn, a.sites, batch, a.notifier, clock)
+    unpublish_batch(a.conn, a.sites, batch, a.notifier, clock, bridge=a.bridge, fetch=a.fetch)
     assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
     assert (
         a.conn.execute("SELECT COUNT(*) FROM publications WHERE unpublished_at IS NULL").fetchone()[

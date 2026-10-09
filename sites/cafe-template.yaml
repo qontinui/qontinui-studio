@@ -8,8 +8,9 @@ publish_dir: ../.studio/sites/cafe-template
 illustrative_label: Illustrative image (AI-generated)
 # D7 page health is required and has no waiver. The template site repos do
 # not exist yet (plan Phase 4), so this site declares no preview and every
-# publication to it is REFUSED until page_health_url, preview_dir (outside the
-# studio root) and preview_manifest_url are set.
+# publication to it is REFUSED until the preview is declared: ui_bridge_url
+# (the preview's own UI Bridge, never the runner's), preview_url, preview_dir
+# (outside the studio root) and preview_manifest_url.
 slots:
   hero:
     width: 1600

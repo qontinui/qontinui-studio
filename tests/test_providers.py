@@ -77,9 +77,9 @@ def test_one_account_per_provider_is_enforced() -> None:
         "id": "x",
         "provider": "X",
         "plan": "free",
-        "api_available": {"value": "unknown"},
-        "automation_allowed": {"value": "unknown"},
-        "commercial_use": {"value": "unknown"},
+        "api_available": {"value": "unknown", "source": "https://x.test/api", "note": "403"},
+        "automation_allowed": {"value": "unknown", "source": "https://x.test/tos", "note": "403"},
+        "commercial_use": {"value": "unknown", "source": "https://x.test/tos", "note": "403"},
         "watermark": "none",
         "domains": ["x.test"],
     }
@@ -90,8 +90,12 @@ def test_one_account_per_provider_is_enforced() -> None:
 
 
 def test_a_yes_needs_a_source_and_bare_yaml_bools_coerce() -> None:
-    with pytest.raises(ValueError, match="cite a source"):
+    with pytest.raises(ValueError, match="must cite the source URL"):
         SourcedVerdict(value="yes")
+    with pytest.raises(ValueError, match="must cite the source URL"):
+        SourcedVerdict(value="unknown", note="could not read it")
+    with pytest.raises(ValueError, match="needs a note"):
+        SourcedVerdict(value="unknown", source="https://x.test/tos")
     assert SourcedVerdict.model_validate({"value": True, "source": "https://x"}).value == "yes"
     assert SourcedVerdict.model_validate({"value": False, "source": "https://x"}).value == "no"
 
@@ -108,13 +112,17 @@ def _row(**kw: object) -> dict[str, object]:
         "id": "x",
         "provider": "X",
         "plan": "free",
-        "api_available": {"value": "unknown"},
-        "automation_allowed": {"value": "unknown"},
-        "commercial_use": {"value": "unknown"},
+        "api_available": {"value": "unknown", "source": "https://x.test/api", "note": "403"},
+        "automation_allowed": {"value": "unknown", "source": "https://x.test/tos", "note": "403"},
+        "commercial_use": {"value": "unknown", "source": "https://x.test/tos", "note": "403"},
         "watermark": "none",
         "domains": ["x.test"],
     }
     base.update(kw)
+    host = str(base["domains"][0]).split("/")[0]  # type: ignore[index]
+    for key in ("api_available", "automation_allowed", "commercial_use"):
+        if key not in kw:
+            base[key] = {"value": "unknown", "source": f"https://{host}/tos", "note": "403"}
     return base
 
 

@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -85,9 +86,15 @@ class SourcedVerdict(BaseModel):
         return None if v is None else _check_first_party(v)
 
     @model_validator(mode="after")
-    def _yes_no_needs_a_source(self) -> SourcedVerdict:
-        if self.value != "unknown" and not self.source:
-            raise ValueError(f"a '{self.value}' verdict must cite a source URL")
+    def _every_verdict_needs_a_source(self) -> SourcedVerdict:
+        # Every verdict cites the page that was checked — for ``unknown`` the
+        # page that could not be read or did not answer, with a ``note`` saying so.
+        if not self.source:
+            raise ValueError(f"a '{self.value}' verdict must cite the source URL that was checked")
+        if self.value == "unknown" and not self.note:
+            raise ValueError(
+                "an 'unknown' verdict needs a note saying why it could not be confirmed"
+            )
         return self
 
 
@@ -112,6 +119,9 @@ class Provider(BaseModel):
     # is recorded, so the scheduler never assigns work to this provider —
     # spending money is an operator decision, not a scheduler default.
     daily_quota: int | None = Field(default=None, ge=0)
+    # The IANA timezone whose midnight resets the provider's daily quota (the
+    # quota "day" is counted in it). Gemini resets at midnight Pacific.
+    quota_reset_tz: str = "UTC"
     tos_reviewed: date | None = None
     # The provider's own web domains: ``host`` (matches the host and its
     # subdomains) or ``host/path-prefix`` for a first-party page on shared
@@ -121,6 +131,15 @@ class Provider(BaseModel):
     domains: list[str] = Field(min_length=1)
     sources: list[str] = Field(default_factory=list)
     notes: str | None = None
+
+    @field_validator("quota_reset_tz")
+    @classmethod
+    def _tz(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ValueError(f"unknown timezone '{v}'") from e
+        return v
 
     @field_validator("domains")
     @classmethod

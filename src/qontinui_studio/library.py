@@ -239,6 +239,12 @@ class Library:
             ).fetchall()
         return [AssetRecord.from_row(r) for r in rows]
 
+    def variant(self, variant_id: str) -> VariantRecord:
+        row = self.conn.execute("SELECT * FROM variants WHERE id = ?", (variant_id,)).fetchone()
+        if row is None:
+            raise KeyError(variant_id)
+        return VariantRecord.from_row(row)
+
     def variants(self, asset_uid: str) -> list[VariantRecord]:
         rows = self.conn.execute(
             "SELECT * FROM variants WHERE asset_uid = ? ORDER BY site, slot, format", (asset_uid,)

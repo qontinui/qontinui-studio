@@ -86,7 +86,15 @@ def test_one_brief_two_sites_zero_manual_steps(
     assert outcome.batch_id in html and "studio unpublish --batch" in html
     assert "approve" not in html.lower()
 
-    removed = unpublish_batch(ctx.conn, ctx.sites, outcome.batch_id, ctx.notifier, ctx.clock)
+    removed = unpublish_batch(
+        ctx.conn,
+        ctx.sites,
+        outcome.batch_id,
+        ctx.notifier,
+        ctx.clock,
+        bridge=ctx.bridge,
+        fetch=ctx.fetch,
+    )
     assert len(removed) == 4
     assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
     manifest = json.loads((studio_root / "published" / "cafe" / "studio-manifest.json").read_text())

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from qontinui_studio.adapters import AdapterSet, build_adapters
 from qontinui_studio.adapters.fake import FakeImageAdapter
@@ -53,7 +55,8 @@ name: Cafe template
 kind: demo
 commercial: false
 publish_dir: ../published/cafe
-page_health_url: http://preview.test/cafe/ui-bridge/control/page-health
+ui_bridge_url: http://preview.test/cafe/__ui-bridge
+preview_url: http://preview.test/cafe/index.html
 preview_dir: ../../previews/cafe
 preview_manifest_url: http://preview.test/cafe/studio-manifest.json
 slots:
@@ -67,7 +70,8 @@ name: Barber template
 kind: demo
 commercial: true
 publish_dir: ../published/barber
-page_health_url: http://preview.test/barber/ui-bridge/control/page-health
+ui_bridge_url: http://preview.test/barber/__ui-bridge
+preview_url: http://preview.test/barber/index.html
 preview_dir: ../../previews/barber
 preview_manifest_url: http://preview.test/barber/studio-manifest.json
 slots:
@@ -162,23 +166,76 @@ def _async_fakes(adapters: AdapterSet) -> AdapterSet:
     return adapters
 
 
+class FakeBridge:
+    """A fake UI Bridge in front of one site's preview server. ``navigate``
+    "loads" a URL; ``snapshot`` reports that URL as ``page.url`` and one media
+    element per file the preview manifest lists, with ``naturalWidth`` taken
+    from actually decoding the file in the preview dir (0 when it does not
+    decode) — so a broken preview image really fails D7's image check."""
+
+    def __init__(self, preview: FakePreview, site: str) -> None:
+        self.preview = preview
+        self.site = site
+        self.url: str | None = preview.stale_url.get(site)
+
+    def navigate(self, url: str) -> None:
+        self.preview.navigated.append(url)
+        if url.startswith(f"http://preview.test/{self.site}/") and not self.preview.ignore_navigate:
+            self.url = url
+
+    def snapshot(self) -> dict[str, object]:
+        site_dir = self.preview.previews / self.site
+        elements: list[dict[str, object]] = []
+        manifest_path = site_dir / "studio-manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text())
+            for entry in manifest.get("slots", {}).values():
+                for name in entry.get("files", {}).values():
+                    width = 0
+                    try:
+                        with Image.open(site_dir / name) as img:
+                            img.load()
+                            width = img.width
+                    except (OSError, ValueError):
+                        width = 0
+                    elements.append(
+                        {
+                            "id": f"img-{name}",
+                            "category": "media",
+                            "mediaMetadata": {
+                                "src": f"http://preview.test/{self.site}/{name}",
+                                "naturalWidth": width,
+                                "loadingState": "loaded" if width else "error",
+                            },
+                        }
+                    )
+        return {"page": {"url": self.url}, "elements": elements}
+
+    def page_health(self) -> dict[str, object]:
+        self.preview.probed.append(self.url or "")
+        return {"success": True, "data": {"summary": self.preview.summary, "findings": []}}
+
+
 class FakePreview:
-    """A fake preview server for the template sites: serves the manifest the
-    studio wrote into ``<previews>/<site>/`` and answers page health OK. The
-    D7 gates run for real against it (manifest sha check + summary check)."""
+    """A fake preview server + UI Bridge for the template sites. The D7 gates
+    run for real against it: manifest sha check, navigation bound to the
+    batch's preview URL, page-health summary, and image decoding."""
 
     def __init__(self, previews: Path, summary: str = "OK") -> None:
         self.previews = previews
         self.summary = summary
         self.probed: list[str] = []
+        self.navigated: list[str] = []
+        self.ignore_navigate = False
+        self.stale_url: dict[str, str] = {}
 
     def fetch(self, url: str) -> bytes:
         site = url.removeprefix("http://preview.test/").split("/", 1)[0]
         return (self.previews / site / "studio-manifest.json").read_bytes()
 
-    def probe(self, url: str) -> dict[str, object]:
-        self.probed.append(url)
-        return {"success": True, "data": {"summary": self.summary, "findings": []}}
+    def bridge(self, base_url: str) -> FakeBridge:
+        site = base_url.removeprefix("http://preview.test/").split("/", 1)[0]
+        return FakeBridge(self, site)
 
 
 @pytest.fixture
@@ -202,7 +259,7 @@ def make_context(
             notifier=FileNotifier(ws.notices_dir),
             clock=clock,
             sleep=clock.sleep,
-            probe=preview.probe,
+            bridge=preview.bridge,
             fetch=preview.fetch,
         )
         for k, v in overrides.items():

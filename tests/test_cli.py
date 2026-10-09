@@ -26,7 +26,7 @@ def _fake_preview(monkeypatch: pytest.MonkeyPatch, preview: FakePreview) -> None
 
     def with_preview(root: Path) -> pipeline.Context:
         ctx = real(root)
-        ctx.probe = preview.probe
+        ctx.bridge = preview.bridge
         ctx.fetch = preview.fetch
         return ctx
 

@@ -13,6 +13,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+from qontinui_studio.commands import studio_command
 from qontinui_studio.library import Library
 from qontinui_studio.publish import unpublish_command
 
@@ -40,7 +41,7 @@ def build_review_page(
 ) -> Path:
     """Write the review page. ``root`` (the studio root) makes every printed
     command runnable from any directory."""
-    prefix = f"studio --root {root.resolve()} " if root is not None else "studio "
+
     library = Library(conn)
     out_dir.mkdir(parents=True, exist_ok=True)
     parts = [
@@ -58,7 +59,7 @@ def build_review_page(
         parts.append(f"<section class='batch'><h2>{_e(b['id'])} — {_e(b['status'])}</h2>")
         parts.append(f"<dl><dt>brief</dt><dd>{_e(b['brief_path'])}</dd></dl>")
         parts.append("<p>Regenerate:</p>")
-        parts.append(f"<code>{_e(prefix)}brief run {_e(b['brief_path'])}</code>")
+        parts.append(f"<code>{_e(studio_command(['brief', 'run', b['brief_path']], root))}</code>")
         if b["status"] == "published":
             parts.append("<p>Unpublish:</p>")
             parts.append(f"<code>{_e(unpublish_command(b['id'], root))}</code>")

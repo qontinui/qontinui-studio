@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -25,6 +26,9 @@ SlotCategory = Literal[
 ExportFormat = Literal["webp", "avif", "png", "jpeg"]
 
 ID_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+
+RUNNER_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+RUNNER_PORT = 9876
 
 DEFAULT_ILLUSTRATIVE_LABEL = "Illustrative image (AI-generated)"
 DEFAULT_AI_LABEL = "AI-generated image"
@@ -64,16 +68,18 @@ class Site(BaseModel):
     # transparency).
     illustrative_label: str = DEFAULT_ILLUSTRATIVE_LABEL
     ai_label: str = DEFAULT_AI_LABEL
-    # UI Bridge page-health endpoint for a running preview of this site, e.g.
-    # http://127.0.0.1:9876/ui-bridge/control/page-health. D7 page health is a
-    # REQUIRED gate with no waiver: unset -> publication to this site is refused.
-    page_health_url: str | None = None
-    # D7 runs against a PREVIEW, before the live swap: the studio writes the
-    # site's live files plus this batch's files and merged manifest into
-    # ``preview_dir`` (served by the preview whose page ``page_health_url``
-    # checks), then fetches ``preview_manifest_url`` to confirm the preview
-    # actually serves this batch's manifest (by sha256). Required with
-    # ``page_health_url``.
+    # D7 runs against a PREVIEW of this site, before the live swap. The studio
+    # writes the site's live files plus the batch's files and merged manifest
+    # into ``preview_dir``; a preview server serves that directory at
+    # ``preview_url`` (the page) and ``preview_manifest_url`` (the manifest).
+    # The page is loaded in a browser carrying the UI Bridge (e.g. the
+    # injection proxy in front of the preview server); ``ui_bridge_url`` is the
+    # prefix its ``/control/*`` routes hang off, e.g.
+    # ``http://127.0.0.1:3000/__ui-bridge``. It must be the PREVIEW's bridge —
+    # never the runner's own UI (127.0.0.1:9876), which is refused.
+    # D7 is REQUIRED with no waiver: a site without all four is never published to.
+    ui_bridge_url: str | None = None
+    preview_url: str | None = None
     preview_dir: Path | None = None
     preview_manifest_url: str | None = None
     slots: dict[str, Slot] = Field(min_length=1)
@@ -100,11 +106,31 @@ class Site(BaseModel):
         for name in self.slots:
             if not re.fullmatch(ID_PATTERN, name):
                 raise ValueError(f"bad slot name '{name}' (must match {ID_PATTERN})")
-        if self.page_health_url and not (self.preview_dir and self.preview_manifest_url):
+        preview_fields = {
+            "ui_bridge_url": self.ui_bridge_url,
+            "preview_url": self.preview_url,
+            "preview_dir": self.preview_dir,
+            "preview_manifest_url": self.preview_manifest_url,
+        }
+        missing = [k for k, v in preview_fields.items() if not v]
+        if 0 < len(missing) < len(preview_fields):
             raise ValueError(
-                "page_health_url needs preview_dir and preview_manifest_url (D7 checks a "
-                "preview of this batch before the live swap)"
+                f"a D7 preview needs all of ui_bridge_url, preview_url, preview_dir and "
+                f"preview_manifest_url; missing {missing}"
             )
+        if self.ui_bridge_url:
+            bridge = urlparse(self.ui_bridge_url)
+            if bridge.scheme not in ("http", "https") or not bridge.hostname:
+                raise ValueError(
+                    f"ui_bridge_url must be an http(s) URL, got '{self.ui_bridge_url}'"
+                )
+            if bridge.hostname in RUNNER_HOSTS and bridge.port == RUNNER_PORT:
+                raise ValueError(
+                    "ui_bridge_url points at the runner's own UI (port 9876); D7 must "
+                    "check the site's PREVIEW page, through the preview's bridge"
+                )
+        if self.preview_url and urlparse(self.preview_url).scheme not in ("http", "https"):
+            raise ValueError(f"preview_url must be an http(s) URL, got '{self.preview_url}'")
         if self.preview_dir is not None:
             preview, live = self.preview_dir.resolve(), self.publish_dir.resolve()
             if preview == live or preview.is_relative_to(live) or live.is_relative_to(preview):
@@ -161,4 +187,35 @@ def load_sites(directory: Path, root: Path | None = None) -> dict[str, Site]:
         if site.id in sites:
             raise ConfigError(f"duplicate site id '{site.id}' ({path})")
         sites[site.id] = site
+    _check_cross_site(sites)
     return sites
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    a, b = a.resolve(), b.resolve()
+    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+
+
+def _check_cross_site(sites: dict[str, Site]) -> None:
+    """A preview dir is rewritten on every publish of its site, under that
+    site's lock only, so it must not overlap ANY site's publish dir or another
+    site's preview dir; publish dirs must not overlap each other either."""
+    items = sorted(sites.items())
+    for i, (a_id, a) in enumerate(items):
+        for b_id, b in items[i + 1 :]:
+            if _overlaps(a.publish_dir, b.publish_dir):
+                raise ConfigError(f"sites '{a_id}' and '{b_id}' have overlapping publish_dir")
+        if a.preview_dir is None:
+            continue
+        for b_id, b in items:
+            if _overlaps(a.preview_dir, b.publish_dir):
+                raise ConfigError(
+                    f"site '{a_id}' preview_dir overlaps site '{b_id}' publish_dir "
+                    f"({a.preview_dir} / {b.publish_dir})"
+                )
+            if (
+                b_id != a_id
+                and b.preview_dir is not None
+                and _overlaps(a.preview_dir, b.preview_dir)
+            ):
+                raise ConfigError(f"sites '{a_id}' and '{b_id}' have overlapping preview_dir")

@@ -10,6 +10,7 @@ JSON so the scheduler can persist it and resume after a crash.
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -54,6 +55,16 @@ class ProviderAdapter(Protocol):
     def poll(self, job: SubmittedJob) -> PollResult: ...
 
     def download(self, job: SubmittedJob, dest_dir: Path) -> list[Path]: ...
+
+
+_DAILY_QUOTA = re.compile(r"insufficient_quota|per[ _-]?day|daily", re.IGNORECASE)
+
+
+def is_daily_quota(text: str) -> bool:
+    """Whether a provider's 429 text says the quota for the PERIOD is spent
+    (Gemini ``...PerDay...`` quota ids, OpenAI ``insufficient_quota``), as
+    opposed to a per-minute rate limit that a short backoff clears."""
+    return bool(_DAILY_QUOTA.search(text))
 
 
 def staged_paths(job: SubmittedJob) -> list[Path]:

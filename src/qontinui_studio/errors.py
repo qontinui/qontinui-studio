@@ -24,6 +24,13 @@ class TransientProviderError(ProviderError):
         self.retry_after_s = retry_after_s
 
 
+class QuotaExhaustedError(ProviderError):
+    """The provider says its quota for the current period is spent (e.g. a 429
+    RESOURCE_EXHAUSTED / insufficient_quota). Not a retryable glitch and not a
+    failure of the job: the provider is marked spent until its quota resets and
+    the job is deferred."""
+
+
 class PermanentProviderError(ProviderError):
     """A failure retrying will not fix (4xx other than 429, safety refusal, no image)."""
 
@@ -63,3 +70,13 @@ class PublicationRefused(StudioError):
     def __init__(self, message: str, failures: list[str]) -> None:
         super().__init__(message)
         self.failures = failures
+
+
+class JournalError(StudioError):
+    """A leftover journal is unreadable or names paths outside its site's
+    publish dir. Recovery refuses to act on it and reports the site."""
+
+
+class LeaseLost(StudioError):
+    """This process no longer holds the batch lease (it expired and another
+    driver may have taken over); it must stop driving the batch."""

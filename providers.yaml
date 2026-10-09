@@ -5,8 +5,9 @@
 # - `automation_allowed` answers for the route the studio would drive: the official
 #   API where `adapter` is an API adapter, otherwise the consumer web UI (i.e. whether
 #   a Qontinui GUI-automation adapter would be permitted).
-# - Every `yes`/`no` cites the URL it was read from. Anything not confirmed from a
-#   first-party page is `unknown`, and `unknown` keeps the adapter OFF (D4).
+# - Every verdict cites the first-party URL that was checked: for `yes`/`no` the
+#   page it was read from, for `unknown` the page that refused or did not answer
+#   (with a note). `unknown` keeps the adapter OFF (D4).
 # - `domains` are the provider's own web domains; every source URL must sit under
 #   one of them (a third-party copy of a terms page is not a source).
 # - `daily_quota` is the per-UTC-day cap the scheduler uses. It is set only where a
@@ -49,6 +50,9 @@ providers:
     model: gemini-3.1-flash-image
     api_key_env: GEMINI_API_KEY
     daily_quota: null
+    # "Requests per day (RPD) quotas reset at midnight Pacific time."
+    # — https://ai.google.dev/gemini-api/docs/rate-limits (checked 2026-10-09)
+    quota_reset_tz: America/Los_Angeles
     tos_reviewed: 2026-10-09
     domains: [google.dev, google.com]
     sources:
@@ -80,6 +84,7 @@ providers:
       note: 'the Images API is the provider''s sanctioned programmatic door'
     commercial_use:
       value: unknown
+      source: https://openai.com/policies/terms-of-use/
       note: 'A third-party mirror of the 2024-12-11 Terms of Use (open.windriver.com) says you "own the Output", but openai.com/policies/terms-of-use answered HTTP 403, so the first-party page was not read. Unknown until it is.'
     watermark: C2PA metadata (no visible mark)
     watermark_visible: false
@@ -131,10 +136,12 @@ providers:
     plan: Free plan, 150 tokens/day (secondary sources); free generations are public.
     api_available:
       value: unknown
-      note: 'the API is a separate pay-as-you-go product per secondary sources; leonardo.ai pages answered 403'
+      source: https://leonardo.ai/pricing/
+      note: 'leonardo.ai/pricing answered HTTP 403 when checked on 2026-10-09; secondary sources describe the API as a separate pay-as-you-go product. Unknown until the first-party page is read.'
     automation_allowed:
       value: unknown
-      note: 'ToS page answered 403; a secondary summary says it bars automated access — not read first-hand'
+      source: https://leonardo.ai/terms-of-service/
+      note: 'leonardo.ai/terms-of-service answered HTTP 403 when checked on 2026-10-09; a secondary summary says it bars automated access, but that was not read first-hand. Unknown keeps any adapter off (D4).'
     commercial_use:
       value: "yes"
       source: https://intercom.help/leonardo-ai/en/articles/8044018-commercial-usage
@@ -182,7 +189,8 @@ providers:
     plan: Free daily generations without a plan (count not published).
     api_available:
       value: unknown
-      note: 'Firefly Services API appears enterprise-only per Adobe forum posts; not confirmed from a first-party terms page'
+      source: https://www.adobe.com/products/firefly/plans.html
+      note: 'the plans page (checked 2026-10-09) lists no API for the free tier; Adobe forum posts say Firefly Services is enterprise-only, which no first-party terms page confirmed'
     automation_allowed:
       value: "no"
       source: https://www.adobe.com/legal/terms.html
@@ -289,7 +297,8 @@ providers:
     plan: Free daily credits (secondary sources only; not in the terms).
     api_available:
       value: unknown
-      note: 'a paid Open Platform exists per secondary sources; the first-party doc page rendered empty'
+      source: https://kling.ai/document-api/protocols/paidServiceProtocol
+      note: 'the first-party API protocol page rendered empty when checked on 2026-10-09; secondary sources describe a paid Open Platform'
     automation_allowed:
       value: "no"
       source: https://kling.ai/docs/user-policy

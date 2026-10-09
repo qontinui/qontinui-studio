@@ -14,6 +14,7 @@ from qontinui_studio.gates import (
     d6_not_the_real_thing,
     d7_page_health,
     d7_preview_manifest,
+    d7_preview_page,
 )
 from qontinui_studio.library import AssetRecord, VariantRecord
 from qontinui_studio.postprocess import sha256_file
@@ -129,14 +130,72 @@ def test_d6_rules(records: tuple[AssetRecord, VariantRecord]) -> None:
     assert real.label_for_ai() == "AI-generated image"
 
 
+PREVIEW = {
+    "ui_bridge_url": "http://127.0.0.1:3000/__ui-bridge",
+    "preview_url": "http://127.0.0.1:3000/index.html",
+    "preview_dir": "/tmp/preview",
+    "preview_manifest_url": "http://127.0.0.1:3000/studio-manifest.json",
+}
+
+
+def test_the_runners_own_ui_is_never_the_bridge() -> None:
+    with pytest.raises(ValueError, match="runner's own UI"):
+        _site(**{**PREVIEW, "ui_bridge_url": "http://127.0.0.1:9876/ui-bridge"})
+    with pytest.raises(ValueError, match="needs all of"):
+        _site(ui_bridge_url="http://127.0.0.1:3000/__ui-bridge")
+
+
+class Bridge:
+    def __init__(self, url_after_nav: str | None, elements: list[dict[str, object]]) -> None:
+        self.url_after_nav = url_after_nav
+        self.elements = elements
+        self.url: str | None = "http://127.0.0.1:3000/stale"
+        self.navigated: list[str] = []
+
+    def navigate(self, url: str) -> None:
+        self.navigated.append(url)
+        self.url = self.url_after_nav if self.url_after_nav != "same" else url
+
+    def snapshot(self) -> dict[str, object]:
+        return {"page": {"url": self.url}, "elements": self.elements}
+
+    def page_health(self) -> dict[str, object]:
+        return {"success": True, "data": {"summary": "OK"}}
+
+
+def _img(name: str, width: int, state: str = "loaded") -> dict[str, object]:
+    return {
+        "mediaMetadata": {
+            "src": f"http://127.0.0.1:3000/{name}?v=1",
+            "naturalWidth": width,
+            "loadingState": state,
+        }
+    }
+
+
+def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
+    site = _site(**PREVIEW)
+    files = {"hero": ["hero.webp", "hero.avif"]}
+    good = Bridge("same", [_img("hero.webp", 1600)])
+    results = d7_preview_page(site, "batch-1", files, lambda _u: good)
+    assert [g.outcome for g in results] == ["pass", "pass", "pass"]
+    assert good.navigated == ["http://127.0.0.1:3000/index.html?studio_batch=batch-1"]
+
+    stale = Bridge(None, [_img("hero.webp", 1600)])  # the tab never moved
+    [nav] = d7_preview_page(site, "batch-1", files, lambda _u: stale)
+    assert nav.gate == "d7_navigate" and nav.failed
+
+    broken = Bridge("same", [_img("hero.webp", 0, "error")])
+    assert d7_preview_page(site, "b", files, lambda _u: broken)[-1].failed
+    missing = Bridge("same", [_img("other.webp", 1600)])
+    last = d7_preview_page(site, "b", files, lambda _u: missing)[-1]
+    assert last.failed and "not rendered" in last.detail
+
+
 def test_page_health_gate() -> None:
     assert d7_page_health(_site()).outcome == "not_configured"
     assert d7_page_health(_site()).failed
-    site = _site(
-        page_health_url="http://127.0.0.1:9876/ui-bridge/control/page-health",
-        preview_dir="/tmp/preview",
-        preview_manifest_url="http://127.0.0.1:3000/studio-manifest.json",
-    )
+    site = _site(**PREVIEW)
     for summary in ("OK", "WARNING", "ok"):
         ok = d7_page_health(site, lambda u, s=summary: {"success": True, "data": {"summary": s}})
         assert ok.outcome == "pass"

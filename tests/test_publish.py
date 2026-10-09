@@ -20,7 +20,7 @@ from qontinui_studio.pipeline import Context, run_brief
 from qontinui_studio.publish import JOURNAL_PREFIX, publish_batch, recover, unpublish_batch
 from qontinui_studio.sites import load_sites
 
-from .conftest import FakeClock, FakePreview, debris, notice_text
+from .conftest import FakeBridge, FakeClock, FakePreview, debris, notice_text
 
 
 def _edit_site(studio_root: Path, name: str, old: str, new: str) -> None:
@@ -31,17 +31,29 @@ def _edit_site(studio_root: Path, name: str, old: str, new: str) -> None:
 
 
 CAFE_PREVIEW = (
-    "page_health_url: http://preview.test/cafe/ui-bridge/control/page-health\n"
+    "ui_bridge_url: http://preview.test/cafe/__ui-bridge\n"
+    "preview_url: http://preview.test/cafe/index.html\n"
     "preview_dir: ../../previews/cafe\n"
     "preview_manifest_url: http://preview.test/cafe/studio-manifest.json\n"
 )
 
 
-def _ok(url: str) -> dict[str, object]:
+def _bridges(preview: FakePreview, page_health: Callable[[FakeBridge], dict[str, object]]):  # type: ignore[no-untyped-def]
+    """The fake preview's bridges, with page health answered by ``page_health``."""
+
+    def factory(base_url: str) -> FakeBridge:
+        bridge = preview.bridge(base_url)
+        bridge.page_health = lambda: page_health(bridge)  # type: ignore[method-assign]
+        return bridge
+
+    return factory
+
+
+def _ok(bridge: FakeBridge) -> dict[str, object]:
     return {"success": True, "data": {"summary": "OK"}}
 
 
-def _critical(url: str) -> dict[str, object]:
+def _critical(bridge: FakeBridge) -> dict[str, object]:
     return {"success": True, "data": {"summary": "CRITICAL", "findings": []}}
 
 
@@ -91,9 +103,9 @@ def test_page_health_needs_a_preview(studio_root: Path) -> None:
         studio_root,
         "cafe.yaml",
         CAFE_PREVIEW,
-        "page_health_url: http://preview.test/cafe/ui-bridge/control/page-health\n",
+        "ui_bridge_url: http://preview.test/cafe/__ui-bridge\n",
     )
-    with pytest.raises(ConfigError, match="needs preview_dir and preview_manifest_url"):
+    with pytest.raises(ConfigError, match="needs all of"):
         load_sites(studio_root / "sites")
 
 
@@ -137,26 +149,30 @@ def test_d7_runs_on_the_preview_before_anything_goes_live(
 ) -> None:
     seen: dict[str, object] = {}
 
-    def probe(url: str) -> dict[str, object]:
-        # At probe time the preview holds this batch, and live does not yet.
-        if "/cafe/" not in url:
-            return _ok(url)
+    def page_health(bridge: FakeBridge) -> dict[str, object]:
+        # At probe time the bridged page is this batch's preview, and live is untouched.
+        if bridge.site != "cafe":
+            return _ok(bridge)
+        seen["url"] = bridge.url
         seen["preview"] = json.loads(
             (studio_root.parent / "previews" / "cafe" / "studio-manifest.json").read_text()
         )
         seen["live_exists"] = (studio_root / "published" / "cafe" / "hero.webp").exists()
-        return _ok(url)
+        return _ok(bridge)
 
-    ctx = make_context(probe=probe)
+    ctx = make_context(bridge=_bridges(preview, page_health))
     out = run_brief(ctx, write_brief())
     assert out.status == "published", out.publish and out.publish.failures
     assert seen["live_exists"] is False
+    assert seen["url"] == f"http://preview.test/cafe/index.html?studio_batch={out.batch_id}"
     shown = seen["preview"]
     assert isinstance(shown, dict) and shown["slots"]["hero"]["batch_id"] == out.batch_id
     assert out.publish is not None
     assert {g.gate for g in out.publish.gate_results if g.outcome == "pass"} >= {
         "d7_preview",
+        "d7_navigate",
         "d7_page_health",
+        "d7_images",
     }
 
 
@@ -165,12 +181,13 @@ def test_failed_page_health_leaves_live_content_untouched(
     write_brief: Callable[..., Path],
     studio_root: Path,
     clock: FakeClock,
+    preview: FakePreview,
 ) -> None:
     first = run_brief(make_context(), write_brief())
     assert first.status == "published"
     before = _live(studio_root)
     clock.sleep(60)
-    ctx = make_context(probe=_critical)
+    ctx = make_context(bridge=_bridges(preview, _critical))
     second = run_brief(ctx, write_brief(name="hero2.yaml"))
     assert second.status == "refused"
     assert _status(ctx, second.batch_id) == "refused"
@@ -189,11 +206,12 @@ def test_any_probe_exception_refuses_and_never_publishes(
     write_brief: Callable[..., Path],
     studio_root: Path,
     probe_error: Exception,
+    preview: FakePreview,
 ) -> None:
-    def probe(url: str) -> dict[str, object]:
+    def page_health(bridge: FakeBridge) -> dict[str, object]:
         raise probe_error
 
-    ctx = make_context(probe=probe)
+    ctx = make_context(bridge=_bridges(preview, page_health))
     out = run_brief(ctx, write_brief())
     assert out.status == "refused"
     assert _status(ctx, out.batch_id) == "refused"
@@ -223,13 +241,29 @@ def test_unpublishing_the_newest_batch_restores_the_previous_one(
     second = run_brief(ctx, write_brief(name="hero2.yaml"))
     assert second.status == "published"
     assert _live(studio_root)[1] == second.batch_id
-    unpublish_batch(ctx.conn, ctx.sites, second.batch_id, ctx.notifier, ctx.clock)
+    unpublish_batch(
+        ctx.conn,
+        ctx.sites,
+        second.batch_id,
+        ctx.notifier,
+        ctx.clock,
+        bridge=ctx.bridge,
+        fetch=ctx.fetch,
+    )
     assert _live(studio_root) == before
     assert _active_batches(ctx, "cafe-template") == {first.batch_id}
     assert "Restored cafe-template/hero" in notice_text(
         ctx.workspace.notices_dir, second.batch_id, "unpublished"
     )
-    unpublish_batch(ctx.conn, ctx.sites, first.batch_id, ctx.notifier, ctx.clock)
+    unpublish_batch(
+        ctx.conn,
+        ctx.sites,
+        first.batch_id,
+        ctx.notifier,
+        ctx.clock,
+        bridge=ctx.bridge,
+        fetch=ctx.fetch,
+    )
     assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
 
 
@@ -255,7 +289,15 @@ def test_unpublish_restore_refuses_unknown_bytes_and_tampered_variants(
         )
     ]
     Path(vpath).write_bytes(b"tampered")
-    unpublish_batch(ctx.conn, ctx.sites, second.batch_id, ctx.notifier, ctx.clock)
+    unpublish_batch(
+        ctx.conn,
+        ctx.sites,
+        second.batch_id,
+        ctx.notifier,
+        ctx.clock,
+        bridge=ctx.bridge,
+        fetch=ctx.fetch,
+    )
     assert (studio_root / "published" / "cafe" / "hero.webp").read_bytes() == b"hand-made"
     text = notice_text(ctx.workspace.notices_dir, second.batch_id, "unpublished")
     assert "NOT restored cafe-template/hero" in text and "did not place" in text
@@ -268,7 +310,15 @@ def test_unpublish_refuses_a_batch_that_is_not_live(
     ctx = make_context()
     out = run_brief(ctx, write_brief(), publish=False)
     with pytest.raises(PublicationRefused, match="nothing to unpublish"):
-        unpublish_batch(ctx.conn, ctx.sites, out.batch_id, ctx.notifier, ctx.clock)
+        unpublish_batch(
+            ctx.conn,
+            ctx.sites,
+            out.batch_id,
+            ctx.notifier,
+            ctx.clock,
+            bridge=ctx.bridge,
+            fetch=ctx.fetch,
+        )
     assert _status(ctx, out.batch_id) == "generated"
 
 
@@ -327,7 +377,7 @@ def test_rollback_never_removes_bytes_it_did_not_place(tmp_path: Path) -> None:
         site="s",
         publish_dir=d,
         placed=[(d / ".hero.webp.staged-x", dest, "0" * 64)],
-        moved=[(dest, backup)],
+        moved=[publish_mod.Moved(dest, backup, "1" * 64, True)],
         manifest_before=None,
         manifest_after=b"{}",
     )
@@ -393,7 +443,9 @@ def test_incomplete_batch_is_refused(
     assert out.status == "generated"
     ctx.conn.execute("DELETE FROM variants WHERE site = 'barber-template'")
     ctx.conn.commit()
-    result = publish_batch(ctx.conn, ctx.sites, out.batch_id, ctx.notifier, ctx.clock, ctx.probe)
+    result = publish_batch(
+        ctx.conn, ctx.sites, out.batch_id, ctx.notifier, ctx.clock, ctx.bridge, ctx.fetch
+    )
     assert not result.published
     assert [g.subject for g in result.failures if g.gate == "completeness"] == [
         "barber-template/hero"

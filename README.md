@@ -32,18 +32,20 @@ marketing churn never touches merge-critical factory code.
 D3, the build-record allowlist, gates the factory's export (Phase 1). It has no
 subject in this repo.
 
-A site that declares no `page_health_url` reports the page-health gate as
+A site that declares no UI Bridge preview reports the page-health gate as
 `not_configured`, which **refuses** publication. There is no waiver (plan D7).
 The two shipped template sites (`sites/cafe-template.yaml` and
 `sites/barber-template.yaml`) declare no preview yet, because their repos are
 plan Phase 4, so **publishing to them is refused until a preview is
 configured**. The end-to-end acceptance test configures a fake preview server
-(injected fetch and probe) for those sites. Both D7 gates, the preview-manifest
-sha check and the page-health summary check, run for real against it.
+and UI Bridge (injected `fetch` and `bridge`) for those sites. Every D7 check
+runs for real against it, including image decoding from the preview dir.
 
 `preview_dir` is rewritten on every publish, so it has these limits:
 - It must be outside the studio root and must not contain it.
-- It must be neither `publish_dir`, inside it, nor a parent of it.
+- It must not equal, contain or sit inside ANY site's `publish_dir`, or another
+  site's `preview_dir`. Publish dirs must not overlap each other either.
+- It is locked while it is written.
 - The studio only ever deletes files listed in the preview manifest it wrote
   itself.
 
@@ -58,13 +60,29 @@ Publication is safe against failures, crashes and concurrent runs:
   studio publication of that slot, the whole batch is refused (`foreign_file`).
   This covers an owner-supplied photo or a hand edit. A batch that is already
   live is refused (`already_live`).
-- **D7 runs on a preview, before anything goes live.** A site with
-  `page_health_url` must also declare `preview_dir` and `preview_manifest_url`.
-  The studio writes the live files, plus this batch's files and merged manifest,
-  into `preview_dir`. It then confirms the preview serves exactly that manifest
-  (by sha256) and runs UI Bridge page health on it. Only `OK` or `WARNING`
-  publishes. Any other summary, and any probe error, refuses, and live content
-  is never touched.
+- **D7 runs on a preview of this batch, before anything goes live.** A site
+  declares `ui_bridge_url`, `preview_url`, `preview_dir` and
+  `preview_manifest_url`, all four or none:
+  - `ui_bridge_url` is the `/control/*` prefix of the UI Bridge in the browser
+    showing the preview, e.g. the injection proxy in front of the preview
+    server. The runner's own UI (`:9876`) is refused.
+  - The studio writes the live files, this batch's files and the merged
+    manifest into `preview_dir`, and confirms the preview serves exactly that
+    manifest (by sha256).
+  - It drives the bridge to `preview_url?studio_batch=<batch>` with
+    `POST /control/page/navigate`, then confirms the page is there from its own
+    URL (`GET /control/snapshot` → `page.url`).
+  - It runs page health (`POST /control/page-health`). Only `OK` or `WARNING`
+    pass.
+  - It confirms the page did not move, then checks that every changed slot's
+    image elements loaded. Image data comes from the snapshot's media elements:
+    `mediaMetadata.naturalWidth > 0` and `loadingState == "loaded"`.
+
+  Any failure, or any bridge error, refuses, and live content is never touched.
+  The bridge has a navigate control (`/control/page/navigate` in
+  `ui-bridge/packages/ui-bridge/src/server/handlers.ts`), so no separate
+  headless browser is needed. A navigate is fire-and-forget, so the studio
+  waits for idle and then verifies the URL itself.
 - **Journalled swap and unpublish.** Before any live file moves, a journal at
   `<publish_dir>/.studio-journal-<batch>.json` records every staged, placed and
   backup path, plus the manifest before and after. A single `BEGIN IMMEDIATE`
@@ -72,7 +90,13 @@ Publication is safe against failures, crashes and concurrent runs:
   the gate results. Any
   publish, unpublish or `jobs run` replays a leftover journal: forward if the
   database committed, backward otherwise. Undo removes only a live file that
-  still holds the bytes this publish placed. While a publish is in flight the
+  still holds the bytes this publish placed. A journal is acted on only after
+  validation: its batch must exist, and every path it names must be a slot
+  file, staging file or backup directly inside that site's own publish dir.
+  Anything else is refused and the site is reported. Every original is
+  re-checked right before it moves. A backup that does not hold a studio
+  publication's bytes is never deleted. If cleanup fails after the commit, it is
+  logged and left to recovery, and the batch is still reported as published. While a publish is in flight the
   batch is `publishing`; recovery turns an orphaned `publishing` into `refused`.
   Every rolled-back journal produces an operator notice. A published batch whose
   notice was never sent (`batches.notified_at` is null) is re-notified. Recovery
@@ -80,10 +104,14 @@ Publication is safe against failures, crashes and concurrent runs:
   that target it.
 - **Complete or nothing.** A batch publishes only when every `{site, slot}` its
   brief targets has a variant.
-- **Unpublish** works only on a live batch. It restores the publication the
-  batch superseded, after checking the stored variant's sha256. It never
-  overwrites a live file holding bytes the studio did not place; such a slot is
-  reported as not restored.
+- **Unpublish** works only on a live batch whose site configs are all loaded.
+  It restores the publication the batch superseded only if that publication
+  passes D5/D6 against the CURRENT site config and D7 on a preview of the
+  result. Otherwise the slot is left empty and the notice says why. It checks
+  the stored variant's sha256 and never overwrites a live file holding bytes the
+  studio did not place.
+- **Nothing is stranded.** `studio jobs run` also publishes `generated` batches,
+  unless the batch was created with `brief run --no-publish`.
 
 ## Provider inventory: the honest D4 outcome
 
@@ -92,6 +120,8 @@ Designer, Leonardo, Ideogram, Firefly, Runway, Pika, Luma and Kling. Each was
 reviewed on 2026-10-09, and every yes/no cites a source URL. Run
 `studio providers list` to see the verdicts. In summary:
 
+- **Every verdict cites the first-party URL that was checked.** For `unknown`
+  that is the page that refused (e.g. HTTP 403) or rendered empty, with a note.
 - **API adapters exist for Gemini (`google-genai`) and OpenAI Images.** Both pass
   D4 for API use. OpenAI's `commercial_use` is `unknown`: openai.com answered 403,
   and a third-party mirror is not accepted as a source (the loader rejects known
@@ -128,6 +158,10 @@ poetry run studio media trim IN OUT --start 1 --duration 4
 poetry run studio media loop IN OUT --count 3 | --boomerang
 ```
 
+Commands printed in notices and on the review page are shell-quoted for the
+platform (`shlex` on POSIX, `list2cmdline` on Windows), so a root containing
+spaces still pastes correctly.
+
 Exit codes: `0` ok, `1` config error, `2` publication refused by a gate,
 `3` generation deferred or failed.
 
@@ -143,7 +177,13 @@ To let the scheduler use a provider, set `daily_quota` on its row. This is the
 per-UTC-day cap. The scheduler works through a brief's `provider_preference` in
 order and skips providers whose quota is spent. When every preferred provider is
 spent, it defers the job to the next UTC midnight. Transient failures (429, 5xx,
-transport) are retried with exponential backoff. A job is claimed atomically
+transport) are retried with exponential backoff. A quota 429 (Gemini
+`...PerDay...`, OpenAI `insufficient_quota`) is a different case. It marks the
+provider spent until its quota reset, which is midnight in the row's
+`quota_reset_tz` (Gemini: `America/Los_Angeles`), and the job waits; it is not
+failed. A quota unit is spent and the job claimed in one `BEGIN IMMEDIATE`
+transaction. Every lease is read from the clock at claim time, and the batch
+lease is renewed on every scheduler iteration. A job is claimed atomically
 (`submitting`) before its request leaves. That claim records the exact prompt,
 the model and the provider's terms as reviewed, and ingest uses those values
 rather than the current config. A claim whose process died is reclaimed after
@@ -160,7 +200,7 @@ state is kept in `.studio/studio.db`.
   env var may be shared between rows.
 - `sites/*.yaml`: publication targets. Each declares its kind (`demo` /
   `real_business` / `product`), whether it is `commercial`, `publish_dir`,
-  `page_health_url`, and per-slot size, category, formats, focal point and
+  the four D7 preview fields, and per-slot size, category, formats, focal point and
   optional background removal.
 - `briefs/*.yaml`: the asset id, purpose, targets (`{site, slot}` or
   `{campaign}`), aspect ratio, prompt, style guide, reference images, provider

@@ -20,6 +20,7 @@ hard timeout, so a live request is never reclaimed.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -27,9 +28,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from qontinui_studio.adapters import AdapterSet, GenerationRequest, SubmittedJob
-from qontinui_studio.errors import PermanentProviderError, TransientProviderError
+from qontinui_studio.errors import (
+    PermanentProviderError,
+    QuotaExhaustedError,
+    TransientProviderError,
+)
 from qontinui_studio.library import TermsSnapshot
 from qontinui_studio.providers import ProviderInventory
 
@@ -89,6 +95,10 @@ class StepReport:
     discarded: list[str] = field(default_factory=list)
 
 
+# A provider quota message from an adapter that raised a plain transient error.
+_QUOTA_TEXT = re.compile(r"insufficient_quota|per[ _-]?day|daily", re.IGNORECASE)
+
+
 class Scheduler:
     def __init__(
         self,
@@ -110,24 +120,50 @@ class Scheduler:
 
     # ---- quota -----------------------------------------------------------
 
+    def quota_day(self, provider_id: str, now: datetime) -> str:
+        """The provider's quota day: the date in its reset timezone."""
+        tz = ZoneInfo(self.inventory.get(provider_id).quota_reset_tz)
+        return now.astimezone(tz).date().isoformat()
+
+    def next_reset(self, provider_id: str, now: datetime) -> datetime:
+        """The next midnight in the provider's reset timezone, in UTC."""
+        tz = ZoneInfo(self.inventory.get(provider_id).quota_reset_tz)
+        local = now.astimezone(tz)
+        midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.astimezone(UTC)
+
     def quota_used(self, provider_id: str, day: str) -> int:
         row = self.conn.execute(
             "SELECT used FROM quota_usage WHERE provider = ? AND day = ?", (provider_id, day)
         ).fetchone()
         return int(row["used"]) if row else 0
 
+    def spent_until(self, provider_id: str, now: datetime) -> datetime | None:
+        row = self.conn.execute(
+            "SELECT until FROM provider_spent WHERE provider = ?", (provider_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        until = _parse(row["until"])
+        return until if until > now else None
+
     def quota_remaining(self, provider_id: str, now: datetime) -> int:
         provider = self.inventory.get(provider_id)
         if provider.schedulable_reason() is not None or provider.daily_quota is None:
             return 0
-        return max(0, provider.daily_quota - self.quota_used(provider_id, now.date().isoformat()))
+        if self.spent_until(provider_id, now) is not None:
+            return 0
+        used = self.quota_used(provider_id, self.quota_day(provider_id, now))
+        return max(0, provider.daily_quota - used)
 
-    def _consume_quota(self, provider_id: str, now: datetime) -> None:
+    def _mark_spent(self, provider_id: str, now: datetime) -> None:
+        until = self.next_reset(provider_id, now)
         self.conn.execute(
-            "INSERT INTO quota_usage (provider, day, used) VALUES (?, ?, 1) "
-            "ON CONFLICT(provider, day) DO UPDATE SET used = used + 1",
-            (provider_id, now.date().isoformat()),
+            "INSERT INTO provider_spent (provider, until) VALUES (?, ?) "
+            "ON CONFLICT(provider) DO UPDATE SET until = excluded.until",
+            (provider_id, _iso(until)),
         )
+        self.conn.commit()
 
     # ---- enqueue ---------------------------------------------------------
 
@@ -172,15 +208,19 @@ class Scheduler:
                 return pid
         return None
 
-    def _any_provider_left_later(self, preference: list[str], tried: list[str]) -> bool:
-        """True when some untried preferred provider has an adapter and a quota —
-        i.e. it is only today's quota that is spent."""
+    def _next_window(
+        self, preference: list[str], tried: list[str], now: datetime
+    ) -> datetime | None:
+        """When some untried preferred provider (adapter built, schedulable) gets
+        quota again — the earliest of their resets — or None if none ever will."""
+        times: list[datetime] = []
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
                 continue
-            if self.inventory.get(pid).schedulable_reason() is None:
-                return True
-        return False
+            if self.inventory.get(pid).schedulable_reason() is not None:
+                continue
+            times.append(self.spent_until(pid, now) or self.next_reset(pid, now))
+        return min(times) if times else None
 
     def step(self, requests: dict[str, tuple[list[str], GenerationRequest]]) -> StepReport:
         """Advance every due job once. ``requests`` maps batch id ->
@@ -219,84 +259,131 @@ class Scheduler:
         self.conn.commit()
         return report
 
+    def _spend_and_claim(
+        self, row: sqlite3.Row, provider_id: str, token: str, fields: dict[str, object]
+    ) -> str:
+        """Atomically spend one unit of the provider's quota AND claim the job.
+        Returns 'ok', 'no_quota' (the last unit went elsewhere) or 'lost'
+        (another process claimed the job). Nothing changes unless 'ok'."""
+        provider = self.inventory.get(provider_id)
+        now = self.clock()
+        day = self.quota_day(provider_id, now)
+        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO quota_usage (provider, day, used) VALUES (?, ?, 0)",
+                (provider_id, day),
+            )
+            spent = self.conn.execute(
+                "UPDATE quota_usage SET used = used + 1 "
+                "WHERE provider = ? AND day = ? AND used < ?",
+                (provider_id, day, provider.daily_quota or 0),
+            ).rowcount
+            if spent != 1:
+                self.conn.rollback()
+                return "no_quota"
+            cols = ", ".join(f"{k} = ?" for k in fields)
+            claimed = self.conn.execute(
+                f"UPDATE jobs SET status = 'submitting', claim = ?, {cols} "
+                "WHERE id = ? AND status = 'queued' AND claim IS ?",
+                (token, *fields.values(), row["id"], row["claim"]),
+            ).rowcount
+            if claimed != 1:
+                self.conn.rollback()
+                return "lost"
+            self.conn.commit()
+            return "ok"
+        except BaseException:
+            self.conn.rollback()
+            raise
+
     def _submit(
         self,
         row: sqlite3.Row,
         preference: list[str],
         template: GenerationRequest,
-        now: datetime,
+        _step_start: datetime,
         report: StepReport,
     ) -> None:
         tried: list[str] = json.loads(row["tried_providers"])
-        provider_id = row["provider"]
-        if (
-            provider_id is None
-            or provider_id in tried
-            or provider_id not in self.adapters.adapters  # not built this run
-            or self.quota_remaining(provider_id, now) <= 0
-        ):
-            provider_id = self._pick_provider(preference, tried, now)
-        if provider_id is None:
-            if self._any_provider_left_later(preference, tried):
-                tomorrow = (now + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                self._write(
+        excluded: set[str] = set()
+        token = uuid.uuid4().hex
+        while True:
+            now = self.clock()  # read at the claim, never at step start
+            provider_id = row["provider"]
+            if (
+                provider_id is None
+                or provider_id in tried
+                or provider_id in excluded
+                or provider_id not in self.adapters.adapters  # not built this run
+                or self.quota_remaining(provider_id, now) <= 0
+            ):
+                provider_id = self._pick_provider(preference, [*tried, *excluded], now)
+            if provider_id is None:
+                window = self._next_window(preference, tried, now)
+                if window is not None:
+                    self._write(
+                        row["id"],
+                        row["claim"],
+                        "queued",
+                        provider=None,
+                        next_attempt_at=_iso(window),
+                        last_error="every preferred provider's quota is spent; deferred to "
+                        f"its reset at {_iso(window)}",
+                    )
+                elif self._write(
                     row["id"],
                     row["claim"],
                     "queued",
-                    provider=None,
-                    next_attempt_at=_iso(tomorrow),
-                    last_error="every preferred provider's daily quota is spent; deferred",
-                )
-            elif self._write(
-                row["id"],
-                row["claim"],
-                "queued",
-                status="failed",
-                last_error=row["last_error"] or "no schedulable provider in the brief's preference",
-            ):
-                report.failed.append(row["id"])
-            return
+                    status="failed",
+                    last_error=row["last_error"]
+                    or "no schedulable provider in the brief's preference",
+                ):
+                    report.failed.append(row["id"])
+                return
+            adapter = self.adapters.adapters[provider_id]
+            lease = self._lease(adapter.hard_timeout_s, self.policy.submit_stale_s)
+            # The claim records exactly what is being sent (prompt, model) and the
+            # terms as reviewed right now (D5); ingest reads only these.
+            outcome = self._spend_and_claim(
+                row,
+                provider_id,
+                token,
+                {
+                    "provider": provider_id,
+                    "prompt": template.prompt,
+                    "model": adapter.model,
+                    "terms_json": TermsSnapshot.of(self.inventory.get(provider_id)).to_json(),
+                    "next_attempt_at": _iso(now + timedelta(seconds=lease)),
+                    "updated_at": _iso(now),
+                },
+            )
+            if outcome == "lost":
+                return
+            if outcome == "no_quota":
+                excluded.add(provider_id)
+                continue
+            break
 
         attempts = row["attempts"] if provider_id == row["provider"] else 0
-        adapter = self.adapters.adapters[provider_id]
-        token = uuid.uuid4().hex
         request = GenerationRequest(
             job_id=row["id"],
             prompt=template.prompt,
             aspect_ratio=template.aspect_ratio,
             reference_images=template.reference_images,
         )
-        lease = self._lease(adapter.hard_timeout_s, self.policy.submit_stale_s)
-        # Atomic claim. It records exactly what is being sent (prompt, model)
-        # and the terms as reviewed right now (D5); ingest reads only these.
-        # Quota is spent in the same transaction, BEFORE the request leaves.
-        claimed = self.conn.execute(
-            "UPDATE jobs SET status = 'submitting', claim = ?, provider = ?, prompt = ?, "
-            "model = ?, terms_json = ?, next_attempt_at = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'queued' AND claim IS ?",
-            (
-                token,
-                provider_id,
-                request.prompt,
-                adapter.model,
-                TermsSnapshot.of(self.inventory.get(provider_id)).to_json(),
-                _iso(now + timedelta(seconds=lease)),
-                _iso(now),
-                row["id"],
-                row["claim"],
-            ),
-        ).rowcount
-        if claimed != 1:
-            self.conn.rollback()
-            return  # another process claimed it
-        self._consume_quota(provider_id, now)
-        self.conn.commit()
-
         try:
             handle = adapter.submit(request, self.staging_dir / row["id"] / token)
+        except QuotaExhaustedError as e:
+            self._quota_exhausted(row["id"], token, "submitting", provider_id, str(e))
+            return
         except TransientProviderError as e:
+            if _QUOTA_TEXT.search(str(e)):
+                # An adapter that did not type its quota error.
+                self._quota_exhausted(row["id"], token, "submitting", provider_id, str(e))
+                return
+            now = self.clock()
             attempts += 1
             if attempts >= self.policy.max_attempts_per_provider:
                 self._give_up_on_provider(
@@ -317,9 +404,10 @@ class Scheduler:
             return
         except PermanentProviderError as e:
             self._give_up_on_provider(
-                row["id"], token, "submitting", provider_id, tried, str(e), now
+                row["id"], token, "submitting", provider_id, tried, str(e), self.clock()
             )
             return
+        now = self.clock()
         # Persist the handle at once, under our claim. If the claim was taken
         # over while we waited on the provider, this result is discarded.
         if not self._write(
@@ -340,6 +428,24 @@ class Scheduler:
         # Poll straight away; a synchronous provider is already done.
         fresh = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
         self._poll(fresh, now, report)
+
+    def _quota_exhausted(
+        self, job_id: str, claim: str, status: str, provider_id: str, error: str
+    ) -> None:
+        """The provider's quota is spent: mark it spent until its reset and put
+        the job back — NOT as a tried provider and NOT as a failed attempt."""
+        now = self.clock()
+        self._mark_spent(provider_id, now)
+        self._write(
+            job_id,
+            claim,
+            status,
+            status="queued",
+            claim=None,
+            provider=None,
+            next_attempt_at=_iso(now),
+            last_error=f"{provider_id}: quota exhausted until {_iso(self.next_reset(provider_id, now))}: {error}",
+        )
 
     def _give_up_on_provider(
         self,
@@ -366,7 +472,8 @@ class Scheduler:
             status="queued",
         )
 
-    def _poll(self, row: sqlite3.Row, now: datetime, report: StepReport) -> None:
+    def _poll(self, row: sqlite3.Row, _now: datetime, report: StepReport) -> None:
+        now = self.clock()  # read at the claim, never at step start
         provider_id = row["provider"]
         tried: list[str] = json.loads(row["tried_providers"])
         adapter = self.adapters.adapters.get(provider_id)
@@ -480,11 +587,14 @@ class Scheduler:
         requests: dict[str, tuple[list[str], GenerationRequest]],
         sleep: Callable[[float], None] = time.sleep,
         horizon: timedelta = timedelta(minutes=30),
+        on_iteration: Callable[[], None] | None = None,
     ) -> StepReport:
         """Step until every job of the given batches is terminal or deferred
         beyond ``horizon`` (e.g. to tomorrow's quota)."""
         total = StepReport()
         while True:
+            if on_iteration is not None:
+                on_iteration()  # e.g. renew the batch lease; raises to stop
             r = self.step(requests)
             total.completed.extend(r.completed)
             total.failed.extend(r.failed)

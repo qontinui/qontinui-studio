@@ -15,6 +15,8 @@ pyyaml = "^6.0"
 click = "^8.1"
 httpx = "^0.28"
 pillow = "^12"
+# IANA zones for per-provider quota resets (zoneinfo has no database on Windows).
+tzdata = ">=2024.1"
 google-genai = "^1.0"
 # Optional [bg] extra: background removal. Absent -> BackgroundRemovalUnavailable.
 rembg = { version = "^2.0", optional = true }

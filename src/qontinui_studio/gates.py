@@ -14,8 +14,9 @@ import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal, Protocol
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -149,7 +150,7 @@ ACCEPTED_SUMMARIES = ("OK", "WARNING")
 
 
 def http_page_health_probe(url: str) -> dict[str, object]:
-    """POST the UI Bridge page-health endpoint (see the knowledge-base doc
+    """POST a UI Bridge page-health endpoint (knowledge-base doc
     ``page-health-diagnostic.md``) and return its JSON body."""
     resp = httpx.post(url, timeout=30.0)
     resp.raise_for_status()
@@ -160,20 +161,23 @@ def http_page_health_probe(url: str) -> dict[str, object]:
 
 
 def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) -> GateResult:
-    """A UI Bridge page-health pass over the site's running preview.
+    """A UI Bridge page-health pass: ``probe`` is POSTed the site's bridge
+    page-health URL. Only OK/WARNING pass; any probe error refuses.
 
-    A site that declares no ``page_health_url`` is ``not_configured``, which
-    REFUSES publication. There is no waiver (plan D7)."""
+    A site that declares no UI Bridge preview is ``not_configured``, which
+    REFUSES publication. There is no waiver (plan D7). In the publish path this
+    runs inside :func:`d7_preview_page`, after the bridged page was navigated to
+    this batch's preview."""
     subject = f"site {site.id}"
-    if not site.page_health_url:
+    if not site.ui_bridge_url:
         return GateResult(
             "d7_page_health",
             subject,
             "not_configured",
-            "site declares no page_health_url; D7 page health is required — refused",
+            "site declares no UI Bridge preview; D7 page health is required — refused",
         )
     try:
-        body = probe(site.page_health_url)
+        body = probe(site.ui_bridge_url.rstrip("/") + "/control/page-health")
     except Exception as e:  # any probe failure is UNKNOWN; UNKNOWN does not publish
         return GateResult(
             "d7_page_health", subject, "fail", f"page-health probe failed: {type(e).__name__}: {e}"
@@ -194,6 +198,168 @@ def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) 
             f"page-health summary '{summary}' (only {'/'.join(ACCEPTED_SUMMARIES)} publish)",
         )
     return GateResult("d7_page_health", subject, "pass", f"page-health summary {summary}")
+
+
+# ---- the UI Bridge that D7 drives ---------------------------------------------
+
+
+class UiBridge(Protocol):
+    """The three UI Bridge control routes D7 uses (knowledge-base ``ui-bridge.md``):
+    ``POST /control/page/navigate`` (drive the bridged page to a URL),
+    ``GET /control/snapshot`` (``page.url`` = the current URL; media elements
+    carry ``mediaMetadata`` with ``src``, ``naturalWidth`` and ``loadingState``)
+    and ``POST /control/page-health``."""
+
+    def navigate(self, url: str) -> None: ...
+
+    def snapshot(self) -> dict[str, Any]: ...
+
+    def page_health(self) -> dict[str, Any]: ...
+
+
+BridgeFactory = Callable[[str], UiBridge]
+
+
+class BridgeError(Exception):
+    """The bridge refused or could not deliver a command."""
+
+
+class HttpUiBridge:
+    """The UI Bridge control API over HTTP. ``base_url`` is the prefix the
+    ``/control/*`` routes hang off, e.g. ``http://127.0.0.1:3000/__ui-bridge``
+    for the injection proxy in front of a preview server."""
+
+    def __init__(self, base_url: str, http: httpx.Client | None = None) -> None:
+        self.base = base_url.rstrip("/")
+        self.http = http or httpx.Client(timeout=30.0)
+
+    def _body(self, resp: httpx.Response) -> dict[str, Any]:
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, dict):
+            raise BridgeError("bridge answered a non-object body")
+        # A no-tab drive call is an HTTP 200 with success:false (ui-bridge.md):
+        # branch on `success`, never on the status.
+        if body.get("success") is not True:
+            raise BridgeError(f"bridge refused: {body.get('error') or body}")
+        return body
+
+    def navigate(self, url: str) -> None:
+        body = self._body(
+            self.http.post(f"{self.base}/control/page/navigate", json={"url": url, "mode": "hard"})
+        )
+        data = body.get("data")
+        if isinstance(data, dict) and data.get("delivered") is False:
+            raise BridgeError("navigate was not delivered to any tab")
+        # navigate is fire-and-forget (DELIVERED, not EXECUTED): wait for the new
+        # document to settle; the caller then confirms the URL via a snapshot.
+        self._body(self.http.post(f"{self.base}/control/wait-for-idle", json={"timeout": 20000}))
+
+    def snapshot(self) -> dict[str, Any]:
+        data = self._body(self.http.get(f"{self.base}/control/snapshot")).get("data")
+        if not isinstance(data, dict):
+            raise BridgeError("snapshot carried no data")
+        return data
+
+    def page_health(self) -> dict[str, Any]:
+        return self._body(self.http.post(f"{self.base}/control/page-health"))
+
+
+def preview_target(site: Site, batch_id: str) -> str:
+    """The preview URL for one batch: the batch id rides in the query string,
+    so the bridged page's own URL proves which batch it loaded."""
+    assert site.preview_url is not None
+    sep = "&" if "?" in site.preview_url else "?"
+    return f"{site.preview_url}{sep}{urlencode({'studio_batch': batch_id})}"
+
+
+def _current_url(snapshot: dict[str, Any]) -> str | None:
+    page = snapshot.get("page")
+    url = page.get("url") if isinstance(page, dict) else None
+    return url if isinstance(url, str) else None
+
+
+def d7_images(site: Site, snapshot: dict[str, Any], slot_files: dict[str, list[str]]) -> GateResult:
+    """Every slot this batch changes renders on the preview page: at least one
+    image element whose source is one of the slot's files, and every such
+    element loaded (``naturalWidth > 0``, ``loadingState == 'loaded'``)."""
+    subject = f"site {site.id}"
+    media: list[dict[str, Any]] = []
+    for element in snapshot.get("elements") or []:
+        meta = element.get("mediaMetadata") if isinstance(element, dict) else None
+        if isinstance(meta, dict) and isinstance(meta.get("src"), str):
+            media.append(meta)
+    problems: list[str] = []
+    for slot, names in sorted(slot_files.items()):
+        shown = [m for m in media if PurePosixPath(urlparse(m["src"]).path).name in names]
+        if not shown:
+            problems.append(
+                f"slot '{slot}' ({', '.join(names)}) is not rendered on the preview page"
+            )
+            continue
+        for m in shown:
+            if not (isinstance(m.get("naturalWidth"), int | float) and m["naturalWidth"] > 0) or (
+                m.get("loadingState") != "loaded"
+            ):
+                problems.append(
+                    f"slot '{slot}' image {m['src']} did not load "
+                    f"(naturalWidth={m.get('naturalWidth')}, state={m.get('loadingState')})"
+                )
+    if problems:
+        return GateResult("d7_images", subject, "fail", "; ".join(problems))
+    return GateResult(
+        "d7_images", subject, "pass", f"{len(slot_files)} slot(s) rendered and loaded"
+    )
+
+
+def d7_preview_page(
+    site: Site,
+    batch_id: str,
+    slot_files: dict[str, list[str]],
+    bridge_factory: BridgeFactory,
+) -> list[GateResult]:
+    """D7 bound to THIS batch's preview: navigate the bridged page to the
+    batch's preview URL and confirm (by the page's own URL) that it is there,
+    run page health, confirm the page did not move during it, and check every
+    changed slot's images loaded."""
+    subject = f"site {site.id}"
+    if not (site.ui_bridge_url and site.preview_url):
+        return [d7_page_health(site)]
+    target = preview_target(site, batch_id)
+    try:
+        bridge = bridge_factory(site.ui_bridge_url)
+        bridge.navigate(target)
+        before = bridge.snapshot()
+    except Exception as e:  # an unreachable bridge is UNKNOWN; UNKNOWN does not publish
+        return [GateResult("d7_navigate", subject, "fail", f"{type(e).__name__}: {e}")]
+    if _current_url(before) != target:
+        return [
+            GateResult(
+                "d7_navigate",
+                subject,
+                "fail",
+                f"bridged page is at {_current_url(before)!r}, not this batch's preview {target!r}",
+            )
+        ]
+    results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {target}")]
+    results.append(d7_page_health(site, lambda _url: bridge.page_health()))
+    try:
+        after = bridge.snapshot()
+    except Exception as e:
+        results.append(GateResult("d7_navigate", subject, "fail", f"{type(e).__name__}: {e}"))
+        return results
+    if _current_url(after) != target:
+        results.append(
+            GateResult(
+                "d7_navigate",
+                subject,
+                "fail",
+                f"page moved to {_current_url(after)!r} during the page-health check",
+            )
+        )
+        return results
+    results.append(d7_images(site, after, slot_files))
+    return results
 
 
 ManifestFetch = Callable[[str], bytes]

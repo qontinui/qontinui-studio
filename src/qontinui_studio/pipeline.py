@@ -24,12 +24,12 @@ from PIL import Image
 
 from qontinui_studio.adapters import AdapterSet, GenerationRequest
 from qontinui_studio.briefs import LoadedBrief, load_brief, validate_brief
-from qontinui_studio.errors import ConfigError
+from qontinui_studio.errors import ConfigError, LeaseLost, StudioError
 from qontinui_studio.gates import (
+    BridgeFactory,
+    HttpUiBridge,
     ManifestFetch,
-    PageHealthProbe,
     http_manifest_fetch,
-    http_page_health_probe,
 )
 from qontinui_studio.library import Library, TermsSnapshot
 from qontinui_studio.notify import Notifier
@@ -78,7 +78,7 @@ class Context:
     clock: Callable[[], datetime] = _now
     sleep: Callable[[float], None] = _sleep
     policy: RetryPolicy = field(default_factory=RetryPolicy)
-    probe: PageHealthProbe = http_page_health_probe
+    bridge: BridgeFactory = HttpUiBridge
     fetch: ManifestFetch = http_manifest_fetch
 
     def scheduler(self) -> Scheduler:
@@ -93,7 +93,9 @@ class Context:
         )
 
 
-def new_batch(ctx: Context, loaded: LoadedBrief) -> str:
+def new_batch(ctx: Context, loaded: LoadedBrief, publish: bool = True) -> str:
+    """Create a batch. ``publish=False`` records ``no_publish``: resume will
+    generate it but never publish it."""
     now = ctx.clock()
     stamp = now.strftime("%Y%m%dT%H%M%S")
     batch_id = f"{loaded.brief.id}-{stamp}"
@@ -104,7 +106,7 @@ def new_batch(ctx: Context, loaded: LoadedBrief) -> str:
     targets = [[t.site, t.slot] for t in loaded.brief.targets if t.is_slot]
     ctx.conn.execute(
         "INSERT INTO batches (id, brief_id, brief_path, brief_sha256, targets_json, created_at, "
-        "status) VALUES (?,?,?,?,?,?, 'generating')",
+        "status, no_publish) VALUES (?,?,?,?,?,?, 'generating', ?)",
         (
             batch_id,
             loaded.brief.id,
@@ -112,6 +114,7 @@ def new_batch(ctx: Context, loaded: LoadedBrief) -> str:
             loaded.sha256,
             json.dumps(targets),
             now.isoformat(),
+            0 if publish else 1,
         ),
     )
     ctx.conn.commit()
@@ -133,7 +136,9 @@ def _request_for(loaded: LoadedBrief) -> tuple[list[str], GenerationRequest]:
 
 
 INGEST_LEASE_S = 600.0
-BATCH_LEASE_S = 6 * 3600.0
+# Renewed on every scheduler iteration and before ingest, so it only has to
+# outlast one iteration (a sleep up to the 30 min horizon + one provider call).
+BATCH_LEASE_S = 3600.0
 
 
 def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
@@ -286,12 +291,32 @@ class _Lease:
         self.ctx.conn.commit()
         return cur.rowcount == 1
 
+    def renew(self) -> None:
+        """Extend the lease from NOW. Raises :class:`LeaseLost` when it is no
+        longer held (expired, or taken over) — the caller must stop driving."""
+        now = self.ctx.clock()
+        cur = self.ctx.conn.execute(
+            "UPDATE batches SET driver_until = ? "
+            "WHERE id = ? AND status = 'generating' AND driver = ? AND driver_until > ?",
+            (
+                (now + timedelta(seconds=BATCH_LEASE_S)).isoformat(),
+                self.batch_id,
+                self.token,
+                now.isoformat(),
+            ),
+        )
+        self.ctx.conn.commit()
+        if cur.rowcount != 1:
+            raise LeaseLost(f"lost the lease on batch {self.batch_id}")
+
     def set_status(self, status: str, reason: str | None = None) -> bool:
-        """Set the batch status and release the lease, only if still held."""
+        """Set the batch status and release the lease, only if still held and
+        unexpired."""
+        now = self.ctx.clock()
         cur = self.ctx.conn.execute(
             "UPDATE batches SET status = ?, reason = ?, driver = NULL, driver_until = NULL "
-            "WHERE id = ? AND status = 'generating' AND driver = ?",
-            (status, reason, self.batch_id, self.token),
+            "WHERE id = ? AND status = 'generating' AND driver = ? AND driver_until > ?",
+            (status, reason, self.batch_id, self.token, now.isoformat()),
         )
         self.ctx.conn.commit()
         return cur.rowcount == 1
@@ -329,19 +354,31 @@ def drive_batch(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutco
         outcome = _drive_leased(ctx, row, lease)
     finally:
         lease.release()
-    if publish and outcome.status == "generated":
+    if publish and outcome.status == "generated" and not row["no_publish"]:
+        _publish_into(ctx, outcome)
+    return outcome
+
+
+def _publish_into(ctx: Context, outcome: BatchOutcome) -> None:
+    """Publish a generated batch. A publish that could not even start (e.g. a
+    site's leftover journal is invalid) leaves the batch 'generated' with the
+    error recorded; the next `jobs run` retries it."""
+    try:
         outcome.publish = publish_batch(
             ctx.conn,
             ctx.sites,
-            batch_id,
+            outcome.batch_id,
             ctx.notifier,
             ctx.clock,
-            ctx.probe,
-            ctx.fetch,
+            bridge=ctx.bridge,
+            fetch=ctx.fetch,
             root=ctx.workspace.root,
         )
-        outcome.status = "published" if outcome.publish.published else "refused"
-    return outcome
+    except StudioError as e:
+        ctx.conn.rollback()
+        outcome.error = f"publish did not start: {type(e).__name__}: {e}"
+        return
+    outcome.status = "published" if outcome.publish.published else "refused"
 
 
 def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome:
@@ -362,7 +399,8 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
         raise ConfigError(reason)
     outcome = BatchOutcome(batch_id=batch_id, status=row["status"])
     outcome.unavailable_providers = dict(ctx.adapters.unavailable)
-    ctx.scheduler().run({batch_id: _request_for(loaded)}, sleep=ctx.sleep)
+    ctx.scheduler().run({batch_id: _request_for(loaded)}, sleep=ctx.sleep, on_iteration=lease.renew)
+    lease.renew()
 
     # An ingest whose process died is reclaimable once its lease lapses.
     now = ctx.clock()
@@ -404,7 +442,7 @@ def run_brief(ctx: Context, brief_path: Path, publish: bool = True) -> BatchOutc
     problems = validate_brief(loaded.brief, ctx.sites, ctx.inventory)
     if problems:
         raise ConfigError(f"{brief_path}: " + "; ".join(problems))
-    batch_id = new_batch(ctx, loaded)
+    batch_id = new_batch(ctx, loaded, publish=publish)
     return drive_batch(ctx, batch_id, publish=publish)
 
 
@@ -415,7 +453,9 @@ def resume_all(ctx: Context, publish: bool = True) -> list[BatchOutcome]:
     the batches that target it. One bad batch never stops the others."""
     report = recover(ctx.conn, ctx.sites, ctx.notifier, root=ctx.workspace.root)
     rows = ctx.conn.execute(
-        "SELECT id, targets_json FROM batches WHERE status = 'generating' ORDER BY created_at"
+        "SELECT id, targets_json, status, no_publish FROM batches "
+        "WHERE status = 'generating' OR (status = 'generated' AND no_publish = 0) "
+        "ORDER BY created_at"
     ).fetchall()
     outcomes: list[BatchOutcome] = []
     for r in rows:
@@ -433,7 +473,16 @@ def resume_all(ctx: Context, publish: bool = True) -> list[BatchOutcome]:
             )
             continue
         try:
-            outcomes.append(drive_batch(ctx, r["id"], publish=publish))
+            if r["status"] == "generated":
+                # Generated but never published (crash, or a publish that could
+                # not start): publish it now.
+                if not publish:
+                    continue
+                stranded = BatchOutcome(batch_id=r["id"], status="generated")
+                _publish_into(ctx, stranded)
+                outcomes.append(stranded)
+            else:
+                outcomes.append(drive_batch(ctx, r["id"], publish=publish))
         except Exception as e:  # one bad batch never stops the others
             ctx.conn.rollback()
             status = ctx.conn.execute(

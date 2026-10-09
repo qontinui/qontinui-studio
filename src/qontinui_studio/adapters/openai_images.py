@@ -22,6 +22,7 @@ from qontinui_studio.adapters.base import (
     PollResult,
     SubmittedJob,
     copy_staged,
+    is_daily_quota,
     read_reference,
     sniff_mime,
     write_staged,
@@ -29,6 +30,7 @@ from qontinui_studio.adapters.base import (
 from qontinui_studio.errors import (
     MissingCredentialError,
     PermanentProviderError,
+    QuotaExhaustedError,
     TransientProviderError,
 )
 
@@ -88,6 +90,8 @@ class OpenAIImageAdapter:
         except httpx.TransportError as e:
             raise TransientProviderError(f"openai transport: {e}") from e
 
+        if resp.status_code == 429 and is_daily_quota(resp.text):
+            raise QuotaExhaustedError(f"openai 429: {_error_message(resp)}")
         if resp.status_code == 429 or resp.status_code >= 500:
             retry_after = resp.headers.get("retry-after")
             raise TransientProviderError(

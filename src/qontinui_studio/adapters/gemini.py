@@ -23,12 +23,14 @@ from qontinui_studio.adapters.base import (
     PollResult,
     SubmittedJob,
     copy_staged,
+    is_daily_quota,
     read_reference,
     write_staged,
 )
 from qontinui_studio.errors import (
     MissingCredentialError,
     PermanentProviderError,
+    QuotaExhaustedError,
     TransientProviderError,
 )
 
@@ -74,6 +76,8 @@ class GeminiImageAdapter:
                 ),
             )
         except genai_errors.APIError as e:
+            if e.code == 429 and is_daily_quota(f"{e.status} {e.message} {e.details}"):
+                raise QuotaExhaustedError(f"gemini {e.code}: {e.message}") from e
             if e.code == 429 or e.code >= 500:
                 raise TransientProviderError(f"gemini {e.code}: {e.message}") from e
             raise PermanentProviderError(f"gemini {e.code}: {e.message}") from e

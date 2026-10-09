@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS batches (
     driver_until TEXT,
     -- Set once the operator notice for the publication was delivered;
     -- recovery re-sends for a published batch that has none.
-    notified_at TEXT
+    notified_at TEXT,
+    -- Created by `brief run --no-publish`: resume never publishes it.
+    no_publish INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -63,6 +65,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     tried_providers TEXT NOT NULL DEFAULT '[]',
     last_error TEXT,
     updated_at TEXT NOT NULL
+);
+
+-- A provider that reported its quota spent (QuotaExhaustedError) is skipped
+-- until its next quota reset.
+CREATE TABLE IF NOT EXISTS provider_spent (
+    provider TEXT PRIMARY KEY,
+    until TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS quota_usage (

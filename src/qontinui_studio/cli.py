@@ -16,7 +16,7 @@ import click
 from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.briefs import load_brief, validate_brief
-from qontinui_studio.errors import ConfigError, PublicationRefused, StudioError
+from qontinui_studio.errors import PublicationRefused, StudioError
 from qontinui_studio.library import Library
 from qontinui_studio.notify import CoordFindingNotifier, FileNotifier
 from qontinui_studio.pipeline import BatchOutcome, Context, resume_all, run_brief
@@ -124,7 +124,7 @@ def brief_run(obj: Obj, path: Path, no_publish: bool) -> None:
     ctx = _context(obj.root)
     try:
         outcome = run_brief(ctx, path, publish=not no_publish)
-    except ConfigError as e:
+    except StudioError as e:
         raise click.ClickException(str(e)) from e
     sys.exit(_report(outcome))
 
@@ -159,15 +159,15 @@ def publish_cmd(obj: Obj, batch_id: str) -> None:
             batch_id,
             ctx.notifier,
             ctx.clock,
-            ctx.probe,
-            ctx.fetch,
+            bridge=ctx.bridge,
+            fetch=ctx.fetch,
             root=obj.root,
         )
-    except ConfigError as e:
-        raise click.ClickException(str(e)) from e
     except PublicationRefused as e:
         click.echo(f"refused: {e}", err=True)
         sys.exit(2)
+    except StudioError as e:
+        raise click.ClickException(str(e)) from e
     for g in result.gate_results:
         click.echo(f"{g.outcome:15} {g.gate:15} {g.subject}: {g.detail}")
     if result.delivery:
@@ -183,13 +183,22 @@ def unpublish_cmd(obj: Obj, batch_id: str) -> None:
     ctx = _context(obj.root)
     try:
         removed = unpublish_batch(
-            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, root=obj.root
+            ctx.conn,
+            ctx.sites,
+            batch_id,
+            ctx.notifier,
+            ctx.clock,
+            root=obj.root,
+            bridge=ctx.bridge,
+            fetch=ctx.fetch,
         )
     except KeyError as e:
         raise click.ClickException(str(e)) from e
     except PublicationRefused as e:
         click.echo(f"refused: {e}", err=True)
         sys.exit(2)
+    except StudioError as e:
+        raise click.ClickException(str(e)) from e
     click.echo(f"unpublished {batch_id}: removed {len(removed)} file(s)")
 
 
