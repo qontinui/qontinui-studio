@@ -80,7 +80,9 @@ Publication is safe against failures, crashes and concurrent runs:
     manifest (by sha256).
   - It drives the bridge to
     `preview_url?studio_batch=<batch>&studio_attempt=<fresh uuid>` with
-    `POST /control/page/navigate`. The attempt token changes on every D7 run,
+    `POST /control/page/navigate` and `{"hard": true}`. Without `hard`, an
+    app with a client-side router changes the URL but keeps the old
+    document. The attempt token changes on every D7 run,
     including an unpublish restore's, so a tab still showing an earlier
     attempt's document never matches. It then polls `GET /control/snapshot` until
     `page.url` is that page, or a 30 s deadline passes. A bridge error while
@@ -97,8 +99,9 @@ Publication is safe against failures, crashes and concurrent runs:
     reports that image's `currentSrc`.
 
     Slot elements are found by their `data-media-id`, never by file name:
-    `studio-<slot>` for the `<picture>` and `studio-<slot>-img` for the
-    `<img>`. UI Bridge's `generateMediaId` uses an explicit `data-media-id`
+    `studio-picture-<slot>` for the `<picture>` and `studio-img-<slot>` for the
+    `<img>`. The kind comes before the slot name, so no two slots' ids can
+    collide. UI Bridge's `generateMediaId` uses an explicit `data-media-id`
     first. Without one, it derives the id from the alt text, which is the same
     site-wide label on every slot, or from the sibling index. Those ids
     collide, and the registry silently drops duplicates. A missing id is
@@ -158,16 +161,20 @@ Publication is safe against failures, crashes and concurrent runs:
 A site template renders each studio slot from `studio-manifest.json`:
 
 ```html
-<picture data-media-id="studio-hero">
+<picture data-media-id="studio-picture-hero">
   <source type="image/avif" srcset="hero.avif?sha={{ slots.hero.sha256.avif }}">
-  <img data-media-id="studio-hero-img"
+  <img data-media-id="studio-img-hero"
        src="hero.webp?sha={{ slots.hero.sha256.webp }}" loading="eager"
+       width="1600" height="900"
        alt="{{ slots.hero.label }}">
 </picture>
 ```
 
-- Every slot's `<picture>` and `<img>` carry `data-media-id="studio-<slot>"`
-  and `data-media-id="studio-<slot>-img"`. D7 finds slots only by these ids.
+- Every slot's `<picture>` and `<img>` carry `data-media-id="studio-picture-<slot>"`
+  and `data-media-id="studio-img-<slot>"`. D7 finds slots only by these ids.
+- The `<img>` has `width` and `height`, the slot's size from the site config.
+  An image that has not loaded yet would otherwise be 0 px wide, and UI Bridge
+  skips zero-size media as not visible.
 - The preview page runs the UI Bridge React auto-registration provider with
   media discovery.
 

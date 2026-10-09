@@ -112,7 +112,7 @@ def test_h2_picture_sources_must_carry_their_sha(tmp_path: Path) -> None:
         "page": {"url": "http://preview.example/?studio_batch=b"},
         "elements": [
             {
-                "id": "studio-hero",
+                "id": "studio-picture-hero",
                 "mediaMetadata": {
                     "src": "/hero.avif?sha=" + "a" * 64,
                     "sources": [{"srcset": "/hero.avif 1x"}],  # no ?sha=: stale cache

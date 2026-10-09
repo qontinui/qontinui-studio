@@ -209,7 +209,7 @@ class Bridge:
         self.navigated: list[str] = []
         self.fail_snapshots = 0
 
-    def navigate(self, url: str) -> None:
+    def navigate(self, url: str, *, hard: bool = False) -> None:
         self.navigated.append(url)
         self.url = self.url_after_nav if self.url_after_nav != "same" else url
 
@@ -227,7 +227,7 @@ SHA = "a" * 64
 
 
 def _img(
-    src: str, width: int = 1600, state: str = "loaded", mid: str = "studio-hero"
+    src: str, width: int = 1600, state: str = "loaded", mid: str = "studio-picture-hero"
 ) -> dict[str, object]:
     return {
         "id": mid,
@@ -267,7 +267,7 @@ def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
     assert last.failed and "not one of the slot's files" in last.detail
     nothing = Bridge("same", [_img(f"/hero.webp?sha={SHA}", mid="img-illustrative")])
     last = _run(site, nothing, files)[-1]
-    assert last.failed and 'data-media-id="studio-hero"' in last.detail
+    assert last.failed and 'data-media-id="studio-picture-hero"' in last.detail
 
 
 @pytest.mark.parametrize(
@@ -286,7 +286,7 @@ def test_d7_navigation_compares_browser_normalised_urls(preview_url: str) -> Non
     site = _site(**{**PREVIEW, "preview_url": preview_url})
     origin_url = browser_href(preview_url)
     bridge = Bridge(None, [_img(f"{origin_url.rsplit('/', 1)[0]}/hero.webp?sha={SHA}")])
-    bridge.navigate = lambda url: setattr(bridge, "url", browser_href(url))  # type: ignore[method-assign]
+    bridge.navigate = lambda url, hard=False: setattr(bridge, "url", browser_href(url))  # type: ignore[method-assign]
     results = _run(site, bridge, {"hero": {"hero.webp": SHA}})
     assert [g.outcome for g in results] == ["pass", "pass", "pass"], results
 
@@ -326,7 +326,7 @@ def test_d7_images_must_come_from_the_preview_with_this_batchs_sha() -> None:
     assert g.failed and "hero.avif" in g.detail
     snap["elements"] = [
         _img("/hero.webp?sha=" + "c" * 64),
-        _img("/hero.avif?sha=" + "b" * 64, mid="studio-hero-img"),
+        _img("/hero.avif?sha=" + "b" * 64, mid="studio-img-hero"),
     ]
     g = d7_images(site, snap, files, lambda u: b"")
     assert g.failed and "not this batch's hero.webp" in g.detail

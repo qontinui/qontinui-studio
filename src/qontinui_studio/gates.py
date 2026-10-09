@@ -213,7 +213,7 @@ class UiBridge(Protocol):
     carry ``mediaMetadata`` with ``src``, ``naturalWidth`` and ``loadingState``)
     and ``POST /control/page-health``."""
 
-    def navigate(self, url: str) -> None: ...
+    def navigate(self, url: str, *, hard: bool = True) -> None: ...
 
     def snapshot(self) -> dict[str, Any]: ...
 
@@ -248,9 +248,16 @@ class HttpUiBridge:
             raise BridgeError(f"bridge refused: {body.get('error') or body}")
         return body
 
-    def navigate(self, url: str) -> None:
+    def navigate(self, url: str, *, hard: bool = True) -> None:
+        # ``hard: true`` forces a full document load. Without it, a page that
+        # registered a navigateHandler (any SPA router) does a CLIENT-side
+        # route change: the URL updates at once while the old document's DOM
+        # stays, and D7 would judge a stale page.
         body = self._body(
-            self.http.post(f"{self.base}/control/page/navigate", json={"url": url, "mode": "hard"})
+            self.http.post(
+                f"{self.base}/control/page/navigate",
+                json={"url": url, "mode": "hard" if hard else "soft", "hard": hard},
+            )
         )
         data = body.get("data")
         if isinstance(data, dict) and data.get("delivered") is False:
@@ -325,12 +332,15 @@ def _current_url(snapshot: dict[str, Any]) -> str | None:
 
 def slot_media_ids(slot: str) -> tuple[str, str]:
     """The ``data-media-id`` a site template gives a studio slot's ``<picture>``
-    and its ``<img>``. UI Bridge's ``generateMediaId`` honours an explicit
+    and its ``<img>``: ``studio-picture-<slot>`` and ``studio-img-<slot>``. The
+    kind comes BEFORE the slot name, so no two slots' ids can collide (a
+    ``<slot>-img`` suffix would make slot ``hero``'s img and slot ``hero-img``'s
+    picture the same id). UI Bridge's ``generateMediaId`` honours an explicit
     ``data-media-id`` first; without it, ids come from the alt text (the same
     site-wide label on every slot) or sibling index and COLLIDE, and the
     registry silently drops every duplicate — so D7 identifies slots by these
     ids, never by guessing from file names."""
-    return f"studio-{slot}", f"studio-{slot}-img"
+    return f"studio-picture-{slot}", f"studio-img-{slot}"
 
 
 def _media(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -564,7 +574,7 @@ def d7_preview_page(
             if bridge is None:
                 bridge = bridge_factory(site.ui_bridge_url)
             if not navigated:
-                bridge.navigate(target)
+                bridge.navigate(target, hard=True)
                 navigated = True
             snap = bridge.snapshot()
             seen = _current_url(snap)

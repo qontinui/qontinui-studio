@@ -272,12 +272,23 @@ class FakeBridge:
         self.preview = preview
         self.site = site
         self.url: str | None = preview.stale_url.get(site)
+        # The DOM of the currently loaded document, as the manifest it was
+        # rendered from. A HARD navigation loads a new document (re-rendered
+        # from the preview as it is now); a client-side navigation only
+        # changes the URL and keeps this DOM.
+        self.document: bytes | None = None
 
-    def navigate(self, url: str) -> None:
+    def navigate(self, url: str, *, hard: bool = False) -> None:
+        """Like the real bridge's pageNavigate: only ``hard`` reloads the
+        document; otherwise an app with a client-side router just updates the
+        URL and keeps the old DOM."""
         self.preview.navigated.append(url)
         href = browser_href(url)
         if href.startswith(f"http://preview.test/{self.site}") and not self.preview.ignore_navigate:
             self.url = href
+            if hard:
+                manifest = self.preview.previews / self.site / "studio-manifest.json"
+                self.document = manifest.read_bytes() if manifest.is_file() else None
 
     def snapshot(self) -> dict[str, object]:
         site_dir = self.preview.previews / self.site
@@ -285,14 +296,16 @@ class FakeBridge:
         manifest_path = site_dir / "studio-manifest.json"
         if not self.preview.media_discovery:
             elements.append({"id": "a-home", "type": "link"})
-        elif manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text())
+        elif self.document is not None or manifest_path.is_file():
+            manifest = json.loads(
+                self.document if self.document is not None else manifest_path.read_bytes()
+            )
             registered: set[str] = set()
             for slot, entry in manifest.get("slots", {}).items():
                 # The template renders each slot in its own <section> as
-                #   <picture data-media-id="studio-<slot>">
+                #   <picture data-media-id="studio-picture-<slot>">
                 #     <source type=image/avif srcset="hero.avif?sha=…">
-                #     <img data-media-id="studio-<slot>-img" src="hero.webp?sha=…"
+                #     <img data-media-id="studio-img-<slot>" src="hero.webp?sha=…"
                 #          alt="<label>" loading="eager">
                 #   </picture><p><label></p>
                 # A browser fetches ONE file (avif when offered); the bridge
@@ -330,7 +343,7 @@ class FakeBridge:
                 section = DomNode("section", children=["picture", "p"])
                 picture = DomNode(
                     "picture",
-                    {"data-media-id": f"studio-{slot}"} if explicit else {},
+                    {"data-media-id": f"studio-picture-{slot}"} if explicit else {},
                     parent=section,
                 )
                 img_attrs = {
@@ -338,7 +351,7 @@ class FakeBridge:
                     "src": f"{files[fallback]}?sha={shas.get(fallback, '')}",
                 }
                 if explicit:
-                    img_attrs["data-media-id"] = f"studio-{slot}-img"
+                    img_attrs["data-media-id"] = f"studio-img-{slot}"
                 img = DomNode(
                     "img", img_attrs, parent=DomNode("picture", children=["source", "img"])
                 )

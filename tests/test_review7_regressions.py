@@ -42,8 +42,8 @@ def test_f1_generate_media_id_port_reproduces_the_collision() -> None:
     assert picture() == picture() == "picture-child-0"
     assert img("hero.webp") == img("about.webp") == "img-illustrative-image-ai-generate"
     # With them, ids are the slot's own.
-    assert picture("studio-hero") == "studio-hero"
-    assert img("hero.webp", "studio-hero-img") == "studio-hero-img"
+    assert picture("studio-picture-hero") == "studio-picture-hero"
+    assert img("hero.webp", "studio-img-hero") == "studio-img-hero"
 
 
 def test_f1_a_template_without_media_ids_is_refused_naming_the_missing_id(
@@ -54,8 +54,8 @@ def test_f1_a_template_without_media_ids_is_refused_naming_the_missing_id(
     assert out.status == "refused"
     assert out.publish is not None
     details = " ".join(g.detail for g in out.publish.failures if g.gate == "d7_images")
-    assert 'data-media-id="studio-hero"' in details
-    assert 'data-media-id="studio-og"' in details
+    assert 'data-media-id="studio-picture-hero"' in details
+    assert 'data-media-id="studio-picture-og"' in details
 
 
 def test_f1_the_readme_template_passes_with_two_slots(
@@ -122,3 +122,70 @@ def test_f2_a_retry_never_binds_to_the_previous_attempts_page(
     assert any(g.gate == "d7_navigate" and "cafe" in g.subject for g in retry.failures), (
         retry.failures
     )
+
+
+# ---- eighth review ---------------------------------------------------------------
+
+
+def test_r8_navigate_asks_for_a_hard_load() -> None:
+    import json
+
+    import httpx
+
+    from qontinui_studio.gates import HttpUiBridge
+
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"success": True, "data": {"delivered": True}})
+
+    bridge = HttpUiBridge(
+        "http://preview.test/__ui-bridge", httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    bridge.navigate("http://preview.test/index.html?studio_batch=b&studio_attempt=a")
+    assert seen == [
+        {
+            "url": "http://preview.test/index.html?studio_batch=b&studio_attempt=a",
+            "mode": "hard",
+            "hard": True,
+        }
+    ]
+
+
+def test_r8_a_client_side_navigation_keeps_the_stale_document(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    clock: FakeClock,
+    preview: FakePreview,
+) -> None:
+    """The fake models a router app: without hard=True the URL changes and the
+    DOM stays. D7 asks for a hard load, so a republish sees the new document;
+    if it did not, the stale document's ?sha= would refuse it."""
+    tabs: dict[str, FakeBridge] = {}
+
+    def factory(base_url: str) -> FakeBridge:
+        site = base_url.removeprefix("http://preview.test/").split("/", 1)[0]
+        return tabs.setdefault(site, preview.bridge(base_url))
+
+    first = run_brief(make_context(bridge=factory), write_brief(name="a.yaml"))
+    assert first.status == "published"
+    clock.sleep(5)
+    second = run_brief(make_context(bridge=factory), write_brief(name="b.yaml"))
+    assert second.status == "published", second.publish and second.publish.failures
+
+    # The same tabs, navigated client-side only: the DOM is still batch B's.
+    cafe = tabs["cafe"]
+    before = cafe.snapshot()["elements"]
+    cafe.navigate("http://preview.test/cafe/index.html?studio_batch=x&studio_attempt=y")
+    assert cafe.url and "studio_attempt=y" in cafe.url
+    assert cafe.snapshot()["elements"] == before
+
+
+def test_r8_slot_names_cannot_make_media_ids_collide() -> None:
+    from qontinui_studio.gates import slot_media_ids
+
+    names = ["hero", "hero-img", "img-hero", "picture-hero", "og", "picture", "img"]
+    ids = [mid for n in names for mid in slot_media_ids(n)]
+    assert len(ids) == len(set(ids))

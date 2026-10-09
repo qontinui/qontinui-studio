@@ -314,7 +314,7 @@ def test_http_ui_bridge_speaks_the_bridge_wire_format(
     bridge.navigate("http://preview.local/index.html?studio_batch=b")
     assert state["requests"][0] == (
         "/__ui-bridge/control/page/navigate",
-        {"url": "http://preview.local/index.html?studio_batch=b", "mode": "hard"},
+        {"url": "http://preview.local/index.html?studio_batch=b", "mode": "hard", "hard": True},
     )
     assert bridge.snapshot()["page"]["url"] == "http://preview.local/index.html?studio_batch=b"
     assert bridge.page_health()["data"]["summary"] == "WARNING"
