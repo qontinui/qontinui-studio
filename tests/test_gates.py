@@ -157,9 +157,35 @@ def test_the_runner_and_supervisor_uis_are_never_the_bridge(url: str) -> None:
         _site(**{**PREVIEW, "ui_bridge_url": url})
 
 
-def test_bridge_guard_allows_other_ports_and_needs_all_fields() -> None:
+def test_bridge_guard_allows_other_ports_and_needs_all_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+
+    real = socket.getaddrinfo
+
+    def fake_dns(host: str, *args: object, **kwargs: object) -> object:
+        table = {"preview.example": "192.0.2.10", "localtest.me": "127.0.0.1"}
+        if host in table:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (table[host], 0))]
+        if host == "nowhere.invalid":
+            raise socket.gaierror("no such host")
+        return real(host, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_dns)
     assert _site(**{**PREVIEW, "ui_bridge_url": "http://127.0.0.1:4001/__ui-bridge"})
+    # A remote host on 9876 is fine — it is not this machine.
     assert _site(**{**PREVIEW, "ui_bridge_url": "http://preview.example:9876/__ui-bridge"})
+    # A name that RESOLVES to loopback is refused, and so is one that does not
+    # resolve at all (UNKNOWN), and the IDNA spelling httpx normalises.
+    for url in (
+        "http://localtest.me:9876/__ui-bridge",
+        "http://nowhere.invalid:9876/__ui-bridge",
+        "http://127\u30020\u30020\u30021:9876/__ui-bridge",
+        "http://0x7f000001:9876/__ui-bridge",
+    ):
+        with pytest.raises(ValueError, match="runner/supervisor|does not resolve"):
+            _site(**{**PREVIEW, "ui_bridge_url": url})
     with pytest.raises(ValueError, match="needs all of"):
         _site(ui_bridge_url="http://127.0.0.1:3000/__ui-bridge")
 

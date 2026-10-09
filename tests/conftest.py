@@ -233,26 +233,44 @@ class FakeBridge:
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text())
             for entry in manifest.get("slots", {}).values():
-                for fmt, name in entry.get("files", {}).items():
+                # A browser renders the slot as
+                #   <picture><source type=image/avif srcset="hero.avif?sha=…">
+                #            <img src="hero.webp?sha=…"></picture>
+                # and fetches ONE file (avif when offered); the bridge reports
+                # one image element whose src is its currentSrc.
+                files, shas = entry.get("files", {}), entry.get("sha256", {})
+                if not files:
+                    continue
+                fallback = next(iter(files))  # the <img src>
+                fmt = "avif" if "avif" in files else fallback
+                name = files[fmt]
+                width = 0
+                try:
+                    with Image.open(site_dir / name) as img:
+                        img.load()
+                        width = img.width
+                except (OSError, ValueError):
                     width = 0
-                    try:
-                        with Image.open(site_dir / name) as img:
-                            img.load()
-                            width = img.width
-                    except (OSError, ValueError):
-                        width = 0
-                    sha = entry.get("sha256", {}).get(fmt, "")
-                    elements.append(
-                        {
-                            "id": f"img-{name}",
-                            "category": "media",
-                            "mediaMetadata": {
-                                "src": f"/{self.site}/{name}?sha={sha}",
-                                "naturalWidth": width,
-                                "loadingState": "loaded" if width else "error",
-                            },
-                        }
-                    )
+                sources = [
+                    {
+                        "srcset": f"/{self.site}/{files[f]}?sha={shas.get(f, '')}",
+                        "type": f"image/{f}",
+                    }
+                    for f in files
+                    if f != fallback
+                ]
+                elements.append(
+                    {
+                        "id": f"img-{name}",
+                        "category": "media",
+                        "mediaMetadata": {
+                            "src": f"/{self.site}/{name}?sha={shas.get(fmt, '')}",
+                            "sources": sources,
+                            "naturalWidth": width,
+                            "loadingState": self.preview.loading_state(width),
+                        },
+                    }
+                )
         return {"page": {"url": self.url}, "elements": elements}
 
     def page_health(self) -> dict[str, object]:
@@ -272,6 +290,14 @@ class FakePreview:
         self.navigated: list[str] = []
         self.ignore_navigate = False
         self.stale_url: dict[str, str] = {}
+        # Snapshots that report images still decoding before they settle.
+        self.pending_snapshots = 0
+
+    def loading_state(self, width: int) -> str:
+        if self.pending_snapshots > 0:
+            self.pending_snapshots -= 1
+            return "pending"
+        return "loaded" if width else "error"
 
     def fetch(self, url: str) -> bytes:
         """The preview server: serves any file of a site's preview dir."""

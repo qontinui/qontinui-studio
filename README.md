@@ -66,9 +66,13 @@ Publication is safe against failures, crashes and concurrent runs:
   - `ui_bridge_url` is the `/control/*` prefix of the UI Bridge in the browser
     showing the preview, e.g. the injection proxy in front of the preview
     server. Ports 9875 and 9876 (the supervisor's and runner's own UIs) are
-    refused on any host that resolves to this machine. That covers every
-    loopback or unspecified spelling (`127.0.0.2`, `127.1`, `::ffff:127.0.0.1`,
-    `0.0.0.0`) and this machine's own interface addresses.
+    refused on any host that is this machine. The host is judged exactly as
+    httpx will request it, after IDNA normalisation (`127。0。0。1` becomes
+    `127.0.0.1`), and then resolved. It is refused if it is local in any
+    spelling (`127.0.0.2`, `127.1`, `0x7f000001`, `::ffff:127.0.0.1`,
+    `0.0.0.0`), if ANY address it resolves to is loopback, unspecified or one
+    of this machine's interfaces (`localtest.me`), or if it does not resolve at
+    all, because UNKNOWN refuses.
   - The studio writes the live files, this batch's files and the merged
     manifest into `preview_dir`, and confirms the preview serves exactly that
     manifest (by sha256).
@@ -81,15 +85,18 @@ Publication is safe against failures, crashes and concurrent runs:
     page's origin must be the preview's origin.
   - It runs page health (`POST /control/page-health`). Only `OK` or `WARNING`
     pass.
-  - It confirms the page did not move, then checks every changed slot from the
-    snapshot's media elements:
-    - every file of the slot must appear as an image whose source resolves
-      under the preview's origin;
-    - each image must carry `?sha=<that file's sha256>`, which the manifest's
-      per-format `sha256` gives the template, so the page provably shows this
-      batch's bytes;
-    - each image must have loaded (`naturalWidth > 0`,
-      `loadingState == "loaded"`).
+  - It keeps polling the snapshot, within the same deadline and without the
+    page moving, until every changed slot's images have settled (loaded or
+    failed). It then checks every changed slot. A browser renders a
+    multi-format slot through `<picture>`, fetches ONE file, and the bridge
+    reports that image's `currentSrc`. So:
+    - at least one image must show one of the slot's files from the preview's
+      origin, carrying `?sha=<that file's sha256>` and loaded
+      (`naturalWidth > 0`, `loadingState == "loaded"`);
+    - every element and every `srcset` / `<source>` URL naming a slot file
+      must carry that file's `?sha=`;
+    - each format the page did not load is fetched from the preview server and
+      its sha256 compared.
   - A slot marked `rendered: false` is meta-only, e.g. an `og:image`. It is
     verified by fetching each file from the preview server and comparing its
     sha256.
@@ -132,6 +139,25 @@ Publication is safe against failures, crashes and concurrent runs:
   studio did not place.
 - **Nothing is stranded.** `studio jobs run` also publishes `generated` batches,
   unless the batch was created with `brief run --no-publish`.
+
+### Site template guidance
+
+A site template renders each studio slot from `studio-manifest.json`:
+
+```html
+<picture>
+  <source type="image/avif" srcset="hero.avif?sha={{ slots.hero.sha256.avif }}">
+  <img src="hero.webp?sha={{ slots.hero.sha256.webp }}" loading="eager"
+       alt="{{ slots.hero.label }}">
+</picture>
+```
+
+- Every file URL carries `?sha=<sha256>` from the manifest. It busts caches,
+  and D7 checks it.
+- Studio slot images must be `loading="eager"`. D7 refuses a `lazy` image,
+  because a lazy image never loads in a preview nobody scrolls.
+- Show the manifest's `label` beside the image (D6).
+- Meta-only slots (an `og:image`) are declared `rendered: false`.
 
 ## Provider inventory: the honest D4 outcome
 

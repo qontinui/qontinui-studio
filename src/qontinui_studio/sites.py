@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import httpx
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -60,6 +61,53 @@ def _host_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | 
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         return addr.ipv4_mapped
     return addr
+
+
+def _resolves_local(host: str) -> bool | None:
+    """Whether ANY address ``host`` resolves to is this machine's; None when it
+    does not resolve at all (UNKNOWN)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return None
+    for info in infos:
+        addr = _host_address(str(info[4][0]).split("%")[0])
+        if addr is not None and (
+            addr.is_loopback or addr.is_unspecified or addr in _local_addresses()
+        ):
+            return True
+    return False
+
+
+def forbidden_bridge_reason(url: str) -> str | None:
+    """Why ``url`` may not be used as a D7 UI Bridge, or None.
+
+    The host is taken exactly as httpx — which makes the request — will see it
+    (IDNA-normalised, e.g. ``127。0。0。1`` -> ``127.0.0.1``). On the runner's
+    and supervisor's ports (9875/9876) the host is refused if it is local in
+    any spelling, if ANY address it resolves to is local, or if it does not
+    resolve at all (UNKNOWN refuses)."""
+    try:
+        parsed = httpx.URL(url)
+    except (httpx.InvalidURL, ValueError) as e:
+        return f"ui_bridge_url is not a valid URL ({e})"
+    host, port = parsed.host, parsed.port
+    if parsed.scheme not in ("http", "https") or not host:
+        return f"ui_bridge_url must be an http(s) URL, got '{url}'"
+    if port not in FORBIDDEN_LOCAL_PORTS:
+        return None
+    local = True if is_local_host(host) else _resolves_local(host.rstrip("."))
+    if local is None:
+        return (
+            f"ui_bridge_url host {host!r} on port {port} does not resolve, so it cannot be "
+            "shown not to be the runner/supervisor's own UI; refused"
+        )
+    if local:
+        return (
+            f"ui_bridge_url points at the runner/supervisor's own UI (port {port} on this "
+            "machine); D7 must check the site's PREVIEW page, through the preview's bridge"
+        )
+    return None
 
 
 def is_local_host(host: str) -> bool:
@@ -172,12 +220,9 @@ class Site(BaseModel):
                 raise ValueError(
                     f"ui_bridge_url must be an http(s) URL, got '{self.ui_bridge_url}'"
                 )
-            if bridge.port in FORBIDDEN_LOCAL_PORTS and is_local_host(bridge.hostname):
-                raise ValueError(
-                    f"ui_bridge_url points at the runner/supervisor's own UI (port "
-                    f"{bridge.port} on this machine); D7 must check the site's PREVIEW "
-                    "page, through the preview's bridge"
-                )
+            why = forbidden_bridge_reason(self.ui_bridge_url)
+            if why is not None:
+                raise ValueError(why)
         if self.preview_url and urlparse(self.preview_url).scheme not in ("http", "https"):
             raise ValueError(f"preview_url must be an http(s) URL, got '{self.preview_url}'")
         if self.preview_dir is not None:

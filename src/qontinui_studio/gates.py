@@ -316,6 +316,86 @@ def _current_url(snapshot: dict[str, Any]) -> str | None:
     return url if isinstance(url, str) else None
 
 
+def _media(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for element in snapshot.get("elements") or []:
+        meta = element.get("mediaMetadata") if isinstance(element, dict) else None
+        if isinstance(meta, dict) and isinstance(meta.get("src"), str):
+            out.append(meta)
+    return out
+
+
+def _slot_elements(
+    site: Site, page_url: str, media: list[dict[str, Any]], files: dict[str, str]
+) -> list[tuple[dict[str, Any], str, list[str] | None]]:
+    """(element, file name, ?sha= values) for every media element whose source
+    resolves under the preview's origin and names one of ``files``."""
+    assert site.preview_url is not None
+    preview_origin = origin(site.preview_url)
+    found = []
+    for m in media:
+        src = urljoin(page_url, m["src"])
+        parsed = urlparse(src)
+        name = PurePosixPath(parsed.path).name
+        if origin(src) == preview_origin and name in files:
+            found.append((m, name, parse_qs(parsed.query).get("sha")))
+    return found
+
+
+def _srcset_urls(meta: dict[str, Any]) -> list[str]:
+    """Candidate URLs from an element's own ``srcset`` and, when the bridge
+    reports them, its ``<picture>`` ``sources[].srcset``."""
+    sets: list[str] = []
+    if isinstance(meta.get("srcset"), str):
+        sets.append(meta["srcset"])
+    for source in meta.get("sources") or []:
+        if isinstance(source, dict) and isinstance(source.get("srcset"), str):
+            sets.append(source["srcset"])
+    urls: list[str] = []
+    for srcset in sets:
+        for candidate in srcset.split(","):
+            parts = candidate.strip().split()
+            if parts:
+                urls.append(parts[0])
+    return urls
+
+
+def images_settled(
+    site: Site, snapshot: dict[str, Any], slot_files: dict[str, dict[str, str]]
+) -> bool:
+    """Whether every rendered changed slot has at least one element on the
+    page and none of them is still ``pending`` — i.e. waiting longer cannot
+    change the verdict."""
+    if not site.preview_url:
+        return True
+    page_url = _current_url(snapshot) or site.preview_url
+    media = _media(snapshot)
+    for slot, files in slot_files.items():
+        if not site.slots[slot].rendered:
+            continue
+        found = _slot_elements(site, page_url, media, files)
+        if not found or any(m.get("loadingState") == "pending" for m, _, _ in found):
+            return False
+    return True
+
+
+def _fetch_check(
+    site: Site, slot: str, name: str, sha: str, fetch: Callable[[str], bytes]
+) -> str | None:
+    # Slot files sit beside the manifest in preview_dir, so they are served
+    # beside preview_manifest_url.
+    base = site.preview_manifest_url or site.preview_url
+    assert base is not None
+    url = urljoin(base, name)
+    try:
+        got = hashlib.sha256(fetch(url)).hexdigest()
+    except Exception as e:  # unreachable is UNKNOWN; UNKNOWN does not publish
+        return f"slot '{slot}' {url} could not be fetched ({type(e).__name__})"
+    if got != sha:
+        return f"slot '{slot}' {url} is not this batch's bytes"
+    return None
+
+
 def d7_images(
     site: Site,
     snapshot: dict[str, Any],
@@ -324,62 +404,75 @@ def d7_images(
 ) -> GateResult:
     """Every slot this batch changes is really on the preview, as THIS batch's bytes.
 
-    ``slot_files`` maps slot -> {file name: sha256}. For a rendered slot, EVERY
-    file must appear as an image element whose source resolves under the
-    preview's origin, carries ``?sha=<that file's sha256>`` (the cache-buster
-    the manifest gives the template), and loaded (``naturalWidth > 0``,
-    ``loadingState == 'loaded'``). A slot declared ``rendered: false`` (meta
-    only, e.g. an ``og:image``) is verified by fetching each file from the
-    preview server and comparing its sha256."""
+    ``slot_files`` maps slot -> {file name: sha256}. A browser renders a
+    multi-format slot through ``<picture>``, fetching ONE file, and the bridge
+    reports only the image's ``currentSrc``. So, for a rendered slot:
+
+    * at least one image element must show one of the slot's files from the
+      preview's origin, carrying ``?sha=<that file's sha256>`` (the manifest's
+      cache-buster), loaded (``naturalWidth > 0``, ``loadingState ==
+      'loaded'``); ``lazy`` is refused (studio slots must be ``loading="eager"``);
+    * every element showing a slot file must carry that file's ``?sha=``, and
+      every ``srcset`` / ``<picture>`` source URL naming a slot file must too;
+    * every format NOT shown by a loaded element is fetched from the preview
+      server and its sha256 compared.
+
+    A slot declared ``rendered: false`` (meta only, e.g. ``og:image``) is
+    verified by fetching every file."""
     subject = f"site {site.id}"
     if not site.preview_url:
         return GateResult("d7_images", subject, "not_configured", "site declares no preview_url")
     page_url = _current_url(snapshot) or site.preview_url
-    preview_origin = origin(site.preview_url)
-    media: list[dict[str, Any]] = []
-    for element in snapshot.get("elements") or []:
-        meta = element.get("mediaMetadata") if isinstance(element, dict) else None
-        if isinstance(meta, dict) and isinstance(meta.get("src"), str):
-            media.append(meta)
+    media = _media(snapshot)
     problems: list[str] = []
     for slot, files in sorted(slot_files.items()):
-        if not site.slots[slot].rendered:
-            for name, sha in sorted(files.items()):
-                url = urljoin(site.preview_url, name)
-                try:
-                    got = hashlib.sha256(fetch(url)).hexdigest()
-                except Exception as e:  # unreachable is UNKNOWN; UNKNOWN does not publish
-                    problems.append(
-                        f"slot '{slot}' {url} could not be fetched ({type(e).__name__})"
-                    )
-                    continue
-                if got != sha:
-                    problems.append(f"slot '{slot}' {url} is not this batch's bytes")
-            continue
-        for name, sha in sorted(files.items()):
-            shown = []
-            for m in media:
-                src = urljoin(page_url, m["src"])
-                parsed = urlparse(src)
-                if origin(src) != preview_origin or PurePosixPath(parsed.path).name != name:
-                    continue
-                shown.append((m, parse_qs(parsed.query).get("sha")))
-            if not shown:
-                problems.append(
-                    f"slot '{slot}' file {name} is not rendered from the preview "
-                    f"({site.preview_url}) — maybe served from another host, or not at all"
-                )
-                continue
-            for m, tag in shown:
-                if tag != [sha]:
+        to_fetch = dict(files)
+        if site.slots[slot].rendered:
+            found = _slot_elements(site, page_url, media, files)
+            shown_ok = False
+            for m, name, tag in found:
+                state = m.get("loadingState")
+                if tag != [files[name]]:
                     problems.append(f"slot '{slot}' {m['src']} is not this batch's {name} (?sha=)")
-                elif not (
-                    isinstance(m.get("naturalWidth"), int | float) and m["naturalWidth"] > 0
-                ) or (m.get("loadingState") != "loaded"):
+                elif state == "lazy":
+                    problems.append(
+                        f"slot '{slot}' image {m['src']} is lazy-loaded; studio slots must be "
+                        'rendered with loading="eager" so D7 can see them load'
+                    )
+                elif state == "pending":
+                    problems.append(f"slot '{slot}' image {m['src']} did not finish loading")
+                elif (
+                    not (isinstance(m.get("naturalWidth"), int | float) and m["naturalWidth"] > 0)
+                    or state != "loaded"
+                ):
                     problems.append(
                         f"slot '{slot}' image {m['src']} did not load "
-                        f"(naturalWidth={m.get('naturalWidth')}, state={m.get('loadingState')})"
+                        f"(naturalWidth={m.get('naturalWidth')}, state={state})"
                     )
+                else:
+                    shown_ok = True
+                    to_fetch.pop(name, None)
+                for url in _srcset_urls(m):
+                    resolved = urljoin(page_url, url)
+                    sname = PurePosixPath(urlparse(resolved).path).name
+                    if sname in files and parse_qs(urlparse(resolved).query).get("sha") != [
+                        files[sname]
+                    ]:
+                        problems.append(
+                            f"slot '{slot}' source {url} is not this batch's {sname} (?sha=)"
+                        )
+            if not found:
+                problems.append(
+                    f"slot '{slot}' ({', '.join(sorted(files))}) is not rendered from the "
+                    f"preview ({site.preview_url}) — maybe served from another host, or not at all"
+                )
+                continue
+            if not shown_ok:
+                continue
+        for name, sha in sorted(to_fetch.items()):
+            problem = _fetch_check(site, slot, name, sha, fetch)
+            if problem:
+                problems.append(problem)
     if problems:
         return GateResult("d7_images", subject, "fail", "; ".join(problems))
     return GateResult(
@@ -442,19 +535,34 @@ def d7_preview_page(
         return [GateResult("d7_navigate", subject, "fail", f"{why} after {deadline_s:.0f}s")]
     results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {seen}")]
     results.append(d7_page_health(site, lambda _url: bridge.page_health()))
-    try:
-        after = bridge.snapshot()
-    except Exception as e:
-        results.append(GateResult("d7_navigate", subject, "fail", f"{type(e).__name__}: {e}"))
-        return results
-    if not same_page(_current_url(after), target, batch_id):
+    # Poll until every changed slot's image has settled (loaded or failed),
+    # within the remaining deadline; the page must not move meanwhile.
+    after: dict[str, Any] | None = None
+    while True:
+        try:
+            snap = bridge.snapshot()
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+        else:
+            if not same_page(_current_url(snap), target, batch_id):
+                results.append(
+                    GateResult(
+                        "d7_navigate",
+                        subject,
+                        "fail",
+                        f"page moved to {_current_url(snap)!r} during the D7 check",
+                    )
+                )
+                return results
+            after = snap
+            if images_settled(site, snap, slot_files):
+                break
+        if monotonic() >= stop:
+            break
+        sleep(poll_s)
+    if after is None:
         results.append(
-            GateResult(
-                "d7_navigate",
-                subject,
-                "fail",
-                f"page moved to {_current_url(after)!r} during the page-health check",
-            )
+            GateResult("d7_navigate", subject, "fail", f"bridge unavailable: {last_error}")
         )
         return results
     results.append(d7_images(site, after, slot_files, fetch))
