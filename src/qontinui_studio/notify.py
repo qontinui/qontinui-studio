@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -64,12 +65,24 @@ class FileNotifier:
         self.directory = directory
 
     def notify(self, notice: Notice, note: str | None = None) -> Delivery:
+        """Write ``<batch>-<outcome>-<UTC timestamp>.md`` (+ ``.json``). Never
+        overwrites an earlier notice: a batch published, unpublished and
+        published again leaves three notices."""
         self.directory.mkdir(parents=True, exist_ok=True)
-        stem = self.directory / f"{notice.batch_id}-{notice.outcome}"
         md = render_markdown(notice)
         if note:
             md += f"\n> Delivery note: {note}\n"
-        stem.with_suffix(".md").write_text(md, encoding="utf-8")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        base = f"{notice.batch_id}-{notice.outcome}-{stamp}"
+        n = 0
+        while True:
+            stem = self.directory / (base if n == 0 else f"{base}-{n}")
+            try:
+                with stem.with_suffix(".md").open("x", encoding="utf-8") as f:
+                    f.write(md)
+                break
+            except FileExistsError:
+                n += 1
         payload = {**asdict(notice), "delivery_note": note}
         stem.with_suffix(".json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return Delivery(channel="file", location=str(stem.with_suffix(".md")), note=note)

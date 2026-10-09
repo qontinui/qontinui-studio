@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS batches (
     brief_id TEXT NOT NULL,
     brief_path TEXT NOT NULL,
     brief_sha256 TEXT NOT NULL,
+    -- The (site, slot) targets the brief named when the batch was created; a
+    -- batch publishes only when every one of them has a variant.
+    targets_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN
         ('generating', 'generated', 'published', 'refused', 'unpublished', 'failed'))
@@ -25,8 +28,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     batch_id TEXT NOT NULL REFERENCES batches(id),
     variant_index INTEGER NOT NULL,
     provider TEXT,
-    status TEXT NOT NULL CHECK (status IN ('queued', 'submitted', 'done', 'failed')),
+    -- downloaded: files are on disk but not yet in the library; ingested: the
+    -- library rows and every target's variants exist. A crash between the two
+    -- leaves 'downloaded', which the next run re-ingests.
+    status TEXT NOT NULL CHECK (status IN
+        ('queued', 'submitted', 'downloaded', 'ingested', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0,
+    polls INTEGER NOT NULL DEFAULT 0,
+    submitted_at TEXT,
+    files_json TEXT,
     next_attempt_at TEXT NOT NULL,
     external_id TEXT,
     handle_json TEXT,
@@ -86,7 +96,7 @@ CREATE TABLE IF NOT EXISTS gate_results (
     batch_id TEXT NOT NULL REFERENCES batches(id),
     gate TEXT NOT NULL,
     subject TEXT NOT NULL,
-    outcome TEXT NOT NULL CHECK (outcome IN ('pass', 'fail', 'not_configured')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('pass', 'fail', 'not_configured', 'waived')),
     detail TEXT NOT NULL,
     evaluated_at TEXT NOT NULL
 );
@@ -100,7 +110,10 @@ CREATE TABLE IF NOT EXISTS publications (
     published_path TEXT NOT NULL,
     label TEXT NOT NULL,
     published_at TEXT NOT NULL,
-    unpublished_at TEXT
+    unpublished_at TEXT,
+    -- Set when a newer batch took this slot over; unpublishing that newer
+    -- batch restores this publication.
+    superseded_by TEXT
 );
 """
 

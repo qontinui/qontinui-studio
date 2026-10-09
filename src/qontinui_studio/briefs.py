@@ -9,9 +9,10 @@ from typing import Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from qontinui_studio import postprocess
 from qontinui_studio.errors import ConfigError
 from qontinui_studio.providers import ProviderInventory
-from qontinui_studio.sites import Site
+from qontinui_studio.sites import ID_PATTERN, Site
 
 
 class Target(BaseModel):
@@ -19,9 +20,11 @@ class Target(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    site: str | None = None
-    slot: str | None = None
-    campaign: str | None = None
+    # All three become path components of variant/published files, so they
+    # share the id pattern (no separators, no "..", no NUL).
+    site: str | None = Field(default=None, pattern=ID_PATTERN)
+    slot: str | None = Field(default=None, pattern=ID_PATTERN)
+    campaign: str | None = Field(default=None, pattern=ID_PATTERN)
 
     @model_validator(mode="after")
     def _exactly_one_shape(self) -> Self:
@@ -39,7 +42,7 @@ class Target(BaseModel):
 class Brief(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$", description="the asset id")
+    id: str = Field(pattern=ID_PATTERN, description="the asset id")
     purpose: str = Field(min_length=1)
     targets: list[Target] = Field(min_length=1)
     aspect_ratio: str
@@ -81,7 +84,12 @@ class LoadedBrief(BaseModel):
     sha256: str
 
 
-def load_brief(path: Path) -> LoadedBrief:
+def load_brief(path: Path, root: Path | None = None) -> LoadedBrief:
+    """Load a brief. ``style_guide`` and ``reference_images`` resolve relative to
+    the brief file and must stay inside the studio ``root`` (default: the
+    directory above ``briefs/``, i.e. ``path.parent.parent``) — a brief cannot
+    pull an arbitrary file from the machine into a provider request."""
+    root = (root if root is not None else path.resolve().parent.parent).resolve()
     try:
         text = path.read_text(encoding="utf-8")
         raw = yaml.safe_load(text)
@@ -90,12 +98,19 @@ def load_brief(path: Path) -> LoadedBrief:
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: expected a mapping")
     base = path.parent
-    if isinstance(raw.get("style_guide"), str):
-        raw["style_guide"] = str((base / raw["style_guide"]).resolve())
+
+    def confined(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        resolved = (base / value).resolve()
+        if not resolved.is_relative_to(root):
+            raise ConfigError(f"{path}: '{value}' resolves outside the studio root {root}")
+        return str(resolved)
+
+    if raw.get("style_guide") is not None:
+        raw["style_guide"] = confined(raw["style_guide"])
     if isinstance(raw.get("reference_images"), list):
-        raw["reference_images"] = [
-            str((base / p).resolve()) if isinstance(p, str) else p for p in raw["reference_images"]
-        ]
+        raw["reference_images"] = [confined(p) for p in raw["reference_images"]]
     try:
         brief = Brief.model_validate(raw)
     except ValueError as e:
@@ -116,6 +131,17 @@ def validate_brief(brief: Brief, sites: dict[str, Site], providers: ProviderInve
             problems.append(f"target site '{t.site}' is not defined under sites/")
         elif t.slot not in site.slots:
             problems.append(f"site '{t.site}' has no slot '{t.slot}'")
+        else:
+            slot = site.slots[t.slot]
+            # Pre-flight the local tools BEFORE any provider quota is spent.
+            if slot.remove_background and not postprocess.rembg_available():
+                problems.append(
+                    f"{t.site}/{t.slot} needs background removal but 'rembg' is not installed "
+                    "(poetry install -E bg)"
+                )
+            for fmt in slot.formats:
+                if not postprocess.format_supported(fmt):
+                    problems.append(f"{t.site}/{t.slot}: this Pillow build cannot encode '{fmt}'")
     known = {p.id for p in providers.providers}
     for pid in brief.provider_preference:
         if pid not in known:

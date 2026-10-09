@@ -111,6 +111,7 @@ class Library:
         prompt: str,
         created_at: datetime,
         raw_path: Path,
+        commit: bool = True,
     ) -> AssetRecord:
         """Record a generated asset, snapshotting the provider's terms AS REVIEWED
         at generation time — a later edit to providers.yaml does not rewrite the
@@ -145,7 +146,8 @@ class Library:
                 None if provider.watermark_visible is None else int(provider.watermark_visible),
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return self.asset(uid)
 
     def add_variant(
@@ -159,6 +161,7 @@ class Library:
         fmt: str,
         path: Path,
         created_at: datetime,
+        commit: bool = True,
     ) -> VariantRecord:
         with Image.open(path) as img:
             width, height = img.size
@@ -179,7 +182,8 @@ class Library:
                 created_at.isoformat(),
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return VariantRecord.from_row(
             self.conn.execute("SELECT * FROM variants WHERE id = ?", (variant_id,)).fetchone()
         )

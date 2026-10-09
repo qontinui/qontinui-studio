@@ -8,9 +8,11 @@ unconfirmed answer is not an allowance.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -32,6 +34,30 @@ def _coerce_verdict(value: Any) -> Any:
     return value
 
 
+# Third-party copies of terms pages. A verdict must be read from the provider's
+# own page; a mirror can be stale or altered, so it may be cited in a note but
+# never as a verdict's source.
+MIRROR_DOMAINS = frozenset(
+    {
+        "open.windriver.com",
+        "tosdr.org",
+        "conductatlas.com",
+        "termsfeed.com",
+        "archive.ph",
+        "archive.today",
+    }
+)
+
+
+def _check_first_party(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if not url.startswith("https://") or not host:
+        raise ValueError(f"source must be an https URL, got '{url}'")
+    if any(host == d or host.endswith("." + d) for d in MIRROR_DOMAINS):
+        raise ValueError(f"'{host}' is a third-party mirror, not a first-party terms page")
+    return url
+
+
 def _default_media() -> list[Media]:
     return ["image"]
 
@@ -43,12 +69,20 @@ class SourcedVerdict(BaseModel):
 
     value: Verdict
     source: str | None = None
+    # ``quote`` is VERBATIM text from ``source``; anything paraphrased or
+    # second-hand goes in ``note``.
     quote: str | None = None
+    note: str | None = None
 
     @field_validator("value", mode="before")
     @classmethod
     def _bool_to_verdict(cls, v: Any) -> Any:
         return _coerce_verdict(v)
+
+    @field_validator("source")
+    @classmethod
+    def _first_party(cls, v: str | None) -> str | None:
+        return None if v is None else _check_first_party(v)
 
     @model_validator(mode="after")
     def _yes_no_needs_a_source(self) -> SourcedVerdict:
@@ -82,9 +116,10 @@ class Provider(BaseModel):
     sources: list[str] = Field(default_factory=list)
     notes: str | None = None
 
-    @property
-    def licence_reviewed(self) -> bool:
-        return self.tos_reviewed is not None and self.commercial_use.value != "unknown"
+    @field_validator("sources")
+    @classmethod
+    def _sources_first_party(cls, v: list[str]) -> list[str]:
+        return [_check_first_party(u) for u in v]
 
     def adapter_gate(self) -> str | None:
         """Return why D4 keeps this provider's adapter off, or ``None`` when it may run."""
@@ -120,14 +155,22 @@ class ProviderInventory(BaseModel):
 
     @model_validator(mode="after")
     def _one_account_per_provider(self) -> ProviderInventory:
-        seen: set[str] = set()
+        # One account per provider, checked three ways: the row id, the
+        # provider's (normalised) name, and the API key env var — two rows that
+        # differ only in id or spelling would still be two accounts.
+        seen: dict[str, dict[str, str]] = {"id": {}, "provider": {}, "api_key_env": {}}
         for p in self.providers:
-            if p.id in seen:
-                raise ValueError(
-                    f"provider '{p.id}' appears twice — D4 allows one account per provider; "
-                    "multiple accounts are never used to get around a provider's limits"
-                )
-            seen.add(p.id)
+            keys = {"id": p.id, "provider": _normalise(p.provider)}
+            if p.api_key_env:
+                keys["api_key_env"] = p.api_key_env
+            for kind, key in keys.items():
+                if key in seen[kind]:
+                    raise ValueError(
+                        f"providers '{seen[kind][key]}' and '{p.id}' share {kind} '{key}' — D4 "
+                        "allows one account per provider; multiple accounts are never used to "
+                        "get around a provider's limits"
+                    )
+                seen[kind][key] = p.id
         return self
 
     def get(self, provider_id: str) -> Provider:
@@ -135,6 +178,10 @@ class ProviderInventory(BaseModel):
             if p.id == provider_id:
                 return p
         raise ConfigError(f"unknown provider '{provider_id}'")
+
+
+def _normalise(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
 
 
 def load_providers(path: Path) -> ProviderInventory:

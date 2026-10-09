@@ -1,11 +1,14 @@
 """Gemini image generation over the official API (google-genai).
 
-Default model ``gemini-2.5-flash-image`` ("nano banana"). The key comes from the
-env var named in providers.yaml (``GEMINI_API_KEY`` by default).
+The model comes from providers.yaml (shipped: ``gemini-3.1-flash-image``,
+"Nano Banana 2"; the original ``gemini-2.5-flash-image`` was shut down on
+2026-10-02). The key comes from the env var named in providers.yaml
+(``GEMINI_API_KEY`` by default).
 """
 
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 
@@ -16,11 +19,12 @@ from google.genai import types
 from PIL import Image
 
 from qontinui_studio.adapters.base import (
-    EXTENSIONS,
     GenerationRequest,
     PollResult,
     SubmittedJob,
     copy_staged,
+    read_reference,
+    write_staged,
 )
 from qontinui_studio.errors import (
     MissingCredentialError,
@@ -48,7 +52,11 @@ class GeminiImageAdapter:
 
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
         contents: list[str | Image.Image] = [request.prompt]
-        contents.extend(Image.open(p) for p in request.reference_images)
+        for ref in request.reference_images:
+            # Decode fully and close the file; the SDK gets an in-memory copy.
+            with Image.open(io.BytesIO(read_reference(ref))) as img:
+                img.load()
+                contents.append(img.copy())
         try:
             response = self._client.models.generate_content(
                 model=self.model,
@@ -64,8 +72,10 @@ class GeminiImageAdapter:
             raise PermanentProviderError(f"gemini {e.code}: {e.message}") from e
         except httpx.TransportError as e:
             raise TransientProviderError(f"gemini transport: {e}") from e
+        except (genai_errors.UnknownApiResponseError, ValueError) as e:
+            # A 2xx whose body did not parse (truncated JSON, bad base64, schema).
+            raise TransientProviderError(f"gemini unreadable response: {e}") from e
 
-        staging_dir.mkdir(parents=True, exist_ok=True)
         staged: list[str] = []
         for candidate in response.candidates or []:
             if candidate.content is None:
@@ -74,9 +84,7 @@ class GeminiImageAdapter:
                 blob = part.inline_data
                 if blob is None or not blob.data:
                     continue
-                ext = EXTENSIONS.get(blob.mime_type or "", ".png")
-                path = staging_dir / f"{request.job_id}-{len(staged)}{ext}"
-                path.write_bytes(blob.data)
+                path = write_staged(staging_dir, f"{request.job_id}-{len(staged)}", blob.data)
                 staged.append(str(path))
         if not staged:
             reason = ""

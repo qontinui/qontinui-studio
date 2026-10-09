@@ -188,3 +188,93 @@ def test_openai_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(MissingCredentialError):
         OpenAIImageAdapter("openai", "gpt-image-1")
+
+
+def _gemini_body(data: bytes, mime: str = "image/png") -> dict[str, object]:
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}}
+                    ],
+                }
+            }
+        ]
+    }
+
+
+def _jpeg() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+@respx.mock
+def test_gemini_extension_comes_from_the_bytes_not_the_declared_mime(
+    gemini: GeminiImageAdapter, tmp_path: Path
+) -> None:
+    respx.post(GEMINI_URL).mock(return_value=httpx.Response(200, json=_gemini_body(_jpeg())))
+    handle = gemini.submit(_req(), tmp_path / "s")
+    [path] = gemini.download(handle, tmp_path / "o")
+    assert path.suffix == ".jpg"
+
+
+@respx.mock
+def test_gemini_non_image_bytes_are_permanent(gemini: GeminiImageAdapter, tmp_path: Path) -> None:
+    respx.post(GEMINI_URL).mock(
+        return_value=httpx.Response(200, json=_gemini_body(b"<html>nope</html>"))
+    )
+    with pytest.raises(PermanentProviderError, match="not an image"):
+        gemini.submit(_req(), tmp_path)
+
+
+@respx.mock
+def test_gemini_unparseable_2xx_is_transient(gemini: GeminiImageAdapter, tmp_path: Path) -> None:
+    respx.post(GEMINI_URL).mock(return_value=httpx.Response(200, content=b"{truncated"))
+    with pytest.raises(TransientProviderError):
+        gemini.submit(_req(), tmp_path)
+
+
+def test_unreadable_reference_image_is_permanent(
+    gemini: GeminiImageAdapter, openai: OpenAIImageAdapter, tmp_path: Path
+) -> None:
+    bad = tmp_path / "ref.png"
+    bad.write_bytes(b"not an image")
+    for adapter in (gemini, openai):
+        with pytest.raises(PermanentProviderError):
+            adapter.submit(_req(reference_images=[bad]), tmp_path)
+        with pytest.raises(PermanentProviderError):
+            adapter.submit(_req(reference_images=[tmp_path / "missing.png"]), tmp_path)
+
+
+@respx.mock
+def test_openai_reference_mime_is_sniffed(openai: OpenAIImageAdapter, tmp_path: Path) -> None:
+    ref = tmp_path / "ref.png"  # misleading name: the bytes are JPEG
+    ref.write_bytes(_jpeg())
+    route = respx.post("https://api.openai.com/v1/images/edits").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"b64_json": base64.b64encode(_png()).decode()}]}
+        )
+    )
+    openai.submit(_req(reference_images=[ref]), tmp_path / "s")
+    assert b"Content-Type: image/jpeg" in route.calls.last.request.content
+
+
+@respx.mock
+def test_openai_bad_bodies(openai: OpenAIImageAdapter, tmp_path: Path) -> None:
+    url = "https://api.openai.com/v1/images/generations"
+    respx.post(url).mock(return_value=httpx.Response(200, content=b"<html>gateway</html>"))
+    with pytest.raises(TransientProviderError, match="unreadable"):
+        openai.submit(_req(), tmp_path)
+    respx.post(url).mock(return_value=httpx.Response(200, json={"data": [{"b64_json": "!!!"}]}))
+    with pytest.raises(PermanentProviderError, match="base64"):
+        openai.submit(_req(), tmp_path)
+    respx.post(url).mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"b64_json": base64.b64encode(b"text").decode()}]}
+        )
+    )
+    with pytest.raises(PermanentProviderError, match="not an image"):
+        openai.submit(_req(), tmp_path)

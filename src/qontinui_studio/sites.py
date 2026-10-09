@@ -7,8 +7,9 @@ content category of every slot a brief may target.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -23,6 +24,9 @@ SlotCategory = Literal[
 ]
 ExportFormat = Literal["webp", "avif", "png", "jpeg"]
 
+ID_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+PageHealthPolicy = Literal["required", "waived"]
+
 DEFAULT_ILLUSTRATIVE_LABEL = "Illustrative image (AI-generated)"
 DEFAULT_AI_LABEL = "AI-generated image"
 
@@ -36,7 +40,11 @@ class Slot(BaseModel):
 
     width: int = Field(gt=0)
     height: int = Field(gt=0)
-    category: SlotCategory = "decorative"
+    # Required. A Site fills ``decorative`` for an omitted category on demo and
+    # product sites; a real business must state every slot's category, because
+    # D6 refuses AI food/premises imagery there and a silent default would
+    # disable that check.
+    category: SlotCategory
     formats: list[ExportFormat] = Field(default_factory=_default_formats, min_length=1)
     remove_background: bool = False
     focal_x: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -46,7 +54,7 @@ class Slot(BaseModel):
 class Site(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    id: str = Field(pattern=ID_PATTERN)
     name: str
     kind: SiteKind
     commercial: bool
@@ -58,16 +66,38 @@ class Site(BaseModel):
     illustrative_label: str = DEFAULT_ILLUSTRATIVE_LABEL
     ai_label: str = DEFAULT_AI_LABEL
     # UI Bridge page-health endpoint for a running preview of this site, e.g.
-    # http://127.0.0.1:9876/ui-bridge/control/page-health. Unset -> the D7
-    # page-health gate is reported NOT_CONFIGURED for this site.
+    # http://127.0.0.1:9876/ui-bridge/control/page-health. Unset with
+    # ``page_health: required`` -> the D7 gate REFUSES publication.
     page_health_url: str | None = None
+    # ``waived`` is allowed only on a demo site (one with no running preview
+    # yet); the operator notice prints the waiver on every publication.
+    page_health: PageHealthPolicy = "required"
     slots: dict[str, Slot] = Field(min_length=1)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _slot_categories(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or not isinstance(data.get("slots"), dict):
+            return data
+        kind = data.get("kind")
+        slots: dict[str, Any] = {}
+        for name, slot in data["slots"].items():
+            if isinstance(slot, dict) and "category" not in slot:
+                if kind == "real_business":
+                    raise ValueError(
+                        f"slot '{name}': a real_business site must state every slot's category"
+                    )
+                slot = {**slot, "category": "decorative"}
+            slots[name] = slot
+        return {**data, "slots": slots}
+
     @model_validator(mode="after")
-    def _slot_names(self) -> Site:
+    def _checks(self) -> Site:
         for name in self.slots:
-            if not name or "/" in name:
-                raise ValueError(f"bad slot name '{name}'")
+            if not re.fullmatch(ID_PATTERN, name):
+                raise ValueError(f"bad slot name '{name}' (must match {ID_PATTERN})")
+        if self.page_health == "waived" and self.kind != "demo":
+            raise ValueError("page_health: waived is allowed only on a demo site")
         return self
 
     def label_for_ai(self) -> str:

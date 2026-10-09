@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from qontinui_studio import postprocess
 from qontinui_studio.briefs import Brief, Target, load_brief, validate_brief
 from qontinui_studio.errors import ConfigError
 from qontinui_studio.providers import load_providers
@@ -80,3 +81,64 @@ def test_unreadable_brief_is_a_config_error(tmp_path: Path) -> None:
     p.write_text("- just a list")
     with pytest.raises(ConfigError):
         load_brief(p)
+
+
+def test_campaign_and_slot_names_cannot_escape_paths() -> None:
+    for bad in ("../x", "a/b", "a\\b", "x\x00", ".."):
+        with pytest.raises(ValueError):
+            Target.model_validate({"campaign": bad})
+        with pytest.raises(ValueError):
+            Target.model_validate({"site": "s", "slot": bad})
+
+
+def test_style_guide_and_references_must_stay_under_the_root(
+    studio_root: Path, write_brief: Callable[..., Path], tmp_path: Path
+) -> None:
+    outside = tmp_path / "secret.md"
+    outside.write_text("x")
+    path = write_brief()
+    path.write_text(path.read_text().replace("style_guide: style.md", f"style_guide: {outside}"))
+    with pytest.raises(ConfigError, match="outside the studio root"):
+        load_brief(path, root=studio_root)
+    path.write_text(
+        path.read_text().replace(f"style_guide: {outside}", "style_guide: ../../secret.md")
+    )
+    with pytest.raises(ConfigError, match="outside the studio root"):
+        load_brief(path, root=studio_root)
+
+
+def test_validation_prechecks_local_tools_before_spending_quota(
+    studio_root: Path, write_brief: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = studio_root / "sites" / "cafe.yaml"
+    site.write_text(
+        site.read_text().replace(
+            "hero: {width: 1600, height: 900, formats: [webp, avif]}",
+            "hero: {width: 1600, height: 900, formats: [webp, avif], remove_background: true}",
+        )
+    )
+    monkeypatch.setattr(postprocess, "rembg_available", lambda: False)
+    monkeypatch.setattr(postprocess, "format_supported", lambda fmt: fmt != "avif")
+    problems = validate_brief(
+        load_brief(write_brief()).brief,
+        load_sites(studio_root / "sites"),
+        load_providers(studio_root / "providers.yaml"),
+    )
+    joined = "\n".join(problems)
+    assert "rembg" in joined
+    assert "cannot encode 'avif'" in joined
+
+
+def test_real_business_sites_must_state_slot_categories(tmp_path: Path) -> None:
+    (tmp_path / "s.yaml").write_text(
+        "id: shop\nname: Shop\nkind: real_business\ncommercial: true\npublish_dir: out\n"
+        "slots:\n  hero: {width: 10, height: 10}\n"
+    )
+    with pytest.raises(ConfigError, match="must state every slot's category"):
+        load_sites(tmp_path)
+    (tmp_path / "s.yaml").write_text(
+        "id: shop\nname: Shop\nkind: demo\ncommercial: false\npublish_dir: out\n"
+        "slots:\n  ../evil: {width: 10, height: 10}\n"
+    )
+    with pytest.raises(ConfigError, match="bad slot name"):
+        load_sites(tmp_path)

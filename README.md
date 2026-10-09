@@ -33,7 +33,18 @@ D3, the build-record allowlist, gates the factory's export (Phase 1). It has no
 subject in this repo.
 
 A site that declares no `page_health_url` reports the page-health gate as
-`not_configured`. The operator notice says so explicitly; it is never shown as a pass.
+`not_configured`, which **refuses** publication. The one exception is a demo
+site that sets `page_health: waived` (allowed on demo sites only, e.g. a template
+with no running preview yet). Every operator notice for such a site prints the
+waiver.
+
+Publication is transactional. New files are staged under hidden names, the
+slot's current files are moved aside, and the new ones are renamed into place.
+Manifests are written via a temp file and `os.replace`. The page-health probe
+then checks the new content. If it fails, or any step raises, the previous files,
+manifest and publication rows are put back. Unpublishing the newest batch on a
+slot restores the publication it replaced. A batch publishes only when every
+`{site, slot}` its brief targets has a variant.
 
 ## Provider inventory: the honest D4 outcome
 
@@ -43,7 +54,9 @@ reviewed on 2026-10-09, and every yes/no cites a source URL. Run
 `studio providers list` to see the verdicts. In summary:
 
 - **API adapters exist for Gemini (`google-genai`) and OpenAI Images.** Both pass
-  D4 for API use. Neither has a free API tier for image generation: Gemini's image
+  D4 for API use. OpenAI's `commercial_use` is `unknown`: openai.com answered 403,
+  and a third-party mirror is not accepted as a source (the loader rejects known
+  mirror domains). So D5 refuses OpenAI assets until the first-party terms are read. Neither has a free API tier for image generation: Gemini's image
   models list "Not available" under the free tier. Their `daily_quota` is therefore
   unset, and **the scheduler assigns them nothing until the operator sets one**,
   because paying for API calls is the operator's decision.
@@ -85,7 +98,7 @@ Exit codes: `0` ok, `1` config error, `2` publication refused by a gate,
 |---|---|
 | `GEMINI_API_KEY` | the `gemini` adapter. The env var name is set per row by `api_key_env`. |
 | `OPENAI_API_KEY` | the `openai` adapter |
-| `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. |
+| `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. Notice files are timestamped and never overwritten. |
 
 To let the scheduler use a provider, set `daily_quota` on its row. This is the
 per-UTC-day cap. The scheduler works through a brief's `provider_preference` in

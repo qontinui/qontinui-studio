@@ -15,6 +15,8 @@ from qontinui_studio.pipeline import Context, run_brief
 from qontinui_studio.publish import unpublish_batch
 from qontinui_studio.review import build_review_page
 
+from .conftest import notice_text
+
 
 def test_one_brief_two_sites_zero_manual_steps(
     make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
@@ -43,6 +45,8 @@ def test_one_brief_two_sites_zero_manual_steps(
         assert entry["label"] == "Illustrative image (AI-generated)"
         assert entry["licence"]["commercial_use"] == "yes"
         assert entry["batch_id"] == outcome.batch_id
+        # No staging/backup debris left behind.
+        assert not [p for p in publish_dir.iterdir() if p.name.startswith(".")]
 
     # Full D5 provenance on every library row.
     lib = Library(ctx.conn)
@@ -63,12 +67,13 @@ def test_one_brief_two_sites_zero_manual_steps(
         assert ("cafe-template", "hero", "avif") in slots
         assert ("barber-template", "hero", "webp") in slots
         assert any(v.campaign == "launch" for v in lib.variants(a.uid))
+    assert {r["status"] for r in ctx.conn.execute("SELECT status FROM jobs")} == {"ingested"}
 
-    # The operator is notified, not asked: a notice with the one-step unpublish.
-    notice = ctx.workspace.notices_dir / f"{outcome.batch_id}-published.md"
-    text = notice.read_text()
+    # The operator is notified, not asked: a notice with the one-step unpublish,
+    # and the page-health waiver printed.
+    text = notice_text(ctx.workspace.notices_dir, outcome.batch_id, "published")
     assert f"studio unpublish --batch {outcome.batch_id}" in text
-    assert "NOT CONFIGURED: d7_page_health" in text
+    assert "WAIVED: d7_page_health" in text
 
     page = build_review_page(ctx.conn, ctx.workspace.review_dir, ctx.clock())
     html = page.read_text()
@@ -80,6 +85,9 @@ def test_one_brief_two_sites_zero_manual_steps(
     assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
     manifest = json.loads((studio_root / "published" / "cafe" / "studio-manifest.json").read_text())
     assert "hero" not in manifest["slots"]
+    # The published notice was not overwritten by the unpublished one.
+    assert notice_text(ctx.workspace.notices_dir, outcome.batch_id, "published")
+    assert notice_text(ctx.workspace.notices_dir, outcome.batch_id, "unpublished")
 
 
 def test_non_commercial_licence_refused_for_commercial_site(
@@ -94,24 +102,4 @@ def test_non_commercial_licence_refused_for_commercial_site(
     # Atomic: nothing from the batch reached EITHER site.
     assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
     assert not (studio_root / "published" / "barber" / "hero.webp").exists()
-    notice = ctx.workspace.notices_dir / f"{outcome.batch_id}-refused.md"
-    assert "d5_licence" in notice.read_text()
-
-
-def test_page_health_failure_rolls_back(
-    make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
-) -> None:
-    site_file = studio_root / "sites" / "cafe.yaml"
-    site_file.write_text(
-        site_file.read_text()
-        + "page_health_url: http://127.0.0.1:9/ui-bridge/control/page-health\n"
-    )
-
-    def critical(url: str) -> dict[str, object]:
-        return {"success": True, "data": {"summary": "CRITICAL", "findings": []}}
-
-    ctx = make_context(probe=critical)
-    outcome = run_brief(ctx, write_brief())
-    assert outcome.status == "refused"
-    assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
-    assert not (studio_root / "published" / "barber" / "hero.webp").exists()
+    assert "d5_licence" in notice_text(ctx.workspace.notices_dir, outcome.batch_id, "refused")

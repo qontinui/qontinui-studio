@@ -6,6 +6,9 @@ kind: demo
 commercial: false
 publish_dir: ../.studio/sites/cafe-template
 illustrative_label: Illustrative image (AI-generated)
+# No running preview exists yet (the template repos are Phase 4), so page
+# health is explicitly waived; every publication notice prints the waiver.
+page_health: waived
 slots:
   hero:
     width: 1600

@@ -10,6 +10,7 @@ D3 (the build-record export allowlist) is a gate on the FACTORY's export
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,9 @@ from qontinui_studio.library import AssetRecord, VariantRecord
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site, Slot
 
-Outcome = Literal["pass", "fail", "not_configured"]
+# ``not_configured`` is a FAILURE (D7: a gate that did not run did not pass);
+# ``waived`` passes but is printed in every operator notice.
+Outcome = Literal["pass", "fail", "not_configured", "waived"]
 
 
 @dataclass(frozen=True)
@@ -33,7 +36,7 @@ class GateResult:
 
     @property
     def failed(self) -> bool:
-        return self.outcome == "fail"
+        return self.outcome in ("fail", "not_configured")
 
 
 def _subject(asset: AssetRecord, variant: VariantRecord) -> str:
@@ -122,12 +125,20 @@ def d6_not_the_real_thing(
             "fail",
             f"real business '{site.id}': {slot.category} imagery must be real photos, not AI",
         )
-    if site.kind == "demo" and not label.strip():
+    if site.kind == "demo" and "illustrative" not in label.casefold():
         return GateResult(
-            "d6", subject, "fail", f"demo site '{site.id}' must label AI imagery as illustrative"
+            "d6",
+            subject,
+            "fail",
+            f"demo site '{site.id}' must label AI imagery as illustrative (label: '{label}')",
         )
-    if not label.strip():
-        return GateResult("d6", subject, "fail", f"site '{site.id}' has an empty AI label")
+    if site.kind != "demo" and not re.search(r"\bai\b", label, re.IGNORECASE):
+        return GateResult(
+            "d6",
+            subject,
+            "fail",
+            f"site '{site.id}' must label AI imagery as AI (label: '{label}')",
+        )
     return GateResult("d6", subject, "pass", f"labelled '{label}'")
 
 
@@ -148,12 +159,23 @@ def http_page_health_probe(url: str) -> dict[str, object]:
 def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) -> GateResult:
     """A UI Bridge page-health pass over the site's running preview.
 
-    A site that declares no ``page_health_url`` is reported ``not_configured``
-    — stated in the operator notice, never rendered as a pass."""
+    A site that declares no ``page_health_url`` is ``not_configured``, which
+    REFUSES publication, unless it is a demo site with ``page_health: waived`` —
+    then the outcome is ``waived`` and every operator notice prints it."""
     subject = f"site {site.id}"
     if not site.page_health_url:
+        if site.page_health == "waived":
+            return GateResult(
+                "d7_page_health",
+                subject,
+                "waived",
+                f"page health WAIVED for demo site '{site.id}' (no running preview)",
+            )
         return GateResult(
-            "d7_page_health", subject, "not_configured", "site declares no page_health_url"
+            "d7_page_health",
+            subject,
+            "not_configured",
+            "site declares no page_health_url and does not waive page health — refused",
         )
     try:
         body = probe(site.page_health_url)

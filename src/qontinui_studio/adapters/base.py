@@ -9,9 +9,14 @@ JSON so the scheduler can persist it and resume after a crash.
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
+
+from PIL import Image, UnidentifiedImageError
+
+from qontinui_studio.errors import PermanentProviderError, TransientProviderError
 
 
 @dataclass(frozen=True)
@@ -56,13 +61,77 @@ def staged_paths(job: SubmittedJob) -> list[Path]:
 
 def copy_staged(job: SubmittedJob, dest_dir: Path) -> list[Path]:
     """``download`` for adapters that staged their bytes at submit time."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
     out: list[Path] = []
-    for src in staged_paths(job):
-        dst = dest_dir / src.name
-        dst.write_bytes(src.read_bytes())
-        out.append(dst)
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for src in staged_paths(job):
+            dst = dest_dir / src.name
+            dst.write_bytes(src.read_bytes())
+            out.append(dst)
+    except FileNotFoundError as e:
+        # The staged bytes are gone (e.g. .studio/staging was cleaned): the
+        # provider job must be redone.
+        raise PermanentProviderError(f"staged file missing: {e}") from e
+    except OSError as e:
+        raise TransientProviderError(f"cannot copy staged file: {e}") from e
     return out
 
 
-EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+_EXT_BY_PIL_FORMAT = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "WEBP": ".webp",
+    "GIF": ".gif",
+    "AVIF": ".avif",
+}
+_MIME_BY_PIL_FORMAT = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+    "GIF": "image/gif",
+    "AVIF": "image/avif",
+}
+
+
+def _pil_format(data: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+            fmt = img.format or ""
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as e:
+        raise PermanentProviderError(f"provider returned bytes that are not an image: {e}") from e
+    if fmt not in _EXT_BY_PIL_FORMAT:
+        raise PermanentProviderError(f"provider returned an unsupported image format '{fmt}'")
+    return fmt
+
+
+def sniff_extension(data: bytes) -> str:
+    """The file extension for image ``data``, from its actual bytes — never from
+    a provider's declared MIME type. Non-image bytes are a permanent failure."""
+    return _EXT_BY_PIL_FORMAT[_pil_format(data)]
+
+
+def sniff_mime(data: bytes) -> str:
+    return _MIME_BY_PIL_FORMAT[_pil_format(data)]
+
+
+def write_staged(staging_dir: Path, name: str, data: bytes) -> Path:
+    """Write ``data`` under ``staging_dir`` with its sniffed extension. A disk
+    error is transient (it is local, and retrying after space frees can work)."""
+    path = staging_dir / f"{name}{sniff_extension(data)}"
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as e:
+        raise TransientProviderError(f"cannot write {path}: {e}") from e
+    return path
+
+
+def read_reference(path: Path) -> bytes:
+    """Read a brief's reference image; an unreadable one is permanent (config)."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        raise PermanentProviderError(f"cannot read reference image {path}: {e}") from e
+    _pil_format(data)
+    return data

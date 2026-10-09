@@ -54,18 +54,30 @@ def remove_background(img: Image.Image) -> Image.Image:
     return out
 
 
+def rembg_available() -> bool:
+    try:
+        import rembg  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def format_supported(fmt: str) -> bool:
+    if fmt not in _PIL_FORMAT:
+        return False
+    if fmt in ("avif", "webp"):
+        return bool(features.check(fmt))
+    return True
+
+
 _PIL_FORMAT = {"webp": "WEBP", "avif": "AVIF", "png": "PNG", "jpeg": "JPEG"}
 _EXT = {"webp": ".webp", "avif": ".avif", "png": ".png", "jpeg": ".jpg"}
 
 
 def export(img: Image.Image, dest_stem: Path, fmt: str, quality: int = 82) -> Path:
     """Write ``img`` as ``fmt`` next to ``dest_stem`` and return the path."""
-    if fmt not in _PIL_FORMAT:
-        raise FormatUnsupported(f"unknown export format '{fmt}'")
-    if fmt == "avif" and not features.check("avif"):
-        raise FormatUnsupported("this Pillow build has no AVIF encoder")
-    if fmt == "webp" and not features.check("webp"):
-        raise FormatUnsupported("this Pillow build has no WebP encoder")
+    if not format_supported(fmt):
+        raise FormatUnsupported(f"this Pillow build cannot encode '{fmt}'")
     dest = dest_stem.with_suffix(_EXT[fmt])
     dest.parent.mkdir(parents=True, exist_ok=True)
     out = img
@@ -107,12 +119,18 @@ def _run_ffmpeg(args: list[str]) -> None:
         raise FfmpegFailed(f"ffmpeg exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
 
 
+def _ff(path: Path) -> str:
+    """An ffmpeg URL for a local file: ``file:`` + the resolved path, so a name
+    starting with ``-`` or containing ``:`` is never read as an option or protocol."""
+    return "file:" + str(path.resolve())
+
+
 def trim(src: Path, dest: Path, start_s: float, duration_s: float) -> Path:
     """Cut ``duration_s`` seconds from ``start_s`` (re-encoded, so cuts are exact)."""
     if duration_s <= 0 or start_s < 0:
         raise ValueError("trim needs start >= 0 and duration > 0")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(["-ss", f"{start_s}", "-i", str(src), "-t", f"{duration_s}", "-an", str(dest)])
+    _run_ffmpeg(["-ss", f"{start_s}", "-i", _ff(src), "-t", f"{duration_s}", "-an", _ff(dest)])
     return dest
 
 
@@ -121,7 +139,7 @@ def loop(src: Path, dest: Path, count: int) -> Path:
     if count < 1:
         raise ValueError("loop count must be >= 1")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(["-stream_loop", str(count - 1), "-i", str(src), "-an", str(dest)])
+    _run_ffmpeg(["-stream_loop", str(count - 1), "-i", _ff(src), "-an", _ff(dest)])
     return dest
 
 
@@ -131,12 +149,12 @@ def boomerang(src: Path, dest: Path) -> Path:
     _run_ffmpeg(
         [
             "-i",
-            str(src),
+            _ff(src),
             "-filter_complex",
             "[0:v]reverse[r];[0:v][r]concat=n=2:v=1:a=0[v]",
             "-map",
             "[v]",
-            str(dest),
+            _ff(dest),
         ]
     )
     return dest

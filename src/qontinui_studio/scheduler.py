@@ -45,6 +45,10 @@ class RetryPolicy:
     base_backoff_s: float = 30.0
     max_backoff_s: float = 3600.0
     poll_interval_s: float = 5.0
+    # A submitted job that is still pending after either cap is abandoned on
+    # that provider and moves to the next preferred one.
+    max_polls: int = 720
+    poll_timeout_s: float = 3600.0
 
     def backoff(self, attempts: int, retry_after_s: float | None) -> float:
         delay: float = min(self.max_backoff_s, self.base_backoff_s * 2.0 ** max(0, attempts - 1))
@@ -171,6 +175,9 @@ class Scheduler:
         fields["updated_at"] = _iso(self.clock())
         cols = ", ".join(f"{k} = ?" for k in fields)
         self.conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", (*fields.values(), job_id))
+        # Every job state change is durable on its own: a crash never loses a
+        # submission the provider has already counted.
+        self.conn.commit()
 
     def _submit(
         self,
@@ -218,6 +225,7 @@ class Scheduler:
             reference_images=template.reference_images,
         )
         self._consume_quota(provider_id, now)
+        self.conn.commit()  # quota is spent BEFORE the request leaves
         try:
             handle = adapter.submit(request, self.staging_dir / row["id"])
         except TransientProviderError as e:
@@ -242,6 +250,8 @@ class Scheduler:
             provider=provider_id,
             attempts=attempts + 1,
             status="submitted",
+            submitted_at=_iso(now),
+            polls=0,
             external_id=handle.external_id,
             handle_json=json.dumps(handle.data),
             next_attempt_at=_iso(now),
@@ -259,6 +269,8 @@ class Scheduler:
             row["id"],
             provider=None,
             attempts=0,
+            polls=0,
+            submitted_at=None,
             tried_providers=json.dumps(tried),
             next_attempt_at=_iso(now),
             last_error=f"{provider_id}: {error}",
@@ -275,33 +287,76 @@ class Scheduler:
             report.failed.append(row["id"])
             return
         handle = SubmittedJob(external_id=row["external_id"], data=json.loads(row["handle_json"]))
+        tried: list[str] = json.loads(row["tried_providers"])
+        polls = int(row["polls"]) + 1
+        submitted_at = _parse(row["submitted_at"]) if row["submitted_at"] else now
+        overdue = (
+            polls > self.policy.max_polls
+            or (now - submitted_at).total_seconds() > self.policy.poll_timeout_s
+        )
         try:
             result = adapter.poll(handle)
+        except PermanentProviderError as e:
+            self._give_up_on_provider(row, provider_id, tried, str(e), now)
+            return
         except TransientProviderError as e:
+            if overdue:
+                self._give_up_on_provider(
+                    row, provider_id, tried, f"poll deadline passed: {e}", now
+                )
+                return
             self._update(
                 row["id"],
+                polls=polls,
                 next_attempt_at=_iso(now + timedelta(seconds=self.policy.poll_interval_s)),
                 last_error=str(e),
             )
             return
         if result.status == "pending":
+            if overdue:
+                self._give_up_on_provider(
+                    row,
+                    provider_id,
+                    tried,
+                    f"still pending after {polls} polls / "
+                    f"{(now - submitted_at).total_seconds():.0f}s",
+                    now,
+                )
+                return
             self._update(
                 row["id"],
+                polls=polls,
                 next_attempt_at=_iso(now + timedelta(seconds=self.policy.poll_interval_s)),
             )
             return
         if result.status == "failed":
-            tried: list[str] = json.loads(row["tried_providers"])
             self._give_up_on_provider(
                 row, provider_id, tried, result.error or "provider job failed", now
             )
             return
-        files = adapter.download(handle, self.raw_dir / row["batch_id"])
+        try:
+            files = adapter.download(handle, self.raw_dir / row["batch_id"])
+        except TransientProviderError as e:
+            self._update(
+                row["id"],
+                polls=polls,
+                next_attempt_at=_iso(now + timedelta(seconds=self.policy.poll_interval_s)),
+                last_error=f"download: {e}",
+            )
+            return
+        except PermanentProviderError as e:
+            self._give_up_on_provider(row, provider_id, tried, f"download: {e}", now)
+            return
         if not files:
-            tried = json.loads(row["tried_providers"])
             self._give_up_on_provider(row, provider_id, tried, "download returned no files", now)
             return
-        self._update(row["id"], status="done", last_error=None)
+        self._update(
+            row["id"],
+            status="downloaded",
+            polls=polls,
+            files_json=json.dumps({"model": adapter.model, "files": [str(f) for f in files]}),
+            last_error=None,
+        )
         report.completed.append(
             CompletedJob(
                 job_id=row["id"],

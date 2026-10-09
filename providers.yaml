@@ -31,15 +31,15 @@ providers:
     api_available:
       value: "yes"
       source: https://ai.google.dev/gemini-api/docs/pricing
-      quote: 'image models priced per image on the paid tier; free tier "Not available"'
+      note: 'pricing table lists image models per image on the paid tier; free-tier column reads "Not available"'
     automation_allowed:
       value: "yes"
       source: https://ai.google.dev/gemini-api/terms
-      quote: 'the API is the sanctioned programmatic door ("for developers building with Google AI models")'
+      note: 'the Gemini API is the provider''s sanctioned programmatic door'
     commercial_use:
       value: "yes"
       source: https://ai.google.dev/gemini-api/terms
-      quote: '"for developers building with Google AI models for professional or business purposes"; "Google won''t claim ownership over that content"'
+      quote: 'for developers building with Google AI models for professional or business purposes'
     watermark: SynthID (invisible)
     watermark_visible: false
     media: [image]
@@ -74,11 +74,10 @@ providers:
     automation_allowed:
       value: "yes"
       source: https://platform.openai.com/docs/api-reference/images
-      quote: 'the Images API is the sanctioned programmatic door'
+      note: 'the Images API is the provider''s sanctioned programmatic door'
     commercial_use:
-      value: "yes"
-      source: https://open.windriver.com/info/uni-license-list/licenses/openai-tou-20241211.html
-      quote: 'you "own the Output"; "We hereby assign to you all our right, title, and interest, if any, in and to Output." (mirror of the 2024-12-11 Terms of Use; openai.com answered 403)'
+      value: unknown
+      note: 'A third-party mirror of the 2024-12-11 Terms of Use (open.windriver.com) says you "own the Output", but openai.com/policies/terms-of-use answered HTTP 403, so the first-party page was not read. Unknown until it is.'
     watermark: C2PA metadata (no visible mark)
     watermark_visible: false
     media: [image]
@@ -89,12 +88,13 @@ providers:
     tos_reviewed: 2026-10-09
     sources:
       - https://openai.com/policies/terms-of-use/
-      - https://open.windriver.com/info/uni-license-list/licenses/openai-tou-20241211.html
       - https://help.openai.com/en/articles/8912793-c2pa-in-chatgpt-images
     notes: >-
-      Billed API — daily_quota unset until the operator chooses to pay. The ChatGPT
-      web UI is NOT automatable: the Terms of Use forbid "Automatically or
-      programmatically extract data or Output".
+      Billed API — daily_quota unset until the operator chooses to pay. Because
+      commercial_use is unknown, the D5 gate refuses OpenAI assets until the
+      first-party terms are read. The ChatGPT web UI is not treated as automatable:
+      the (third-party-mirrored) Terms of Use forbid "Automatically or
+      programmatically extract data or Output", and no GUI adapter is built.
 
   - id: bing
     provider: Microsoft Bing Image Creator / Designer
@@ -102,15 +102,15 @@ providers:
     api_available:
       value: "no"
       source: https://www.bing.com/new/termsofuseimagecreator
-      quote: 'no API is offered; the terms cover the web/app experience only'
+      note: 'no API is offered; the terms cover the web/app experience only'
     automation_allowed:
       value: "no"
       source: https://www.bing.com/new/termsofuseimagecreator
-      quote: '"Not to engage in activity that is harmful to the Online Services, including bot/scraping behaviors"'
+      quote: 'Not to engage in activity that is harmful to the Online Services, including bot/scraping behaviors'
     commercial_use:
       value: unknown
       source: https://www.microsoft.com/en-us/microsoft-copilot/for-individuals/termsofuse/archives
-      quote: 'current terms only require lawful use; archived terms said "any legal personal, non-commercial purpose"'
+      note: 'current terms only require lawful use; archived terms said "any legal personal, non-commercial purpose"'
     watermark: Content Credentials (C2PA provenance)
     watermark_visible: false
     media: [image]
@@ -126,14 +126,15 @@ providers:
     plan: Free plan, 150 tokens/day (secondary sources); free generations are public.
     api_available:
       value: unknown
-      quote: 'the API is a separate pay-as-you-go product per secondary sources; leonardo.ai pages answered 403'
+      note: 'the API is a separate pay-as-you-go product per secondary sources; leonardo.ai pages answered 403'
     automation_allowed:
       value: unknown
-      quote: 'ToS page answered 403; a secondary summary says it bars automated access — not read first-hand'
+      note: 'ToS page answered 403; a secondary summary says it bars automated access — not read first-hand'
     commercial_use:
       value: "yes"
       source: https://intercom.help/leonardo-ai/en/articles/8044018-commercial-usage
-      quote: 'free-plan example "Jason and Jane can download their own generations for commercial usage"'
+      quote: 'Jason and Jane can download their own generations for commercial usage'
+      note: 'a free-plan example in the help article'
     watermark: unknown
     media: [image]
     adapter: none
@@ -150,15 +151,15 @@ providers:
     api_available:
       value: "yes"
       source: https://ideogram.ai/legal/usage-policy
-      quote: 'an API subscription is the one sanctioned non-website interface (billed per image)'
+      note: 'an API subscription is the one sanctioned non-website interface (billed per image)'
     automation_allowed:
       value: "no"
       source: https://ideogram.ai/legal/usage-policy
-      quote: '"Do not use cheats, automation software (bots)..."; "Do not use any robot, spider, crawlers, scraper, or other automatic device"'
+      quote: 'Do not use cheats, automation software (bots)'
     commercial_use:
       value: "yes"
       source: https://ideogram.ai/legal/tos
-      quote: '"we do not restrict your ability to use User Output for your own purposes (including for commercial purposes)"'
+      quote: 'we do not restrict your ability to use User Output for your own purposes (including for commercial purposes)'
     watermark: unknown
     media: [image]
     adapter: none
@@ -174,15 +175,17 @@ providers:
     plan: Free daily generations without a plan (count not published).
     api_available:
       value: unknown
-      quote: 'Firefly Services API appears enterprise-only per Adobe forum posts; not confirmed from a first-party terms page'
+      note: 'Firefly Services API appears enterprise-only per Adobe forum posts; not confirmed from a first-party terms page'
     automation_allowed:
       value: "no"
       source: https://www.adobe.com/legal/terms.html
-      quote: 's.6.6 no access "by any means other than the interface we provide or authorize"; Gen-AI guidelines bar "unauthorized automated or scripting processes"'
+      quote: 'by any means other than the interface we provide or authorize'
+      note: 's.6.6; the Gen-AI user guidelines also bar "unauthorized automated or scripting processes"'
     commercial_use:
       value: "yes"
       source: https://www.adobe.com/products/firefly/plans.html
-      quote: '"Outputs generated with Adobe Firefly AI models can be used for commercial purposes" (partner models excepted)'
+      quote: 'Outputs generated with Adobe Firefly AI models can be used for commercial purposes'
+      note: 'partner models excepted'
     watermark: Content Credentials (C2PA)
     watermark_visible: false
     media: [image, video]
@@ -199,15 +202,16 @@ providers:
     api_available:
       value: "yes"
       source: https://docs.dev.runwayml.com/guides/pricing/
-      quote: 'developer API billed per credit; no free API tier stated'
+      note: 'developer API billed per credit; no free API tier stated'
     automation_allowed:
       value: "no"
       source: https://runway.com/terms-of-use
-      quote: 's.5(vii) "using manual or automated software or other means to access, ''scrape,'' ''crawl'' or ''spider'' any pages"'
+      quote: 'using manual or automated software or other means to access, ''scrape,'' ''crawl'' or ''spider'' any pages'
+      note: 's.5(vii)'
     commercial_use:
       value: "yes"
       source: https://runway.com/terms-of-use
-      quote: '"the Company does not restrict your commercial use of your Outputs"'
+      quote: 'the Company does not restrict your commercial use of your Outputs'
     watermark: unknown (paid Standard plan advertises "No watermarks")
     media: [video, image]
     adapter: none
@@ -224,15 +228,17 @@ providers:
     api_available:
       value: "no"
       source: https://pika.art/terms-of-service
-      quote: 'API only "If your Plan includes API access"; top-up credits "can''t be used with the API"'
+      quote: 'If your Plan includes API access'
+      note: 'top-up credits "can''t be used with the API"; the free plan carries no API access'
     automation_allowed:
       value: "no"
       source: https://pika.art/terms-of-service
-      quote: '"use any robot, spider, scraper, crawler, or other automated or manual means to access, extract, copy, or collect data"'
+      quote: 'use any robot, spider, scraper, crawler, or other automated or manual means to access, extract, copy, or collect data'
     commercial_use:
       value: "no"
       source: https://pika.art/pricing
-      quote: 'Free plan "Not included: Commercial license"'
+      quote: 'Not included: Commercial license'
+      note: 'listed against the Free plan'
     watermark: none listed on the free plan
     watermark_visible: false
     media: [video]
@@ -249,15 +255,16 @@ providers:
     api_available:
       value: "yes"
       source: https://lumalabs.ai/pricing
-      quote: 'API access under a subscription and separate API terms'
+      note: 'API access under a subscription and separate API terms'
     automation_allowed:
       value: "no"
       source: https://lumalabs.ai/legal/tos
-      quote: 's.3.4(m) bars automated access via "spiders, robots, crawlers, and data mining tools"'
+      quote: 'spiders, robots, crawlers, and data mining tools'
+      note: 's.3.4(m) bars automated access via these'
     commercial_use:
       value: "no"
       source: https://lumalabs.ai/legal/tos
-      quote: '"can only use the Outputs for commercial purposes if the Outputs were produced during an active Subscription Term"'
+      quote: 'can only use the Outputs for commercial purposes if the Outputs were produced during an active Subscription Term'
     watermark: provenance marks / content credentials; visible watermark on legacy free output (secondary)
     media: [video, image]
     adapter: none
@@ -271,15 +278,17 @@ providers:
     plan: Free daily credits (secondary sources only; not in the terms).
     api_available:
       value: unknown
-      quote: 'a paid Open Platform exists per secondary sources; the first-party doc page rendered empty'
+      note: 'a paid Open Platform exists per secondary sources; the first-party doc page rendered empty'
     automation_allowed:
       value: "no"
       source: https://kling.ai/docs/user-policy
-      quote: 's.3.1(h) you may not "use automated scripts to collect information from or otherwise interact with the Services"'
+      quote: 'use automated scripts to collect information from or otherwise interact with the Services'
+      note: 's.3.1(h), as a prohibited use'
     commercial_use:
       value: "no"
       source: https://kling.ai/docs/user-policy
-      quote: 's.4.6 without written permission you may not use "the Output for any commercial purposes"; s.4.5 output must be labelled as Kling-generated'
+      quote: 'the Output for any commercial purposes'
+      note: 's.4.6: may not be used this way without written permission; s.4.5 requires labelling output as Kling-generated'
     watermark: visible Kling watermark on free output (secondary); brand labelling required by the terms
     watermark_visible: true
     media: [video, image]

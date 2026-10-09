@@ -100,3 +100,58 @@ def test_malformed_file_is_a_config_error(tmp_path: Path) -> None:
     bad.write_text("note: n\nproviders: [{id: Bad Id}]\n")
     with pytest.raises(ConfigError):
         load_providers(bad)
+
+
+def _row(**kw: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "id": "x",
+        "provider": "X",
+        "plan": "free",
+        "api_available": {"value": "unknown"},
+        "automation_allowed": {"value": "unknown"},
+        "commercial_use": {"value": "unknown"},
+        "watermark": "none",
+    }
+    base.update(kw)
+    return base
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "shared"),
+    [
+        (_row(id="a", provider="Leonardo.ai"), _row(id="b", provider="leonardo AI"), "provider"),
+        (
+            _row(id="a", provider="A", api_key_env="KEY"),
+            _row(id="b", provider="B", api_key_env="KEY"),
+            "api_key_env",
+        ),
+    ],
+)
+def test_one_account_per_provider_by_name_and_key(
+    a: dict[str, object], b: dict[str, object], shared: str
+) -> None:
+    with pytest.raises(ValueError, match=f"share {shared}"):
+        ProviderInventory.model_validate(
+            {"note": "n", "operator_accounts_owed": True, "providers": [a, b]}
+        )
+
+
+def test_mirror_domains_are_not_first_party_sources() -> None:
+    with pytest.raises(ValueError, match="third-party mirror"):
+        SourcedVerdict(value="yes", source="https://open.windriver.com/x/openai-tou.html")
+    with pytest.raises(ValueError, match="https URL"):
+        SourcedVerdict(value="no", source="http://example.com/tos")
+    with pytest.raises(ValueError, match="third-party mirror"):
+        ProviderInventory.model_validate(
+            {
+                "note": "n",
+                "operator_accounts_owed": True,
+                "providers": [_row(sources=["https://tosdr.org/en/service/1"])],
+            }
+        )
+
+
+def test_openai_commercial_use_is_unknown_until_first_party_terms_are_read() -> None:
+    p = load_providers(REPO / "providers.yaml").get("openai")
+    assert p.commercial_use.value == "unknown"
+    assert p.commercial_use.note and "403" in p.commercial_use.note

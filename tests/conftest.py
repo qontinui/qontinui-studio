@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,7 @@ name: Cafe template
 kind: demo
 commercial: false
 publish_dir: ../published/cafe
+page_health: waived
 slots:
   hero: {width: 1600, height: 900, formats: [webp, avif]}
   og: {width: 1200, height: 630, formats: [png]}
@@ -61,6 +63,7 @@ name: Barber template
 kind: demo
 commercial: true
 publish_dir: ../published/barber
+page_health: waived
 slots:
   hero: {width: 1440, height: 1080, formats: [webp, avif]}
 """
@@ -78,6 +81,26 @@ style_guide: style.md
 provider_preference: [{providers}]
 variants: {variants}
 """
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never touch the network: provider HTTP is mocked with respx, which
+    intercepts at the httpx transport, so any real socket connect is a bug."""
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("tests must not open network connections")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+
+
+def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:
+    """The newest notice for (batch, outcome); notices are timestamped."""
+    matches = sorted(notices_dir.glob(f"{batch_id}-{outcome}-*.md"))
+    assert matches, f"no {outcome} notice for {batch_id} in {notices_dir}"
+    return matches[-1].read_text()
 
 
 class FakeClock:

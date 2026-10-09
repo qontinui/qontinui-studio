@@ -64,7 +64,7 @@ def _site(**kw: object) -> Site:
         "kind": "demo",
         "commercial": False,
         "publish_dir": "/tmp/x",
-        "slots": {"hero": {"width": 4, "height": 4}},
+        "slots": {"hero": {"width": 4, "height": 4, "category": "decorative"}},
     }
     base.update(kw)
     return Site.model_validate(base)
@@ -124,6 +124,7 @@ def test_d6_rules(records: tuple[AssetRecord, VariantRecord]) -> None:
 
 def test_page_health_gate() -> None:
     assert d7_page_health(_site()).outcome == "not_configured"
+    assert d7_page_health(_site()).failed
     site = _site(page_health_url="http://127.0.0.1:9876/ui-bridge/control/page-health")
     ok = d7_page_health(site, lambda u: {"success": True, "data": {"summary": "HEALTHY"}})
     assert ok.outcome == "pass"
@@ -136,3 +137,21 @@ def test_page_health_gate() -> None:
 
     down = d7_page_health(site, unreachable)
     assert down.failed and "probe failed" in down.detail
+
+
+def test_d6_label_wording(records: tuple[AssetRecord, VariantRecord]) -> None:
+    asset, variant = records
+    deco = Slot(width=4, height=4, category="decorative")
+    demo = _site()
+    real = _site(kind="real_business", commercial=True)
+    assert d6_not_the_real_thing(asset, variant, demo, deco, "Example photo").failed
+    assert d6_not_the_real_thing(asset, variant, demo, deco, "ILLUSTRATIVE only").outcome == "pass"
+    assert d6_not_the_real_thing(asset, variant, real, deco, "Maintained by us").failed
+    assert d6_not_the_real_thing(asset, variant, real, deco, "Made with ai").outcome == "pass"
+
+
+def test_page_health_waiver_and_refusal() -> None:
+    required = _site(page_health="required")
+    assert d7_page_health(required).failed
+    waived = d7_page_health(_site(page_health="waived"))
+    assert waived.outcome == "waived" and not waived.failed

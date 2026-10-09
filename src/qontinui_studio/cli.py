@@ -16,7 +16,7 @@ import click
 from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.briefs import load_brief, validate_brief
-from qontinui_studio.errors import StudioError
+from qontinui_studio.errors import ConfigError, PublicationRefused, StudioError
 from qontinui_studio.library import Library
 from qontinui_studio.notify import CoordFindingNotifier, FileNotifier
 from qontinui_studio.pipeline import BatchOutcome, Context, resume_all, run_brief
@@ -50,6 +50,9 @@ def _context(root: Path) -> Context:
 
 def _report(outcome: BatchOutcome) -> int:
     click.echo(f"batch {outcome.batch_id}: {outcome.status}")
+    if outcome.error:
+        click.echo(f"  error: {outcome.error}")
+        return 1
     for pid, why in sorted(outcome.unavailable_providers.items()):
         click.echo(f"  provider {pid} off: {why}")
     for j in outcome.failed_jobs:
@@ -100,7 +103,7 @@ def brief_validate(obj: Obj, paths: tuple[Path, ...]) -> None:
     sites = load_sites(ws.sites_dir)
     bad = 0
     for p in paths:
-        problems = validate_brief(load_brief(p).brief, sites, inventory)
+        problems = validate_brief(load_brief(p, root=obj.root).brief, sites, inventory)
         for problem in problems:
             click.echo(f"{p}: {problem}")
         bad += bool(problems)
@@ -116,7 +119,11 @@ def brief_validate(obj: Obj, paths: tuple[Path, ...]) -> None:
 def brief_run(obj: Obj, path: Path, no_publish: bool) -> None:
     """Generate, post-process and (gate-)publish one brief."""
     ctx = _context(obj.root)
-    sys.exit(_report(run_brief(ctx, path, publish=not no_publish)))
+    try:
+        outcome = run_brief(ctx, path, publish=not no_publish)
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+    sys.exit(_report(outcome))
 
 
 @main.group()
@@ -142,7 +149,13 @@ def jobs_run(obj: Obj, no_publish: bool) -> None:
 def publish_cmd(obj: Obj, batch_id: str) -> None:
     """Run the D5/D6/D7 gates over a generated batch and publish it if they pass."""
     ctx = _context(obj.root)
-    result = publish_batch(ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe)
+    try:
+        result = publish_batch(ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe)
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+    except PublicationRefused as e:
+        click.echo(f"refused: {e}", err=True)
+        sys.exit(2)
     for g in result.gate_results:
         click.echo(f"{g.outcome:15} {g.gate:15} {g.subject}: {g.detail}")
     if result.delivery:
