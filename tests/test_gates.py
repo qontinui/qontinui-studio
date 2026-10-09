@@ -177,8 +177,6 @@ def test_d6_label_wording(records: tuple[AssetRecord, VariantRecord]) -> None:
     assert d6_not_the_real_thing(asset, variant, real, deco, "Made with ai").outcome == "pass"
 
 
-def test_page_health_waiver_and_refusal() -> None:
-    required = _site(page_health="required")
-    assert d7_page_health(required).failed
-    waived = d7_page_health(_site(page_health="waived"))
-    assert waived.outcome == "waived" and not waived.failed
+def test_page_health_has_no_waiver() -> None:
+    required = d7_page_health(_site())
+    assert required.failed and required.outcome == "not_configured"

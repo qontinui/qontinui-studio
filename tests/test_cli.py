@@ -14,9 +14,23 @@ from qontinui_studio.adapters import AdapterSet
 from qontinui_studio.adapters.fake import FakeImageAdapter
 from qontinui_studio.cli import main
 
-from .conftest import FakeClock
+from .conftest import FakeClock, FakePreview
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _fake_preview(monkeypatch: pytest.MonkeyPatch, preview: FakePreview) -> None:
+    """The CLI's Context talks to the fake preview server instead of HTTP."""
+    real = cli._context
+
+    def with_preview(root: Path) -> pipeline.Context:
+        ctx = real(root)
+        ctx.probe = preview.probe
+        ctx.fetch = preview.fetch
+        return ctx
+
+    monkeypatch.setattr(cli, "_context", with_preview)
 
 
 @pytest.fixture(autouse=True)

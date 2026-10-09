@@ -8,6 +8,13 @@ transient failure is retried with exponential backoff; once a provider has
 exhausted its attempts the job moves to the next preferred provider. When every
 preferred provider is spent for today, the job is deferred to the next UTC
 midnight rather than failed.
+
+Concurrency: every step that acts on a job first CLAIMS it with a fresh token
+(``jobs.claim``) in a conditional update, and every later write is conditional
+on that token and the expected status. A process whose claim was taken over —
+because it outlived its lease — has its late result discarded, never merged
+with another process's state. A submission's lease is longer than the adapter's
+hard timeout, so a live request is never reclaimed.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -50,9 +58,12 @@ class RetryPolicy:
     # that provider and moves to the next preferred one.
     max_polls: int = 720
     poll_timeout_s: float = 3600.0
-    # A job claimed for submission ('submitting') whose process died before
-    # recording the outcome is reclaimed after this long.
+    # Minimum lease of a 'submitting' claim. The effective lease is the larger
+    # of this and the adapter's hard timeout + 60 s, so a request still in
+    # flight is never reclaimed.
     submit_stale_s: float = 900.0
+    # Lease of one poll/download round.
+    poll_lease_s: float = 900.0
 
     def backoff(self, attempts: int, retry_after_s: float | None) -> float:
         delay: float = min(self.max_backoff_s, self.base_backoff_s * 2.0 ** max(0, attempts - 1))
@@ -75,6 +86,7 @@ class CompletedJob:
 class StepReport:
     completed: list[CompletedJob] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    discarded: list[str] = field(default_factory=list)
 
 
 class Scheduler:
@@ -133,6 +145,23 @@ class Scheduler:
         self.conn.commit()
         return ids
 
+    # ---- conditional writes ------------------------------------------------
+
+    def _write(self, job_id: str, claim: str | None, status: str, /, **fields: object) -> bool:
+        """Update a job only if it is still in ``status`` under ``claim``.
+        Returns False (and changes nothing) when another process took it over."""
+        fields["updated_at"] = _iso(self.clock())
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        cur = self.conn.execute(
+            f"UPDATE jobs SET {cols} WHERE id = ? AND status = ? AND claim IS ?",
+            (*fields.values(), job_id, status, claim),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def _lease(self, adapter_timeout_s: float, floor_s: float) -> float:
+        return max(floor_s, adapter_timeout_s + 60.0)
+
     # ---- the step --------------------------------------------------------
 
     def _pick_provider(self, preference: list[str], tried: list[str], now: datetime) -> str | None:
@@ -169,30 +198,26 @@ class Scheduler:
                 continue
             preference, template = requests[batch_id]
             if row["status"] == "submitting":
-                # Claimed by a process that never recorded the outcome (it died
-                # mid-request). The provider may have charged; the quota was
-                # already counted. Requeue on the same provider.
-                self.conn.execute(
-                    "UPDATE jobs SET status = 'queued', last_error = ?, updated_at = ? "
-                    "WHERE id = ? AND status = 'submitting'",
-                    ("reclaimed a stale submission (outcome unknown)", _iso(now), row["id"]),
-                )
-                self.conn.commit()
+                # The claim outlived its lease (longer than the adapter's hard
+                # timeout): its process is gone. Requeue; if that process ever
+                # returns, its writes no longer match the claim and are dropped.
+                if not self._write(
+                    row["id"],
+                    row["claim"],
+                    "submitting",
+                    status="queued",
+                    claim=None,
+                    next_attempt_at=_iso(now),
+                    last_error="reclaimed a stale submission (outcome unknown)",
+                ):
+                    continue
                 row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             if row["status"] == "queued":
                 self._submit(row, preference, template, now, report)
-            else:
+            elif row["status"] == "submitted":
                 self._poll(row, now, report)
         self.conn.commit()
         return report
-
-    def _update(self, job_id: str, **fields: object) -> None:
-        fields["updated_at"] = _iso(self.clock())
-        cols = ", ".join(f"{k} = ?" for k in fields)
-        self.conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", (*fields.values(), job_id))
-        # Every job state change is durable on its own: a crash never loses a
-        # submission the provider has already counted.
-        self.conn.commit()
 
     def _submit(
         self,
@@ -216,46 +241,51 @@ class Scheduler:
                 tomorrow = (now + timedelta(days=1)).replace(
                     hour=0, minute=0, second=0, microsecond=0
                 )
-                self._update(
+                self._write(
                     row["id"],
+                    row["claim"],
+                    "queued",
                     provider=None,
                     next_attempt_at=_iso(tomorrow),
                     last_error="every preferred provider's daily quota is spent; deferred",
                 )
-            else:
-                self._update(
-                    row["id"],
-                    status="failed",
-                    last_error=row["last_error"]
-                    or "no schedulable provider in the brief's preference",
-                )
+            elif self._write(
+                row["id"],
+                row["claim"],
+                "queued",
+                status="failed",
+                last_error=row["last_error"] or "no schedulable provider in the brief's preference",
+            ):
                 report.failed.append(row["id"])
             return
 
         attempts = row["attempts"] if provider_id == row["provider"] else 0
         adapter = self.adapters.adapters[provider_id]
+        token = uuid.uuid4().hex
         request = GenerationRequest(
             job_id=row["id"],
             prompt=template.prompt,
             aspect_ratio=template.aspect_ratio,
             reference_images=template.reference_images,
         )
-        # Atomic claim: only one process may submit this job. The claim also
-        # records exactly what is being sent (prompt, model) and the terms as
-        # reviewed right now (D5); ingest reads these, never later config.
+        lease = self._lease(adapter.hard_timeout_s, self.policy.submit_stale_s)
+        # Atomic claim. It records exactly what is being sent (prompt, model)
+        # and the terms as reviewed right now (D5); ingest reads only these.
         # Quota is spent in the same transaction, BEFORE the request leaves.
         claimed = self.conn.execute(
-            "UPDATE jobs SET status = 'submitting', provider = ?, prompt = ?, model = ?, "
-            "terms_json = ?, next_attempt_at = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'queued'",
+            "UPDATE jobs SET status = 'submitting', claim = ?, provider = ?, prompt = ?, "
+            "model = ?, terms_json = ?, next_attempt_at = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'queued' AND claim IS ?",
             (
+                token,
                 provider_id,
                 request.prompt,
                 adapter.model,
                 TermsSnapshot.of(self.inventory.get(provider_id)).to_json(),
-                _iso(now + timedelta(seconds=self.policy.submit_stale_s)),
+                _iso(now + timedelta(seconds=lease)),
                 _iso(now),
                 row["id"],
+                row["claim"],
             ),
         ).rowcount
         if claimed != 1:
@@ -263,53 +293,74 @@ class Scheduler:
             return  # another process claimed it
         self._consume_quota(provider_id, now)
         self.conn.commit()
+
         try:
-            handle = adapter.submit(request, self.staging_dir / row["id"])
+            handle = adapter.submit(request, self.staging_dir / row["id"] / token)
         except TransientProviderError as e:
             attempts += 1
             if attempts >= self.policy.max_attempts_per_provider:
-                self._give_up_on_provider(row, provider_id, tried, str(e), now)
+                self._give_up_on_provider(
+                    row["id"], token, "submitting", provider_id, tried, str(e), now
+                )
             else:
                 delay = self.policy.backoff(attempts, e.retry_after_s)
-                self._update(
+                self._write(
                     row["id"],
+                    token,
+                    "submitting",
                     status="queued",
-                    provider=provider_id,
+                    claim=None,
                     attempts=attempts,
                     next_attempt_at=_iso(now + timedelta(seconds=delay)),
                     last_error=str(e),
                 )
             return
         except PermanentProviderError as e:
-            self._give_up_on_provider(row, provider_id, tried, str(e), now)
+            self._give_up_on_provider(
+                row["id"], token, "submitting", provider_id, tried, str(e), now
+            )
             return
-        self._update(
+        # Persist the handle at once, under our claim. If the claim was taken
+        # over while we waited on the provider, this result is discarded.
+        if not self._write(
             row["id"],
-            provider=provider_id,
-            attempts=attempts + 1,
+            token,
+            "submitting",
             status="submitted",
+            attempts=attempts + 1,
             submitted_at=_iso(now),
             polls=0,
             external_id=handle.external_id,
             handle_json=json.dumps(handle.data),
             next_attempt_at=_iso(now),
             last_error=None,
-        )
+        ):
+            report.discarded.append(row["id"])
+            return
         # Poll straight away; a synchronous provider is already done.
         fresh = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
         self._poll(fresh, now, report)
 
     def _give_up_on_provider(
-        self, row: sqlite3.Row, provider_id: str, tried: list[str], error: str, now: datetime
-    ) -> None:
-        tried = [*tried, provider_id]
-        self._update(
-            row["id"],
+        self,
+        job_id: str,
+        claim: str | None,
+        status: str,
+        provider_id: str,
+        tried: list[str],
+        error: str,
+        now: datetime,
+    ) -> bool:
+        return self._write(
+            job_id,
+            claim,
+            status,
             provider=None,
+            claim=None,
             attempts=0,
             polls=0,
             submitted_at=None,
-            tried_providers=json.dumps(tried),
+            tried_providers=json.dumps([*tried, provider_id]),
             next_attempt_at=_iso(now),
             last_error=f"{provider_id}: {error}",
             status="queued",
@@ -321,8 +372,35 @@ class Scheduler:
         adapter = self.adapters.adapters.get(provider_id)
         if adapter is None:
             # Not built this run (key unset, D4 now off): move on rather than fail.
-            self._give_up_on_provider(row, provider_id, tried, "adapter unavailable this run", now)
+            self._give_up_on_provider(
+                row["id"],
+                row["claim"],
+                "submitted",
+                provider_id,
+                tried,
+                "adapter unavailable this run",
+                now,
+            )
             return
+        # Claim this poll round, so two processes never poll/download one job.
+        token = uuid.uuid4().hex
+        lease = self._lease(adapter.hard_timeout_s, self.policy.poll_lease_s)
+        if not self._write(
+            row["id"],
+            row["claim"],
+            "submitted",
+            claim=token,
+            next_attempt_at=_iso(now + timedelta(seconds=lease)),
+        ):
+            return
+        job_id = row["id"]
+
+        def release(**fields: object) -> bool:
+            return self._write(job_id, token, "submitted", **fields)
+
+        def give_up(error: str) -> None:
+            self._give_up_on_provider(job_id, token, "submitted", provider_id, tried, error, now)
+
         handle = SubmittedJob(external_id=row["external_id"], data=json.loads(row["handle_json"]))
         polls = int(row["polls"]) + 1
         submitted_at = _parse(row["submitted_at"]) if row["submitted_at"] else now
@@ -330,78 +408,56 @@ class Scheduler:
             polls > self.policy.max_polls
             or (now - submitted_at).total_seconds() > self.policy.poll_timeout_s
         )
+        next_poll = _iso(now + timedelta(seconds=self.policy.poll_interval_s))
         try:
             result = adapter.poll(handle)
         except PermanentProviderError as e:
-            self._give_up_on_provider(row, provider_id, tried, str(e), now)
+            give_up(str(e))
             return
         except TransientProviderError as e:
             if overdue:
-                self._give_up_on_provider(
-                    row, provider_id, tried, f"poll deadline passed: {e}", now
-                )
-                return
-            self._update(
-                row["id"],
-                polls=polls,
-                next_attempt_at=_iso(now + timedelta(seconds=self.policy.poll_interval_s)),
-                last_error=str(e),
-            )
+                give_up(f"poll deadline passed: {e}")
+            else:
+                release(polls=polls, next_attempt_at=next_poll, last_error=str(e))
             return
         if result.status == "pending":
             if overdue:
-                self._give_up_on_provider(
-                    row,
-                    provider_id,
-                    tried,
+                give_up(
                     f"still pending after {polls} polls / "
-                    f"{(now - submitted_at).total_seconds():.0f}s",
-                    now,
+                    f"{(now - submitted_at).total_seconds():.0f}s"
                 )
-                return
-            self._update(
-                row["id"],
-                polls=polls,
-                next_attempt_at=_iso(now + timedelta(seconds=self.policy.poll_interval_s)),
-            )
+            else:
+                release(polls=polls, next_attempt_at=next_poll)
             return
         if result.status == "failed":
-            self._give_up_on_provider(
-                row, provider_id, tried, result.error or "provider job failed", now
-            )
+            give_up(result.error or "provider job failed")
             return
         try:
-            files = adapter.download(handle, self.raw_dir / row["batch_id"])
+            files = adapter.download(handle, self.raw_dir / row["batch_id"] / f"{job_id}-{token}")
         except TransientProviderError as e:
             # Download retries count against the same poll cap / deadline.
             if overdue:
-                self._give_up_on_provider(
-                    row, provider_id, tried, f"download deadline passed: {e}", now
-                )
-                return
-            self._update(
-                row["id"],
-                polls=polls,
-                next_attempt_at=_iso(now + timedelta(seconds=self.policy.poll_interval_s)),
-                last_error=f"download: {e}",
-            )
+                give_up(f"download deadline passed: {e}")
+            else:
+                release(polls=polls, next_attempt_at=next_poll, last_error=f"download: {e}")
             return
         except PermanentProviderError as e:
-            self._give_up_on_provider(row, provider_id, tried, f"download: {e}", now)
+            give_up(f"download: {e}")
             return
         if not files:
-            self._give_up_on_provider(row, provider_id, tried, "download returned no files", now)
+            give_up("download returned no files")
             return
-        self._update(
-            row["id"],
+        if not release(
             status="downloaded",
             polls=polls,
             files_json=json.dumps([str(f) for f in files]),
             last_error=None,
-        )
+        ):
+            report.discarded.append(job_id)
+            return
         report.completed.append(
             CompletedJob(
-                job_id=row["id"],
+                job_id=job_id,
                 batch_id=row["batch_id"],
                 variant_index=row["variant_index"],
                 provider=provider_id,
@@ -432,6 +488,7 @@ class Scheduler:
             r = self.step(requests)
             total.completed.extend(r.completed)
             total.failed.extend(r.failed)
+            total.discarded.extend(r.discarded)
             pending = [j for b in requests for j in self.pending_jobs(b)]
             if not pending:
                 return total

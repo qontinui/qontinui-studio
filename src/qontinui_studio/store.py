@@ -23,7 +23,14 @@ CREATE TABLE IF NOT EXISTS batches (
         ('generating', 'generated', 'publishing', 'published', 'refused', 'unpublished',
          'failed')),
     -- Why the batch is failed/refused, when it is.
-    reason TEXT
+    reason TEXT,
+    -- Lease: the one process currently driving this batch (drive_batch). A
+    -- second driver's claim fails while the lease is live.
+    driver TEXT,
+    driver_until TEXT,
+    -- Set once the operator notice for the publication was delivered;
+    -- recovery re-sends for a published batch that has none.
+    notified_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -35,7 +42,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- library rows and every target's variants exist. A crash between the two
     -- leaves 'downloaded', which the next run re-ingests.
     status TEXT NOT NULL CHECK (status IN
-        ('queued', 'submitting', 'submitted', 'downloaded', 'ingested', 'failed')),
+        ('queued', 'submitting', 'submitted', 'downloaded', 'ingesting', 'ingested', 'failed')),
+    -- Claim token of the process currently allowed to write this job. Every
+    -- write after a claim is conditional on it, so a process whose claim was
+    -- reclaimed as stale has its late result discarded.
+    claim TEXT,
     -- Persisted when the job is CLAIMED for submission: the exact prompt sent,
     -- the model, and the provider's terms as reviewed at that moment (D5).
     -- Ingest reads these, never the current brief or providers.yaml.
@@ -105,7 +116,7 @@ CREATE TABLE IF NOT EXISTS gate_results (
     batch_id TEXT NOT NULL REFERENCES batches(id),
     gate TEXT NOT NULL,
     subject TEXT NOT NULL,
-    outcome TEXT NOT NULL CHECK (outcome IN ('pass', 'fail', 'not_configured', 'waived')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('pass', 'fail', 'not_configured')),
     detail TEXT NOT NULL,
     evaluated_at TEXT NOT NULL
 );

@@ -34,6 +34,7 @@ class FakeImageAdapter:
     ) -> None:
         self.provider_id = provider_id
         self.model = model
+        self.hard_timeout_s = 0.0
         self._fail_remaining = fail_first
         self._pending_polls = pending_polls
         self._polls: dict[str, int] = {}

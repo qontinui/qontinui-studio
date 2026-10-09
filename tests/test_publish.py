@@ -20,31 +20,21 @@ from qontinui_studio.pipeline import Context, run_brief
 from qontinui_studio.publish import JOURNAL_PREFIX, publish_batch, recover, unpublish_batch
 from qontinui_studio.sites import load_sites
 
-from .conftest import FakeClock, debris, notice_text
-
-PREVIEW = (
-    "page_health_url: http://127.0.0.1:9/ui-bridge/control/page-health\n"
-    "preview_dir: ../preview/cafe\n"
-    "preview_manifest_url: http://127.0.0.1:9/studio-manifest.json\n"
-)
+from .conftest import FakeClock, FakePreview, debris, notice_text
 
 
 def _edit_site(studio_root: Path, name: str, old: str, new: str) -> None:
     p = studio_root / "sites" / name
-    p.write_text(p.read_text().replace(old, new))
+    text = p.read_text()
+    assert old in text, old
+    p.write_text(text.replace(old, new))
 
 
-def _with_preview(studio_root: Path) -> None:
-    _edit_site(studio_root, "cafe.yaml", "page_health: waived\n", PREVIEW)
-
-
-def _serve_preview(studio_root: Path) -> Callable[[str], bytes]:
-    """A fake preview server: serves whatever manifest is in preview_dir."""
-
-    def fetch(url: str) -> bytes:
-        return (studio_root / "preview" / "cafe" / "studio-manifest.json").read_bytes()
-
-    return fetch
+CAFE_PREVIEW = (
+    "page_health_url: http://preview.test/cafe/ui-bridge/control/page-health\n"
+    "preview_dir: ../../previews/cafe\n"
+    "preview_manifest_url: http://preview.test/cafe/studio-manifest.json\n"
+)
 
 
 def _ok(url: str) -> dict[str, object]:
@@ -76,10 +66,10 @@ def _status(ctx: Context, batch_id: str) -> str:
     )
 
 
-def test_missing_page_health_refuses_unless_waived(
+def test_missing_page_health_refuses_with_no_waiver(
     make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
 ) -> None:
-    _edit_site(studio_root, "cafe.yaml", "page_health: waived\n", "")
+    _edit_site(studio_root, "cafe.yaml", CAFE_PREVIEW, "")
     ctx = make_context()
     out = run_brief(ctx, write_brief())
     assert out.status == "refused"
@@ -90,9 +80,9 @@ def test_missing_page_health_refuses_unless_waived(
     assert not (studio_root / "published" / "barber" / "hero.webp").exists()
 
 
-def test_waiver_only_on_demo_sites(studio_root: Path) -> None:
-    _edit_site(studio_root, "cafe.yaml", "kind: demo", "kind: product")
-    with pytest.raises(ConfigError, match="waived is allowed only on a demo site"):
+def test_there_is_no_waiver_field(studio_root: Path) -> None:
+    _edit_site(studio_root, "cafe.yaml", CAFE_PREVIEW, "page_health: waived\n")
+    with pytest.raises(ConfigError, match="page_health"):
         load_sites(studio_root / "sites")
 
 
@@ -100,33 +90,70 @@ def test_page_health_needs_a_preview(studio_root: Path) -> None:
     _edit_site(
         studio_root,
         "cafe.yaml",
-        "page_health: waived\n",
-        "page_health_url: http://127.0.0.1:9/ui-bridge/control/page-health\n",
+        CAFE_PREVIEW,
+        "page_health_url: http://preview.test/cafe/ui-bridge/control/page-health\n",
     )
     with pytest.raises(ConfigError, match="needs preview_dir and preview_manifest_url"):
         load_sites(studio_root / "sites")
 
 
-def test_d7_runs_on_the_preview_before_anything_goes_live(
-    make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
+@pytest.mark.parametrize(
+    "preview_dir",
+    [
+        "..",  # the studio root itself
+        "../..",  # a parent of the studio root
+        "../somewhere",  # inside the studio root
+        "../published/cafe",  # the publish dir
+        "../published",  # a parent of the publish dir
+        "../published/cafe/sub",  # inside the publish dir
+    ],
+)
+def test_preview_dir_path_limits(studio_root: Path, preview_dir: str) -> None:
+    _edit_site(studio_root, "cafe.yaml", "../../previews/cafe", preview_dir)
+    with pytest.raises(ConfigError, match="preview_dir"):
+        load_sites(studio_root / "sites")
+
+
+def test_preview_only_deletes_files_it_wrote(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    clock: FakeClock,
 ) -> None:
-    _with_preview(studio_root)
+    previews = studio_root.parent / "previews" / "cafe"
+    previews.mkdir(parents=True)
+    (previews / "index.html").write_text("the preview site's own page")
+    run_brief(make_context(), write_brief())
+    clock.sleep(60)
+    run_brief(make_context(), write_brief(name="hero2.yaml"))
+    assert (previews / "index.html").read_text() == "the preview site's own page"
+
+
+def test_d7_runs_on_the_preview_before_anything_goes_live(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    preview: FakePreview,
+) -> None:
     seen: dict[str, object] = {}
 
     def probe(url: str) -> dict[str, object]:
         # At probe time the preview holds this batch, and live does not yet.
+        if "/cafe/" not in url:
+            return _ok(url)
         seen["preview"] = json.loads(
-            (studio_root / "preview" / "cafe" / "studio-manifest.json").read_text()
+            (studio_root.parent / "previews" / "cafe" / "studio-manifest.json").read_text()
         )
         seen["live_exists"] = (studio_root / "published" / "cafe" / "hero.webp").exists()
         return _ok(url)
 
-    ctx = make_context(probe=probe, fetch=_serve_preview(studio_root))
+    ctx = make_context(probe=probe)
     out = run_brief(ctx, write_brief())
     assert out.status == "published", out.publish and out.publish.failures
     assert seen["live_exists"] is False
-    preview = seen["preview"]
-    assert isinstance(preview, dict) and preview["slots"]["hero"]["batch_id"] == out.batch_id
+    shown = seen["preview"]
+    assert isinstance(shown, dict) and shown["slots"]["hero"]["batch_id"] == out.batch_id
+    assert out.publish is not None
     assert {g.gate for g in out.publish.gate_results if g.outcome == "pass"} >= {
         "d7_preview",
         "d7_page_health",
@@ -142,9 +169,8 @@ def test_failed_page_health_leaves_live_content_untouched(
     first = run_brief(make_context(), write_brief())
     assert first.status == "published"
     before = _live(studio_root)
-    _with_preview(studio_root)
     clock.sleep(60)
-    ctx = make_context(probe=_critical, fetch=_serve_preview(studio_root))
+    ctx = make_context(probe=_critical)
     second = run_brief(ctx, write_brief(name="hero2.yaml"))
     assert second.status == "refused"
     assert _status(ctx, second.batch_id) == "refused"
@@ -164,12 +190,10 @@ def test_any_probe_exception_refuses_and_never_publishes(
     studio_root: Path,
     probe_error: Exception,
 ) -> None:
-    _with_preview(studio_root)
-
     def probe(url: str) -> dict[str, object]:
         raise probe_error
 
-    ctx = make_context(probe=probe, fetch=_serve_preview(studio_root))
+    ctx = make_context(probe=probe)
     out = run_brief(ctx, write_brief())
     assert out.status == "refused"
     assert _status(ctx, out.batch_id) == "refused"
@@ -179,12 +203,11 @@ def test_any_probe_exception_refuses_and_never_publishes(
 def test_preview_serving_a_different_manifest_refuses(
     make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
 ) -> None:
-    _with_preview(studio_root)
-    ctx = make_context(probe=_ok, fetch=lambda url: b'{"slots": {}}')
+    ctx = make_context(fetch=lambda url: b'{"slots": {}}')
     out = run_brief(ctx, write_brief())
     assert out.status == "refused"
     assert out.publish is not None
-    assert [g.gate for g in out.publish.failures] == ["d7_preview"]
+    assert {g.gate for g in out.publish.failures} == {"d7_preview"}
 
 
 def test_unpublishing_the_newest_batch_restores_the_previous_one(
@@ -282,8 +305,11 @@ def test_crash_mid_swap_is_replayed_by_the_next_run(
 
     cafe = studio_root / "published" / "cafe"
     assert list(cafe.glob(f"{JOURNAL_PREFIX}*.json")), "the crash left its journal"
-    report = recover(ctx.conn, ctx.sites)
-    assert any("rolled back interrupted publish" in r for r in report)
+    report = recover(ctx.conn, ctx.sites, ctx.notifier, root=studio_root)
+    assert any("rolled back interrupted publish" in r for r in report.lines)
+    assert not report.failed_sites
+    # The operator hears about the rollback.
+    assert list(ctx.workspace.notices_dir.glob("*-publish-rolled-back-*.md"))
     assert _live(studio_root) == before
     assert _active_batches(ctx, "cafe-template") == {first.batch_id}
     assert not debris(cafe)

@@ -27,22 +27,37 @@ marketing churn never touches merge-critical factory code.
 | **D4** API first, GUI automation only where the terms allow it, one account per provider | An adapter is built only for a provider whose `providers.yaml` row has `tos_reviewed` set and `automation_allowed: "yes"`. `unknown` keeps it off. A duplicate provider row is a load error. | `providers.py` (`adapter_gate`), `adapters/__init__.py` |
 | **D5** every asset carries provenance and licence | Each library row stores provider, model, prompt, brief id, date and SHA-256. It also snapshots the licence terms as reviewed, and the watermark. `ai_generated` is pinned true by a SQL `CHECK`. An unreviewed licence is refused for every site; a non-commercial licence is refused for a commercial site. | `store.py`, `library.py`, `gates.py` (`d5_licence`, `d5_provenance`) |
 | **D6** AI imagery is never presented as the real thing | Refuses AI imagery in any `product_screenshot` slot, and in `food`/`premises` slots on a `real_business` site. Demo sites must carry an illustrative label. The label is written to the site's `studio-manifest.json` for the site build to render. | `gates.py` (`d6_not_the_real_thing`), `publish.py` |
-| **D7** automated gates decide; the operator is notified, not asked | A batch publishes only when every gate passes, then a UI Bridge page-health check runs. A CRITICAL or unreachable result rolls the batch back. The operator gets a notice with a one-step `studio unpublish --batch <id>`. The review page is not an approval queue. | `publish.py`, `notify.py`, `review.py` |
+| **D7** automated gates decide; the operator is notified, not asked | A batch publishes only when every gate passes, including UI Bridge page health on a preview of the batch, which runs before anything goes live. Page health is **required, with no waiver**. The operator gets a notice carrying a one-step `studio --root <abs path> unpublish --batch <id>`. The review page is not an approval queue. | `publish.py`, `notify.py`, `review.py` |
 
 D3, the build-record allowlist, gates the factory's export (Phase 1). It has no
 subject in this repo.
 
 A site that declares no `page_health_url` reports the page-health gate as
-`not_configured`, which **refuses** publication. The one exception is a demo
-site that sets `page_health: waived` (allowed on demo sites only, e.g. a template
-with no running preview yet). Every operator notice for such a site prints the
-waiver.
+`not_configured`, which **refuses** publication. There is no waiver (plan D7).
+The two shipped template sites (`sites/cafe-template.yaml` and
+`sites/barber-template.yaml`) declare no preview yet, because their repos are
+plan Phase 4, so **publishing to them is refused until a preview is
+configured**. The end-to-end acceptance test configures a fake preview server
+(injected fetch and probe) for those sites. Both D7 gates, the preview-manifest
+sha check and the page-health summary check, run for real against it.
+
+`preview_dir` is rewritten on every publish, so it has these limits:
+- It must be outside the studio root and must not contain it.
+- It must be neither `publish_dir`, inside it, nor a parent of it.
+- The studio only ever deletes files listed in the preview manifest it wrote
+  itself.
 
 Publication is safe against failures, crashes and concurrent runs:
 
 - **Exclusive.** Every publish and unpublish holds an OS file lock
   (`<publish_dir>/.studio.lock`) on each affected site, from the first check
-  to the last write.
+  to the operator notice. A batch is driven by one process at a time; the
+  batch row carries a lease. Each job step runs under a claim token, and a
+  late result from a reclaimed claim is discarded.
+- **Never clobbers.** If a slot path already holds bytes that are not a live
+  studio publication of that slot, the whole batch is refused (`foreign_file`).
+  This covers an owner-supplied photo or a hand edit. A batch that is already
+  live is refused (`already_live`).
 - **D7 runs on a preview, before anything goes live.** A site with
   `page_health_url` must also declare `preview_dir` and `preview_manifest_url`.
   The studio writes the live files, plus this batch's files and merged manifest,
@@ -50,14 +65,19 @@ Publication is safe against failures, crashes and concurrent runs:
   (by sha256) and runs UI Bridge page health on it. Only `OK` or `WARNING`
   publishes. Any other summary, and any probe error, refuses, and live content
   is never touched.
-- **Journalled swap.** Before any live file moves, a journal at
+- **Journalled swap and unpublish.** Before any live file moves, a journal at
   `<publish_dir>/.studio-journal-<batch>.json` records every staged, placed and
   backup path, plus the manifest before and after. A single `BEGIN IMMEDIATE`
-  transaction that marks the batch `published` is the commit point. Any
+  transaction is the commit point. It marks the batch `published` and records
+  the gate results. Any
   publish, unpublish or `jobs run` replays a leftover journal: forward if the
   database committed, backward otherwise. Undo removes only a live file that
   still holds the bytes this publish placed. While a publish is in flight the
   batch is `publishing`; recovery turns an orphaned `publishing` into `refused`.
+  Every rolled-back journal produces an operator notice. A published batch whose
+  notice was never sent (`batches.notified_at` is null) is re-notified. Recovery
+  runs per site: a site that cannot be recovered holds back only the batches
+  that target it.
 - **Complete or nothing.** A batch publishes only when every `{site, slot}` its
   brief targets has a variant.
 - **Unpublish** works only on a live batch. It restores the publication the

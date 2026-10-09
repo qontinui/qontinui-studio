@@ -55,6 +55,9 @@ class OpenAIImageAdapter:
     ) -> None:
         self.provider_id = provider_id
         self.model = model
+        # httpx timeouts are per phase (connect/write/read), not total: bound a
+        # call by all three plus headroom.
+        self.hard_timeout_s = 600.0
         key = os.environ.get(api_key_env)
         if not key:
             raise MissingCredentialError(f"{provider_id}: env var {api_key_env} is unset")

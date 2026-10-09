@@ -44,6 +44,10 @@ class PollResult:
 class ProviderAdapter(Protocol):
     provider_id: str
     model: str
+    # Upper bound on how long one submit/poll/download call can block. The
+    # scheduler's claim lease is always longer, so a request still in flight
+    # is never reclaimed by another process.
+    hard_timeout_s: float
 
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob: ...
 

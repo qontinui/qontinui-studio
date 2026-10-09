@@ -53,7 +53,9 @@ name: Cafe template
 kind: demo
 commercial: false
 publish_dir: ../published/cafe
-page_health: waived
+page_health_url: http://preview.test/cafe/ui-bridge/control/page-health
+preview_dir: ../../previews/cafe
+preview_manifest_url: http://preview.test/cafe/studio-manifest.json
 slots:
   hero: {width: 1600, height: 900, formats: [webp, avif]}
   og: {width: 1200, height: 630, formats: [png]}
@@ -65,7 +67,9 @@ name: Barber template
 kind: demo
 commercial: true
 publish_dir: ../published/barber
-page_health: waived
+page_health_url: http://preview.test/barber/ui-bridge/control/page-health
+preview_dir: ../../previews/barber
+preview_manifest_url: http://preview.test/barber/studio-manifest.json
 slots:
   hero: {width: 1440, height: 1080, formats: [webp, avif]}
 """
@@ -158,8 +162,34 @@ def _async_fakes(adapters: AdapterSet) -> AdapterSet:
     return adapters
 
 
+class FakePreview:
+    """A fake preview server for the template sites: serves the manifest the
+    studio wrote into ``<previews>/<site>/`` and answers page health OK. The
+    D7 gates run for real against it (manifest sha check + summary check)."""
+
+    def __init__(self, previews: Path, summary: str = "OK") -> None:
+        self.previews = previews
+        self.summary = summary
+        self.probed: list[str] = []
+
+    def fetch(self, url: str) -> bytes:
+        site = url.removeprefix("http://preview.test/").split("/", 1)[0]
+        return (self.previews / site / "studio-manifest.json").read_bytes()
+
+    def probe(self, url: str) -> dict[str, object]:
+        self.probed.append(url)
+        return {"success": True, "data": {"summary": self.summary, "findings": []}}
+
+
 @pytest.fixture
-def make_context(studio_root: Path, clock: FakeClock) -> Callable[..., Context]:
+def preview(studio_root: Path) -> FakePreview:
+    return FakePreview(studio_root.parent / "previews")
+
+
+@pytest.fixture
+def make_context(
+    studio_root: Path, clock: FakeClock, preview: FakePreview
+) -> Callable[..., Context]:
     def _make(**overrides: object) -> Context:
         ws = Workspace(studio_root)
         inventory = load_providers(ws.providers_path)
@@ -172,6 +202,8 @@ def make_context(studio_root: Path, clock: FakeClock) -> Callable[..., Context]:
             notifier=FileNotifier(ws.notices_dir),
             clock=clock,
             sleep=clock.sleep,
+            probe=preview.probe,
+            fetch=preview.fetch,
         )
         for k, v in overrides.items():
             setattr(ctx, k, v)

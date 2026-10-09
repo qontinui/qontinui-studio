@@ -32,6 +32,8 @@ from qontinui_studio.errors import (
     TransientProviderError,
 )
 
+REQUEST_TIMEOUT_S = 180.0
+
 
 class GeminiImageAdapter:
     def __init__(
@@ -43,11 +45,16 @@ class GeminiImageAdapter:
     ) -> None:
         self.provider_id = provider_id
         self.model = model
+        # One request timeout, with headroom for the SDK's own handling.
+        self.hard_timeout_s = REQUEST_TIMEOUT_S * 2
         if client is None:
             key = os.environ.get(api_key_env)
             if not key:
                 raise MissingCredentialError(f"{provider_id}: env var {api_key_env} is unset")
-            client = genai.Client(api_key=key)
+            client = genai.Client(
+                api_key=key,
+                http_options=types.HttpOptions(timeout=int(REQUEST_TIMEOUT_S * 1000)),
+            )
         self._client = client
 
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:

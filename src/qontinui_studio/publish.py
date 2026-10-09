@@ -9,28 +9,25 @@ build reads to render the illustrative/AI label beside the image (D6).
 How a publish is made safe:
 
 * **Exclusive.** Every publish/unpublish holds an OS lock on each affected
-  site (``locks.site_locks``) from the first check to the last write.
-* **D7 before anything goes live.** For a site with a preview, the studio
-  writes the live files plus this batch's files and merged manifest into
-  ``preview_dir``, confirms the preview serves exactly that manifest (sha256),
-  then runs UI Bridge page health on it. Only OK/WARNING pass. Nothing live has
-  changed yet, so a D7 failure needs no rollback of live content.
-* **Journalled swap.** Before touching live files, a journal naming every
-  staged, placed and backup path (and the manifest before/after) is written to
-  ``<publish_dir>/.studio-journal-<batch>.json``. The swap renames staged files
-  into place and moves the previous ones to backups; the DB transaction
-  (``BEGIN IMMEDIATE``) that marks the batch ``published`` is the commit
-  point. The journal is removed only after commit (backups deleted) or undo
-  (backups restored). A crash anywhere leaves a journal, and the next
-  publish/unpublish/``jobs run`` replays it: forward if the DB committed,
-  backward otherwise. Undo only removes a live file whose sha256 is still the
-  one this publish placed.
-* The batch sits in status ``publishing`` from the start of D7 to the commit;
-  recovery turns an orphaned ``publishing`` into ``refused``.
-
-Unpublishing the newest batch on a slot restores the publication it
-superseded, after verifying the stored variant's sha256, and never overwrites a
-live file holding bytes the studio did not put there.
+  site (``locks.site_locks``) from the first check to the notice.
+* **Never clobbers.** A slot path holding bytes that are not a live studio
+  publication of that slot (an owner-supplied photo, a hand edit) refuses the
+  batch (gate ``foreign_file``). A batch already live is refused (``already_live``).
+* **D7 before anything goes live, with no waiver.** The studio writes the live
+  files plus this batch's files and merged manifest into ``preview_dir``,
+  confirms the preview serves exactly that manifest (sha256), then runs UI
+  Bridge page health on it. Only OK/WARNING pass. A site with no page-health
+  preview cannot be published to.
+* **Journalled swap and unpublish.** Before touching live files, a journal
+  naming every staged, placed and backup path (and the manifest before/after)
+  is written to ``<publish_dir>/.studio-journal-<batch>.json``. The DB
+  transaction (``BEGIN IMMEDIATE``, gate results included) is the commit
+  point. A crash anywhere leaves a journal that recovery replays — forward if
+  the DB committed, backward otherwise — and the operator is notified either
+  way. Undo only removes a live file that still holds the bytes it placed.
+* **Notified exactly when published.** ``batches.notified_at`` is set after
+  the published notice is sent, under the site locks; recovery re-sends for a
+  published batch that has none.
 """
 
 from __future__ import annotations
@@ -46,7 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from qontinui_studio.errors import ConfigError, PublicationRefused
 from qontinui_studio.gates import (
@@ -70,6 +67,7 @@ from qontinui_studio.sites import Site
 MANIFEST = "studio-manifest.json"
 JOURNAL_PREFIX = ".studio-journal-"
 PUBLISHABLE_STATUSES = ("generated", "refused", "unpublished")
+PREVIEW_FILES_KEY = "studio_preview_files"
 
 
 @dataclass
@@ -85,8 +83,10 @@ class PublishResult:
         return [g for g in self.gate_results if g.failed]
 
 
-def unpublish_command(batch_id: str) -> str:
-    return f"studio unpublish --batch {batch_id}"
+def unpublish_command(batch_id: str, root: Path | None = None) -> str:
+    """The one-step unpublish, runnable from any directory when ``root`` is given."""
+    prefix = f"studio --root {root.resolve()} " if root is not None else "studio "
+    return f"{prefix}unpublish --batch {batch_id}"
 
 
 # ---- file helpers --------------------------------------------------------------
@@ -157,7 +157,20 @@ def _manifest_entry(
     }
 
 
+def _live_shas(conn: sqlite3.Connection, site_id: str, slot: str) -> set[str]:
+    return {
+        r["sha256"]
+        for r in conn.execute(
+            "SELECT v.sha256 FROM publications p JOIN variants v ON v.id = p.variant_id "
+            "WHERE p.site = ? AND p.slot = ? AND p.unpublished_at IS NULL",
+            (site_id, slot),
+        )
+    }
+
+
 # ---- the journal ---------------------------------------------------------------
+
+JournalKind = Literal["publish", "unpublish"]
 
 
 def _journal_path(publish_dir: Path, batch_id: str) -> Path:
@@ -166,11 +179,12 @@ def _journal_path(publish_dir: Path, batch_id: str) -> Path:
 
 @dataclass
 class Journal:
-    """Everything one publish does to one site's live directory."""
+    """Everything one publish or unpublish does to one site's live directory."""
 
     batch_id: str
     site: str
     publish_dir: Path
+    kind: JournalKind = "publish"
     # (staged, dest, sha256 of the bytes placed at dest)
     placed: list[tuple[Path, Path, str]] = field(default_factory=list)
     # (original live path, backup path it is moved to)
@@ -184,6 +198,7 @@ class Journal:
 
     def write(self) -> None:
         payload = {
+            "kind": self.kind,
             "batch_id": self.batch_id,
             "site": self.site,
             "publish_dir": str(self.publish_dir),
@@ -204,11 +219,23 @@ class Journal:
             batch_id=p["batch_id"],
             site=p["site"],
             publish_dir=Path(p["publish_dir"]),
+            kind=p.get("kind", "publish"),
             placed=[(Path(s), Path(d), sha) for s, d, sha in p["placed"]],
             moved=[(Path(o), Path(b)) for o, b in p["moved"]],
             manifest_before=None if before is None else base64.b64decode(before),
             manifest_after=base64.b64decode(p["manifest_after"]),
         )
+
+    def apply(self) -> None:
+        """Perform the journalled change: move originals aside, rename staged
+        files into place, write the manifest."""
+        for original, backup in self.moved:
+            os.replace(original, backup)
+        for staged, dest, _ in self.placed:
+            os.replace(staged, dest)
+        manifest = self.publish_dir / MANIFEST
+        if self.manifest_after:
+            atomic_write(manifest, self.manifest_after)
 
     def roll_forward(self) -> None:
         for staged, _, _ in self.placed:
@@ -218,7 +245,7 @@ class Journal:
         self.path.unlink(missing_ok=True)
 
     def roll_back(self) -> list[str]:
-        """Undo this publish on disk. Returns what could NOT be restored."""
+        """Undo this change on disk. Returns what could NOT be restored."""
         problems: list[str] = []
         for staged, dest, sha in self.placed:
             # The journal is written only after every file is staged, so a
@@ -250,57 +277,190 @@ class Journal:
         return problems
 
 
-def _batch_committed(conn: sqlite3.Connection, batch_id: str, site_id: str) -> bool:
-    row = conn.execute("SELECT status FROM batches WHERE id = ?", (batch_id,)).fetchone()
-    if row is None or row["status"] != "published":
+def _journal_committed(conn: sqlite3.Connection, journal: Journal) -> bool:
+    row = conn.execute("SELECT status FROM batches WHERE id = ?", (journal.batch_id,)).fetchone()
+    if row is None:
         return False
-    live = conn.execute(
-        "SELECT 1 FROM publications WHERE batch_id = ? AND site = ? AND unpublished_at IS NULL",
-        (batch_id, site_id),
-    ).fetchone()
-    return live is not None
+    live = (
+        conn.execute(
+            "SELECT 1 FROM publications WHERE batch_id = ? AND site = ? AND unpublished_at IS NULL",
+            (journal.batch_id, journal.site),
+        ).fetchone()
+        is not None
+    )
+    if journal.kind == "publish":
+        return bool(row["status"] == "published" and live)
+    return bool(row["status"] == "unpublished" and not live)
 
 
-def _recover_locked(conn: sqlite3.Connection, sites: list[Site]) -> list[str]:
-    """Replay every leftover journal in the given (already locked) sites."""
+def _recover_locked(
+    conn: sqlite3.Connection, sites: list[Site], notifier: Notifier, root: Path | None
+) -> list[str]:
+    """Replay every leftover journal in the given (already locked) sites. A
+    rolled-back change is reported to the operator."""
     report: list[str] = []
     for site in sites:
         if not site.publish_dir.is_dir():
             continue
         for path in sorted(site.publish_dir.glob(f"{JOURNAL_PREFIX}*.json")):
             journal = Journal.read(path)
-            if _batch_committed(conn, journal.batch_id, site.id):
+            if _journal_committed(conn, journal):
                 journal.roll_forward()
-                report.append(f"{site.id}: completed interrupted publish {journal.batch_id}")
+                report.append(f"{site.id}: completed interrupted {journal.kind} {journal.batch_id}")
                 continue
             problems = journal.roll_back()
-            conn.execute(
-                "UPDATE batches SET status = 'refused', reason = ? "
-                "WHERE id = ? AND status = 'publishing'",
-                ("interrupted publish rolled back", journal.batch_id),
+            if journal.kind == "publish":
+                conn.execute(
+                    "UPDATE batches SET status = 'refused', reason = ? "
+                    "WHERE id = ? AND status = 'publishing'",
+                    ("interrupted publish rolled back", journal.batch_id),
+                )
+                conn.commit()
+            line = f"{site.id}: rolled back interrupted {journal.kind} {journal.batch_id}" + (
+                f" ({'; '.join(problems)})" if problems else ""
             )
-            conn.commit()
-            report.append(
-                f"{site.id}: rolled back interrupted publish {journal.batch_id}"
-                + (f" ({'; '.join(problems)})" if problems else "")
+            report.append(line)
+            notifier.notify(
+                Notice(
+                    batch_id=journal.batch_id,
+                    outcome=f"{journal.kind}-rolled-back",
+                    title=f"qontinui-studio rolled back an interrupted {journal.kind} of "
+                    f"{journal.batch_id} on {site.id}",
+                    body=line,
+                    unpublish_command=None,
+                )
             )
     return report
 
 
-def recover(conn: sqlite3.Connection, sites: dict[str, Site]) -> list[str]:
-    """Replay leftover journals in EVERY site and refuse orphaned ``publishing``
-    batches. Holds every site lock, so no publish can be mid-flight."""
-    all_sites = list(sites.values())
-    with site_locks([s.publish_dir for s in all_sites]):
-        report = _recover_locked(conn, all_sites)
-        for row in conn.execute("SELECT id FROM batches WHERE status = 'publishing'").fetchall():
-            conn.execute(
-                "UPDATE batches SET status = 'refused', reason = ? WHERE id = ?",
-                ("publish interrupted before any live change", row["id"]),
-            )
-            report.append(f"batch {row['id']}: interrupted publish marked refused")
-        conn.commit()
+@dataclass
+class RecoveryReport:
+    lines: list[str] = field(default_factory=list)
+    # site id -> why its recovery failed; batches targeting it are held back.
+    failed_sites: dict[str, str] = field(default_factory=dict)
+
+
+def recover(
+    conn: sqlite3.Connection,
+    sites: dict[str, Site],
+    notifier: Notifier,
+    root: Path | None = None,
+) -> RecoveryReport:
+    """Bring every site back to a consistent state after a crash.
+
+    Per site (each under its own lock, each isolated): replay leftover
+    journals. Then refuse orphaned ``publishing`` batches and send the
+    published notice for any published batch that never got one. A failure is
+    confined to the site or batch it concerns."""
+    report = RecoveryReport()
+    for site in sites.values():
+        if not site.publish_dir.is_dir():
+            continue  # nothing published there, so nothing to recover
+        try:
+            with site_locks([site.publish_dir]):
+                report.lines += _recover_locked(conn, [site], notifier, root)
+        except Exception as e:
+            conn.rollback()
+            report.failed_sites[site.id] = f"{type(e).__name__}: {e}"
+
+    for row in conn.execute(
+        "SELECT id, targets_json FROM batches WHERE status = 'publishing'"
+    ).fetchall():
+        targets = {str(s) for s, _ in json.loads(row["targets_json"])}
+        if targets & set(report.failed_sites):
+            continue
+        try:
+            dirs = [sites[s].publish_dir for s in targets if s in sites]
+            with site_locks([d for d in dirs if d.is_dir()]):
+                if any(_journal_path(d, row["id"]).exists() for d in dirs):
+                    continue
+                cur = conn.execute(
+                    "UPDATE batches SET status = 'refused', reason = ? "
+                    "WHERE id = ? AND status = 'publishing'",
+                    ("publish interrupted before any live change", row["id"]),
+                )
+                conn.commit()
+                if cur.rowcount == 1:
+                    report.lines.append(f"batch {row['id']}: interrupted publish marked refused")
+                    notifier.notify(
+                        Notice(
+                            batch_id=row["id"],
+                            outcome="refused",
+                            title=f"qontinui-studio: publish of {row['id']} was interrupted",
+                            body="The publish was interrupted before any live change; "
+                            "the batch is refused and can be published again.",
+                        )
+                    )
+        except Exception as e:
+            conn.rollback()
+            report.lines.append(f"batch {row['id']}: recovery failed: {type(e).__name__}: {e}")
+
+    for row in conn.execute(
+        "SELECT id FROM batches WHERE status = 'published' AND notified_at IS NULL"
+    ).fetchall():
+        try:
+            site_ids = {
+                r["site"]
+                for r in conn.execute(
+                    "SELECT DISTINCT site FROM publications WHERE batch_id = ?", (row["id"],)
+                )
+            }
+            if site_ids & set(report.failed_sites):
+                continue
+            with site_locks([sites[s].publish_dir for s in site_ids if s in sites]):
+                again = conn.execute(
+                    "SELECT status, notified_at FROM batches WHERE id = ?", (row["id"],)
+                ).fetchone()
+                if again["status"] != "published" or again["notified_at"] is not None:
+                    continue
+                notifier.notify(_published_notice(conn, sites, row["id"], root))
+                _mark_notified(conn, row["id"])
+                report.lines.append(f"batch {row['id']}: sent the missing published notice")
+        except Exception as e:
+            conn.rollback()
+            report.lines.append(f"batch {row['id']}: notice failed: {type(e).__name__}: {e}")
     return report
+
+
+def _mark_notified(conn: sqlite3.Connection, batch_id: str) -> None:
+    conn.execute(
+        "UPDATE batches SET notified_at = datetime('now') WHERE id = ? AND notified_at IS NULL",
+        (batch_id,),
+    )
+    conn.commit()
+
+
+def _published_notice(
+    conn: sqlite3.Connection, sites: dict[str, Site], batch_id: str, root: Path | None
+) -> Notice:
+    rows = conn.execute(
+        "SELECT site, slot, published_path FROM publications "
+        "WHERE batch_id = ? AND unpublished_at IS NULL ORDER BY site, slot, published_path",
+        (batch_id,),
+    ).fetchall()
+    urls = []
+    for r in rows:
+        site = sites.get(r["site"])
+        name = Path(r["published_path"]).name
+        urls.append(
+            f"{site.public_url.rstrip('/')}/{name}"
+            if site and site.public_url
+            else r["published_path"]
+        )
+    slots = {(r["site"], r["slot"]) for r in rows}
+    gates = conn.execute(
+        "SELECT gate, outcome FROM gate_results WHERE batch_id = ? ORDER BY rowid DESC",
+        (batch_id,),
+    ).fetchall()
+    return Notice(
+        batch_id=batch_id,
+        outcome="published",
+        title=f"qontinui-studio published batch {batch_id}",
+        body=f"{len(slots)} slot(s) across {len({s for s, _ in slots})} site(s) published; "
+        f"every D5/D6/D7 gate passed ({len(gates)} gate results recorded).",
+        urls=urls,
+        unpublish_command=unpublish_command(batch_id, root),
+    )
 
 
 # ---- gates ---------------------------------------------------------------------
@@ -381,24 +541,47 @@ def _plan(
     return list(plans.values())
 
 
+def _safe_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and "/" not in name
+        and "\\" not in name
+        and name not in (".", "..")
+    )
+
+
 def _write_preview(plan: _SitePlan) -> bytes:
     """Fill ``preview_dir`` with the live files overlaid by this batch's files
-    and the merged manifest. Returns the manifest bytes written."""
+    and the merged manifest. Returns the manifest bytes written.
+
+    Only files the studio itself put there (listed in the previous preview
+    manifest it wrote) are ever deleted."""
     preview = plan.site.preview_dir
     assert preview is not None
     preview.mkdir(parents=True, exist_ok=True)
-    for old in preview.iterdir():
-        if old.is_file() and not old.name.startswith("."):
-            old.unlink()
+    previous = preview / MANIFEST
+    if previous.is_file():
+        try:
+            old = json.loads(previous.read_text(encoding="utf-8"))
+        except ValueError:
+            old = None
+        if isinstance(old, dict) and old.get("generated_by") == "qontinui-studio":
+            for name in old.get(PREVIEW_FILES_KEY, []):
+                if _safe_name(name):
+                    (preview / name).unlink(missing_ok=True)
+    names: set[str] = set()
     if plan.site.publish_dir.is_dir():
         for live in plan.site.publish_dir.iterdir():
             if live.is_file() and not live.name.startswith(".") and live.name != MANIFEST:
                 atomic_copy(live, preview / live.name)
+                names.add(live.name)
     for rows in plan.slots.values():
         for _, variant, dest in rows:
             atomic_copy(Path(variant.path), preview / dest.name)
-    data = plan.manifest_bytes
-    atomic_write(preview / MANIFEST, data)
+            names.add(dest.name)
+    data = manifest_bytes({**plan.manifest, PREVIEW_FILES_KEY: sorted(names)})
+    atomic_write(previous, data)
     return data
 
 
@@ -413,6 +596,7 @@ def publish_batch(
     clock: Callable[[], datetime],
     probe: PageHealthProbe = http_page_health_probe,
     fetch: ManifestFetch = http_manifest_fetch,
+    root: Path | None = None,
 ) -> PublishResult:
     """Gate and publish one batch.
 
@@ -420,14 +604,15 @@ def publish_batch(
     :class:`PublicationRefused` for a batch whose status is not publishable
     (still generating, failed, publishing or already published). A gate
     refusal is not an exception: it returns ``published=False`` and sends a
-    refusal notice."""
+    refusal notice. ``root`` is the studio root, printed in the notice's
+    unpublish command."""
     if conn.execute("SELECT 1 FROM batches WHERE id = ?", (batch_id,)).fetchone() is None:
         raise ConfigError(f"no batch '{batch_id}'")
     library = Library(conn)
     selected = _select_slot_variants(library.batch_variants(batch_id))
-    lock_dirs = [sites[s].publish_dir for s, _ in selected if s in sites]
-    with site_locks(lock_dirs):
-        _recover_locked(conn, [sites[s] for s, _ in selected if s in sites])
+    locked = [sites[s] for s in {s for s, _ in selected} if s in sites]
+    with site_locks([s.publish_dir for s in locked]):
+        _recover_locked(conn, locked, notifier, root)
         batch = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
         if batch["status"] not in PUBLISHABLE_STATUSES:
             raise PublicationRefused(
@@ -435,7 +620,15 @@ def publish_batch(
                 f"{'/'.join(PUBLISHABLE_STATUSES)} batches can be published",
                 [],
             )
-        return _publish_locked(conn, sites, batch, selected, notifier, clock(), probe, fetch)
+        claimed = conn.execute(
+            "UPDATE batches SET status = 'publishing', reason = NULL, notified_at = NULL "
+            "WHERE id = ? AND status = ?",
+            (batch_id, batch["status"]),
+        ).rowcount
+        conn.commit()
+        if claimed != 1:
+            raise PublicationRefused(f"batch {batch_id} changed status concurrently", [])
+        return _publish_locked(conn, sites, batch, selected, notifier, clock(), probe, fetch, root)
 
 
 def _publish_locked(
@@ -447,52 +640,78 @@ def _publish_locked(
     now: datetime,
     probe: PageHealthProbe,
     fetch: ManifestFetch,
+    root: Path | None,
 ) -> PublishResult:
     batch_id = batch["id"]
     result = PublishResult(batch_id=batch_id, published=False)
     now_iso = now.isoformat()
-
-    # ---- completeness: every brief target slot has a variant ----------------
-    required = {(str(site), str(slot)) for site, slot in json.loads(batch["targets_json"])}
-    for site_id, slot_name in sorted(required - set(selected)):
-        result.gate_results.append(
-            GateResult(
-                "completeness",
-                f"{site_id}/{slot_name}",
-                "fail",
-                "the brief targets this slot but the batch has no variant for it",
-            )
-        )
-    if not required:
-        result.gate_results.append(
-            GateResult("completeness", f"batch {batch_id}", "fail", "brief targets no site slot")
-        )
-
-    # ---- pre-publication gates (D5, D6) -----------------------------------
-    for (site_id, slot_name), items in selected.items():
-        site = sites.get(site_id)
-        if site is None or slot_name not in site.slots:
+    try:
+        # ---- completeness: every brief target slot has a variant ------------
+        required = {(str(site), str(slot)) for site, slot in json.loads(batch["targets_json"])}
+        for site_id, slot_name in sorted(required - set(selected)):
             result.gate_results.append(
                 GateResult(
-                    "config", f"{site_id}/{slot_name}", "fail", "site or slot no longer defined"
+                    "completeness",
+                    f"{site_id}/{slot_name}",
+                    "fail",
+                    "the brief targets this slot but the batch has no variant for it",
                 )
             )
-            continue
-        slot = site.slots[slot_name]
-        label = site.label_for_ai()
-        for asset, variant in items:
-            result.gate_results.append(d5_provenance(asset, variant))
-            result.gate_results.append(d5_licence(asset, variant, site))
-            result.gate_results.append(d6_not_the_real_thing(asset, variant, site, slot, label))
-    if result.failures:
-        return _refuse(conn, notifier, result, now, "pre-publication gates failed")
+        if not required:
+            result.gate_results.append(
+                GateResult(
+                    "completeness", f"batch {batch_id}", "fail", "brief targets no site slot"
+                )
+            )
+        if conn.execute(
+            "SELECT 1 FROM publications WHERE batch_id = ? AND unpublished_at IS NULL", (batch_id,)
+        ).fetchone():
+            result.gate_results.append(
+                GateResult("already_live", f"batch {batch_id}", "fail", "batch is already live")
+            )
 
-    plans = _plan(selected, sites, batch_id, now_iso)
-    conn.execute(
-        "UPDATE batches SET status = 'publishing', reason = NULL WHERE id = ?", (batch_id,)
-    )
-    conn.commit()
-    try:
+        # ---- pre-publication gates (D5, D6, foreign files) ------------------
+        for (site_id, slot_name), items in selected.items():
+            site = sites.get(site_id)
+            if site is None or slot_name not in site.slots:
+                result.gate_results.append(
+                    GateResult(
+                        "config", f"{site_id}/{slot_name}", "fail", "site or slot no longer defined"
+                    )
+                )
+                continue
+            slot = site.slots[slot_name]
+            label = site.label_for_ai()
+            for asset, variant in items:
+                result.gate_results.append(d5_provenance(asset, variant))
+                result.gate_results.append(d5_licence(asset, variant, site))
+                result.gate_results.append(d6_not_the_real_thing(asset, variant, site, slot, label))
+            live = _live_shas(conn, site_id, slot_name)
+            dests = {site.publish_dir / f"{slot_name}{Path(v.path).suffix}" for _, v in items}
+            prev_paths = {
+                Path(r["published_path"])
+                for r in conn.execute(
+                    "SELECT published_path FROM publications "
+                    "WHERE site = ? AND slot = ? AND unpublished_at IS NULL",
+                    (site_id, slot_name),
+                )
+            }
+            for path in sorted(dests | prev_paths):
+                sha = _file_sha(path)
+                if sha is not None and sha not in live:
+                    result.gate_results.append(
+                        GateResult(
+                            "foreign_file",
+                            str(path),
+                            "fail",
+                            "holds bytes that are not a live studio publication of this slot "
+                            "(owner-supplied or hand-edited); refusing to overwrite",
+                        )
+                    )
+        if result.failures:
+            return _refuse(conn, notifier, result, now, "pre-publication gates failed")
+
+        plans = _plan(selected, sites, batch_id, now_iso)
         # ---- D7 on a preview, before anything live changes ------------------
         for plan in plans:
             site = plan.site
@@ -506,7 +725,7 @@ def _publish_locked(
         if result.failures:
             return _refuse(conn, notifier, result, now, "D7 failed; nothing went live")
 
-        _swap_live(conn, plans, batch_id, now_iso, result)
+        _swap_live(conn, plans, batch_id, now, result)
     except Exception as e:
         result.files = []
         result.gate_results.append(
@@ -524,36 +743,9 @@ def _publish_locked(
         conn.commit()
         raise
 
-    _record_gates(conn, batch_id, result.gate_results, now)
-    conn.commit()
     result.published = True
-
-    urls = []
-    for plan in plans:
-        for rows in plan.slots.values():
-            for _, _, dest in rows:
-                urls.append(
-                    f"{plan.site.public_url.rstrip('/')}/{dest.name}"
-                    if plan.site.public_url
-                    else str(dest)
-                )
-    body_lines = [
-        f"{len(selected)} slot(s) across {len(plans)} site(s) published; "
-        "every D5/D6/D7 gate passed.",
-    ]
-    for g in result.gate_results:
-        if g.outcome == "waived":
-            body_lines.append(f"WAIVED: {g.gate} for {g.subject} — {g.detail}")
-    result.delivery = notifier.notify(
-        Notice(
-            batch_id=batch_id,
-            outcome="published",
-            title=f"qontinui-studio published batch {batch_id}",
-            body="\n".join(body_lines),
-            urls=urls,
-            unpublish_command=unpublish_command(batch_id),
-        )
-    )
+    result.delivery = notifier.notify(_published_notice(conn, sites, batch_id, root))
+    _mark_notified(conn, batch_id)
     return result
 
 
@@ -561,11 +753,12 @@ def _swap_live(
     conn: sqlite3.Connection,
     plans: list[_SitePlan],
     batch_id: str,
-    now_iso: str,
+    now: datetime,
     result: PublishResult,
 ) -> None:
-    """Journal, swap, commit. On any exception everything is rolled back and
-    the exception re-raised."""
+    """Journal, swap, commit (with the gate results). On any exception
+    everything is rolled back and the exception re-raised."""
+    now_iso = now.isoformat()
     journals: list[Journal] = []
     try:
         # 1. stage every file and write every journal before any live change.
@@ -577,6 +770,7 @@ def _swap_live(
                 batch_id=batch_id,
                 site=site.id,
                 publish_dir=site.publish_dir,
+                kind="publish",
                 manifest_before=manifest_path.read_bytes() if manifest_path.is_file() else None,
                 manifest_after=plan.manifest_bytes,
             )
@@ -606,14 +800,10 @@ def _swap_live(
 
         # 2. swap.
         for journal in journals:
-            for original, backup in journal.moved:
-                os.replace(original, backup)
-            for staged, dest, _ in journal.placed:
-                os.replace(staged, dest)
-                result.files.append(dest)
-            atomic_write(journal.publish_dir / MANIFEST, journal.manifest_after)
+            journal.apply()
+            result.files += [dest for _, dest, _ in journal.placed]
 
-        # 3. commit point.
+        # 3. commit point — publications, status and the gate record together.
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         for plan in plans:
@@ -637,9 +827,14 @@ def _swap_live(
                             now_iso,
                         ),
                     )
-        conn.execute(
-            "UPDATE batches SET status = 'published', reason = NULL WHERE id = ?", (batch_id,)
+        _record_gates(conn, batch_id, result.gate_results, now)
+        cur = conn.execute(
+            "UPDATE batches SET status = 'published', reason = NULL "
+            "WHERE id = ? AND status = 'publishing'",
+            (batch_id,),
         )
+        if cur.rowcount != 1:
+            raise PublicationRefused(f"batch {batch_id} left 'publishing' concurrently", [])
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -657,7 +852,8 @@ def _refuse(
     conn.rollback()
     _record_gates(conn, result.batch_id, result.gate_results, now)
     conn.execute(
-        "UPDATE batches SET status = 'refused', reason = ? WHERE id = ?", (why, result.batch_id)
+        "UPDATE batches SET status = 'refused', reason = ? WHERE id = ? AND status = 'publishing'",
+        (why, result.batch_id),
     )
     conn.commit()
     result.files = []
@@ -686,9 +882,9 @@ class UnpublishResult:
 def _unpublish_locked(
     conn: sqlite3.Connection, sites: dict[str, Site], batch_id: str, now: datetime
 ) -> UnpublishResult:
-    """File operations are idempotent (hash-checked deletes, atomic copies) and
-    the DB changes are one transaction, so an interrupted unpublish is finished
-    by running it again."""
+    """Journalled like a publish: decide everything, stage restore copies,
+    write the journals, apply (move this batch's files aside, rename restores
+    into place, write manifests), then commit the DB. Recovery replays it."""
     out = UnpublishResult()
     now_iso = now.isoformat()
     library = Library(conn)
@@ -697,93 +893,122 @@ def _unpublish_locked(
         "JOIN variants v ON v.id = p.variant_id WHERE p.batch_id = ? AND p.unpublished_at IS NULL",
         (batch_id,),
     ).fetchall()
-    slots_by_site: dict[str, set[str]] = {}
+    by_site: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
-        path = Path(row["published_path"])
-        # Only delete the bytes we put there.
-        if _file_sha(path) == row["sha256"]:
-            path.unlink()
-            out.removed.append(path)
-        slots_by_site.setdefault(row["site"], set()).add(row["slot"])
+        by_site.setdefault(row["site"], []).append(row)
 
+    journals: list[Journal] = []
     restore_rows: list[int] = []
-    manifests: dict[str, dict[str, Any]] = {}
-    for site_id, slots in slots_by_site.items():
-        site = sites.get(site_id)
-        if site is None:
-            continue
-        manifest = manifests.setdefault(site_id, _read_manifest(site.publish_dir))
-        for slot in sorted(slots):
-            entry = manifest["slots"].get(slot)
-            if isinstance(entry, dict) and entry.get("batch_id") == batch_id:
-                del manifest["slots"][slot]
-            prev = conn.execute(
-                "SELECT p.*, v.path AS vpath, v.format AS vformat, v.sha256 AS vsha, v.asset_uid "
-                "FROM publications p JOIN variants v ON v.id = p.variant_id "
-                "WHERE p.site = ? AND p.slot = ? AND p.superseded_by = ?",
-                (site_id, slot, batch_id),
-            ).fetchall()
-            if not prev:
+    try:
+        for site_id, site_rows in sorted(by_site.items()):
+            site = sites.get(site_id)
+            if site is None:
                 continue
-            prev_batch = prev[0]["batch_id"]
-            problems: list[str] = []
-            for r in prev:
-                src, dest = Path(r["vpath"]), Path(r["published_path"])
-                if _file_sha(src) != r["vsha"]:
-                    problems.append(f"stored variant {src} is missing or altered")
-                existing = _file_sha(dest)
-                if existing is not None and existing != r["vsha"]:
-                    problems.append(f"{dest} holds bytes the studio did not place")
-            if problems:
-                out.not_restored.append(f"{site_id}/{slot} <- {prev_batch}: {'; '.join(problems)}")
-                continue
-            files: dict[str, str] = {}
-            for r in prev:
-                dest = Path(r["published_path"])
-                if _file_sha(dest) != r["vsha"]:
-                    atomic_copy(Path(r["vpath"]), dest)
-                files[r["vformat"]] = dest.name
-                restore_rows.append(int(r["id"]))
-            manifest["slots"][slot] = _manifest_entry(
-                library.asset(prev[0]["asset_uid"]),
-                files,
-                prev[0]["label"],
-                prev_batch,
-                prev[0]["published_at"],
+            manifest_path = site.publish_dir / MANIFEST
+            manifest = _read_manifest(site.publish_dir)
+            journal = Journal(
+                batch_id=batch_id,
+                site=site_id,
+                publish_dir=site.publish_dir,
+                kind="unpublish",
+                manifest_before=manifest_path.read_bytes() if manifest_path.is_file() else None,
             )
-            out.restored.append(f"{site_id}/{slot} <- {prev_batch}")
-    for site_id, manifest in manifests.items():
-        _write_manifest(sites[site_id].publish_dir, manifest)
+            moving: set[Path] = set()
+            for row in site_rows:
+                path = Path(row["published_path"])
+                # Only move away the bytes we put there.
+                if _file_sha(path) == row["sha256"]:
+                    journal.moved.append(
+                        (path, path.with_name(f".{path.name}.prev-{uuid.uuid4().hex}"))
+                    )
+                    moving.add(path)
+                    out.removed.append(path)
+            for slot in sorted({r["slot"] for r in site_rows}):
+                entry = manifest["slots"].get(slot)
+                if isinstance(entry, dict) and entry.get("batch_id") == batch_id:
+                    del manifest["slots"][slot]
+                prev = conn.execute(
+                    "SELECT p.*, v.path AS vpath, v.format AS vformat, v.sha256 AS vsha, "
+                    "v.asset_uid FROM publications p JOIN variants v ON v.id = p.variant_id "
+                    "WHERE p.site = ? AND p.slot = ? AND p.superseded_by = ?",
+                    (site_id, slot, batch_id),
+                ).fetchall()
+                if not prev:
+                    continue
+                prev_batch = prev[0]["batch_id"]
+                problems: list[str] = []
+                for r in prev:
+                    src, dest = Path(r["vpath"]), Path(r["published_path"])
+                    if _file_sha(src) != r["vsha"]:
+                        problems.append(f"stored variant {src} is missing or altered")
+                    existing = None if dest in moving else _file_sha(dest)
+                    if existing is not None and existing != r["vsha"]:
+                        problems.append(f"{dest} holds bytes the studio did not place")
+                if problems:
+                    out.not_restored.append(
+                        f"{site_id}/{slot} <- {prev_batch}: {'; '.join(problems)}"
+                    )
+                    continue
+                files: dict[str, str] = {}
+                for r in prev:
+                    dest = Path(r["published_path"])
+                    if dest in moving or _file_sha(dest) != r["vsha"]:
+                        staged = dest.with_name(f".{dest.name}.staged-{uuid.uuid4().hex}")
+                        shutil.copyfile(r["vpath"], staged)
+                        journal.placed.append((staged, dest, r["vsha"]))
+                    files[r["vformat"]] = dest.name
+                    restore_rows.append(int(r["id"]))
+                manifest["slots"][slot] = _manifest_entry(
+                    library.asset(prev[0]["asset_uid"]),
+                    files,
+                    prev[0]["label"],
+                    prev_batch,
+                    prev[0]["published_at"],
+                )
+                out.restored.append(f"{site_id}/{slot} <- {prev_batch}")
+            journal.manifest_after = manifest_bytes(manifest)
+            journal.write()
+            journals.append(journal)
 
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    for row in rows:
+        for journal in journals:
+            journal.apply()
+
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            conn.execute(
+                "UPDATE publications SET unpublished_at = ? WHERE id = ?", (now_iso, row["id"])
+            )
+        # This batch's rows that a NEWER batch had already superseded: hand the
+        # publications this batch superseded on to that newer batch, so
+        # unpublishing the newer one later restores the right thing.
+        for r in conn.execute(
+            "SELECT DISTINCT site, slot, superseded_by FROM publications "
+            "WHERE batch_id = ? AND superseded_by IS NOT NULL",
+            (batch_id,),
+        ).fetchall():
+            conn.execute(
+                "UPDATE publications SET superseded_by = ? "
+                "WHERE superseded_by = ? AND site = ? AND slot = ?",
+                (r["superseded_by"], batch_id, r["site"], r["slot"]),
+            )
+        conn.execute("UPDATE publications SET superseded_by = NULL WHERE batch_id = ?", (batch_id,))
+        for rid in restore_rows:
+            conn.execute(
+                "UPDATE publications SET unpublished_at = NULL, superseded_by = NULL WHERE id = ?",
+                (rid,),
+            )
         conn.execute(
-            "UPDATE publications SET unpublished_at = ? WHERE id = ?", (now_iso, row["id"])
+            "UPDATE batches SET status = 'unpublished', reason = NULL WHERE id = ?", (batch_id,)
         )
-    # This batch's rows that a NEWER batch had already superseded: hand the
-    # publications this batch superseded on to that newer batch, so
-    # unpublishing the newer one later restores the right thing.
-    for r in conn.execute(
-        "SELECT DISTINCT site, slot, superseded_by FROM publications "
-        "WHERE batch_id = ? AND superseded_by IS NOT NULL",
-        (batch_id,),
-    ).fetchall():
-        conn.execute(
-            "UPDATE publications SET superseded_by = ? "
-            "WHERE superseded_by = ? AND site = ? AND slot = ?",
-            (r["superseded_by"], batch_id, r["site"], r["slot"]),
-        )
-    conn.execute("UPDATE publications SET superseded_by = NULL WHERE batch_id = ?", (batch_id,))
-    for rid in restore_rows:
-        conn.execute(
-            "UPDATE publications SET unpublished_at = NULL, superseded_by = NULL WHERE id = ?",
-            (rid,),
-        )
-    conn.execute(
-        "UPDATE batches SET status = 'unpublished', reason = NULL WHERE id = ?", (batch_id,)
-    )
-    conn.commit()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        for journal in reversed(journals):
+            journal.roll_back()
+        raise
+    for journal in journals:
+        journal.roll_forward()
     return out
 
 
@@ -793,6 +1018,7 @@ def unpublish_batch(
     batch_id: str,
     notifier: Notifier,
     clock: Callable[[], datetime],
+    root: Path | None = None,
 ) -> list[Path]:
     """Remove a batch's live files and manifest entries, restoring whatever
     publication it had superseded on each slot. Returns the removed files.
@@ -811,7 +1037,7 @@ def unpublish_batch(
     }
     locked = [sites[s] for s in site_ids if s in sites]
     with site_locks([s.publish_dir for s in locked]):
-        _recover_locked(conn, locked)
+        _recover_locked(conn, locked, notifier, root)
         status = conn.execute("SELECT status FROM batches WHERE id = ?", (batch_id,)).fetchone()[
             "status"
         ]
@@ -824,15 +1050,15 @@ def unpublish_batch(
                 [],
             )
         out = _unpublish_locked(conn, sites, batch_id, now)
-    lines = [f"Removed {len(out.removed)} file(s): " + ", ".join(str(p) for p in out.removed)]
-    lines += [f"Restored {r}" for r in out.restored]
-    lines += [f"NOT restored {r}" for r in out.not_restored]
-    notifier.notify(
-        Notice(
-            batch_id=batch_id,
-            outcome="unpublished",
-            title=f"qontinui-studio unpublished batch {batch_id}",
-            body="\n".join(lines),
+        lines = [f"Removed {len(out.removed)} file(s): " + ", ".join(str(p) for p in out.removed)]
+        lines += [f"Restored {r}" for r in out.restored]
+        lines += [f"NOT restored {r}" for r in out.not_restored]
+        notifier.notify(
+            Notice(
+                batch_id=batch_id,
+                outcome="unpublished",
+                title=f"qontinui-studio unpublished batch {batch_id}",
+                body="\n".join(lines),
+            )
         )
-    )
     return out.removed

@@ -69,11 +69,17 @@ def test_one_brief_two_sites_zero_manual_steps(
         assert any(v.campaign == "launch" for v in lib.variants(a.uid))
     assert {r["status"] for r in ctx.conn.execute("SELECT status FROM jobs")} == {"ingested"}
 
+    # D7 ran for real against the (fake) preview of each template site.
+    passed = {(g.gate, g.subject) for g in outcome.publish.gate_results if g.outcome == "pass"}
+    for site in ("cafe-template", "barber-template"):
+        assert ("d7_preview", f"site {site}") in passed
+        assert ("d7_page_health", f"site {site}") in passed
+
     # The operator is notified, not asked: a notice with the one-step unpublish,
-    # and the page-health waiver printed.
+    # runnable from anywhere (it names the studio root).
     text = notice_text(ctx.workspace.notices_dir, outcome.batch_id, "published")
-    assert f"studio unpublish --batch {outcome.batch_id}" in text
-    assert "WAIVED: d7_page_health" in text
+    assert f"studio --root {studio_root.resolve()} unpublish --batch {outcome.batch_id}" in text
+    assert ctx.conn.execute("SELECT notified_at FROM batches").fetchone()[0] is not None
 
     page = build_review_page(ctx.conn, ctx.workspace.review_dir, ctx.clock())
     html = page.read_text()

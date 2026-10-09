@@ -35,7 +35,12 @@ def _e(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
-def build_review_page(conn: sqlite3.Connection, out_dir: Path, generated_at: datetime) -> Path:
+def build_review_page(
+    conn: sqlite3.Connection, out_dir: Path, generated_at: datetime, root: Path | None = None
+) -> Path:
+    """Write the review page. ``root`` (the studio root) makes every printed
+    command runnable from any directory."""
+    prefix = f"studio --root {root.resolve()} " if root is not None else "studio "
     library = Library(conn)
     out_dir.mkdir(parents=True, exist_ok=True)
     parts = [
@@ -53,10 +58,10 @@ def build_review_page(conn: sqlite3.Connection, out_dir: Path, generated_at: dat
         parts.append(f"<section class='batch'><h2>{_e(b['id'])} — {_e(b['status'])}</h2>")
         parts.append(f"<dl><dt>brief</dt><dd>{_e(b['brief_path'])}</dd></dl>")
         parts.append("<p>Regenerate:</p>")
-        parts.append(f"<code>studio brief run {_e(b['brief_path'])}</code>")
+        parts.append(f"<code>{_e(prefix)}brief run {_e(b['brief_path'])}</code>")
         if b["status"] == "published":
             parts.append("<p>Unpublish:</p>")
-            parts.append(f"<code>{_e(unpublish_command(b['id']))}</code>")
+            parts.append(f"<code>{_e(unpublish_command(b['id'], root))}</code>")
         gates = conn.execute(
             "SELECT gate, subject, outcome, detail FROM gate_results WHERE batch_id = ? ORDER BY rowid",
             (b["id"],),

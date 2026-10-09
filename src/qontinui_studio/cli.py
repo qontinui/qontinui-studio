@@ -42,7 +42,7 @@ def _context(root: Path) -> Context:
         workspace=ws,
         conn=connect(ws.db_path),
         inventory=inventory,
-        sites=load_sites(ws.sites_dir),
+        sites=load_sites(ws.sites_dir, root),
         adapters=build_adapters(inventory),
         notifier=CoordFindingNotifier(file_notifier),
     )
@@ -53,6 +53,9 @@ def _report(outcome: BatchOutcome) -> int:
     if outcome.error:
         click.echo(f"  error: {outcome.error}")
         return 1
+    if not outcome.driven:
+        click.echo(f"  {outcome.note}")
+        return 0
     for pid, why in sorted(outcome.unavailable_providers.items()):
         click.echo(f"  provider {pid} off: {why}")
     for j in outcome.failed_jobs:
@@ -100,7 +103,7 @@ def brief() -> None:
 def brief_validate(obj: Obj, paths: tuple[Path, ...]) -> None:
     ws = Workspace(obj.root)
     inventory = load_providers(ws.providers_path)
-    sites = load_sites(ws.sites_dir)
+    sites = load_sites(ws.sites_dir, obj.root)
     bad = 0
     for p in paths:
         problems = validate_brief(load_brief(p, root=obj.root).brief, sites, inventory)
@@ -151,7 +154,14 @@ def publish_cmd(obj: Obj, batch_id: str) -> None:
     ctx = _context(obj.root)
     try:
         result = publish_batch(
-            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe, ctx.fetch
+            ctx.conn,
+            ctx.sites,
+            batch_id,
+            ctx.notifier,
+            ctx.clock,
+            ctx.probe,
+            ctx.fetch,
+            root=obj.root,
         )
     except ConfigError as e:
         raise click.ClickException(str(e)) from e
@@ -172,7 +182,9 @@ def unpublish_cmd(obj: Obj, batch_id: str) -> None:
     """Remove a batch's published files and manifest entries (one step)."""
     ctx = _context(obj.root)
     try:
-        removed = unpublish_batch(ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock)
+        removed = unpublish_batch(
+            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, root=obj.root
+        )
     except KeyError as e:
         raise click.ClickException(str(e)) from e
     except PublicationRefused as e:
@@ -222,7 +234,7 @@ def review() -> None:
 @click.pass_obj
 def review_build(obj: Obj) -> None:
     ws = Workspace(obj.root)
-    page = build_review_page(connect(ws.db_path), ws.review_dir, utc_now())
+    page = build_review_page(connect(ws.db_path), ws.review_dir, utc_now(), root=obj.root)
     click.echo(str(page))
 
 

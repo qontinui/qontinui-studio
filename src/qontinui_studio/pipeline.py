@@ -14,9 +14,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from PIL import Image
@@ -60,6 +61,10 @@ class BatchOutcome:
     unavailable_providers: dict[str, str] = field(default_factory=dict)
     publish: PublishResult | None = None
     error: str | None = None
+    # False when this call did not drive the batch (claimed elsewhere, or no
+    # longer generating); ``note`` says why.
+    driven: bool = True
+    note: str | None = None
 
 
 @dataclass
@@ -127,10 +132,36 @@ def _request_for(loaded: LoadedBrief) -> tuple[list[str], GenerationRequest]:
     )
 
 
-def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> None:
-    """Record a downloaded job's images in the library, cut every target's
-    variants, then mark the job ``ingested`` — all in one transaction, so a
-    crash leaves the job ``downloaded`` with no partial rows."""
+INGEST_LEASE_S = 600.0
+BATCH_LEASE_S = 6 * 3600.0
+
+
+def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
+    """Ingest one downloaded job: claim it (``downloaded`` -> ``ingesting``),
+    record its images in the library and cut every target's variants, then mark
+    it ``ingested`` — the rows and the final status in one transaction,
+    conditional on the claim. Returns False when another process holds or has
+    finished the job (nothing is written).
+
+    A local I/O error (``OSError``) releases the claim and is re-raised: it is
+    transient and the job is retried by the next run. Any other error is
+    permanent for this job: it is marked ``failed`` with the reason."""
+    token = uuid.uuid4().hex
+    now = ctx.clock()
+    claimed = ctx.conn.execute(
+        "UPDATE jobs SET status = 'ingesting', claim = ?, next_attempt_at = ?, updated_at = ? "
+        "WHERE id = ? AND status = 'downloaded' AND claim IS ?",
+        (
+            token,
+            (now + timedelta(seconds=INGEST_LEASE_S)).isoformat(),
+            now.isoformat(),
+            job["id"],
+            job["claim"],
+        ),
+    ).rowcount
+    ctx.conn.commit()
+    if claimed != 1:
+        return False
     library = Library(ctx.conn)
     # Exactly what was sent and the terms as reviewed at submission (D5), as
     # persisted on the job when it was claimed.
@@ -193,92 +224,178 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> None:
                         created_at=ctx.clock(),
                         commit=False,
                     )
+        done = ctx.conn.execute(
+            "UPDATE jobs SET status = 'ingested', claim = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'ingesting' AND claim = ?",
+            (ctx.clock().isoformat(), job["id"], token),
+        ).rowcount
+        if done != 1:
+            ctx.conn.rollback()
+            return False
+        ctx.conn.commit()
+        return True
+    except OSError:
+        ctx.conn.rollback()
         ctx.conn.execute(
-            "UPDATE jobs SET status = 'ingested', updated_at = ? WHERE id = ?",
-            (ctx.clock().isoformat(), job["id"]),
+            "UPDATE jobs SET status = 'downloaded', claim = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'ingesting' AND claim = ?",
+            (ctx.clock().isoformat(), job["id"], token),
         )
         ctx.conn.commit()
+        raise
+    except Exception as e:
+        ctx.conn.rollback()
+        ctx.conn.execute(
+            "UPDATE jobs SET status = 'failed', claim = NULL, last_error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'ingesting' AND claim = ?",
+            (
+                f"ingest failed: {type(e).__name__}: {e}",
+                ctx.clock().isoformat(),
+                job["id"],
+                token,
+            ),
+        )
+        ctx.conn.commit()
+        return False
     except BaseException:
         ctx.conn.rollback()
         raise
 
 
-def _fail_batch(ctx: Context, batch_id: str, reason: str) -> None:
-    ctx.conn.execute(
-        "UPDATE batches SET status = 'failed', reason = ? WHERE id = ?", (reason, batch_id)
-    )
-    ctx.conn.execute(
-        "UPDATE jobs SET status = 'failed', last_error = ? "
-        "WHERE batch_id = ? AND status IN ('queued', 'submitting', 'submitted', 'downloaded')",
-        (reason, batch_id),
-    )
-    ctx.conn.commit()
+class _Lease:
+    """The one process driving a batch. Every status write while driving is
+    conditional on holding it."""
+
+    def __init__(self, ctx: Context, batch_id: str) -> None:
+        self.ctx = ctx
+        self.batch_id = batch_id
+        self.token = uuid.uuid4().hex
+
+    def acquire(self) -> bool:
+        now = self.ctx.clock()
+        cur = self.ctx.conn.execute(
+            "UPDATE batches SET driver = ?, driver_until = ? "
+            "WHERE id = ? AND status = 'generating' AND (driver IS NULL OR driver_until < ?)",
+            (
+                self.token,
+                (now + timedelta(seconds=BATCH_LEASE_S)).isoformat(),
+                self.batch_id,
+                now.isoformat(),
+            ),
+        )
+        self.ctx.conn.commit()
+        return cur.rowcount == 1
+
+    def set_status(self, status: str, reason: str | None = None) -> bool:
+        """Set the batch status and release the lease, only if still held."""
+        cur = self.ctx.conn.execute(
+            "UPDATE batches SET status = ?, reason = ?, driver = NULL, driver_until = NULL "
+            "WHERE id = ? AND status = 'generating' AND driver = ?",
+            (status, reason, self.batch_id, self.token),
+        )
+        self.ctx.conn.commit()
+        return cur.rowcount == 1
+
+    def release(self) -> None:
+        self.ctx.conn.rollback()
+        self.ctx.conn.execute(
+            "UPDATE batches SET driver = NULL, driver_until = NULL WHERE id = ? AND driver = ?",
+            (self.batch_id, self.token),
+        )
+        self.ctx.conn.commit()
 
 
 def drive_batch(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutcome:
+    """Advance one ``generating`` batch: generate, ingest, then (gated) publish.
+
+    Only one process drives a batch at a time (a lease on the batch row). A
+    batch that is no longer ``generating``, or is being driven elsewhere, is
+    returned untouched with ``driven=False``."""
     row = ctx.conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
     if row is None:
         raise ConfigError(f"no batch '{batch_id}'")
+    lease = _Lease(ctx, batch_id)
+    if not lease.acquire():
+        current = ctx.conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        why = (
+            "being driven by another process"
+            if current["status"] == "generating"
+            else f"is '{current['status']}', not generating"
+        )
+        return BatchOutcome(
+            batch_id=batch_id, status=current["status"], driven=False, note=f"not driven: {why}"
+        )
+    try:
+        outcome = _drive_leased(ctx, row, lease)
+    finally:
+        lease.release()
+    if publish and outcome.status == "generated":
+        outcome.publish = publish_batch(
+            ctx.conn,
+            ctx.sites,
+            batch_id,
+            ctx.notifier,
+            ctx.clock,
+            ctx.probe,
+            ctx.fetch,
+            root=ctx.workspace.root,
+        )
+        outcome.status = "published" if outcome.publish.published else "refused"
+    return outcome
+
+
+def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome:
+    batch_id = row["id"]
     loaded = load_brief(Path(row["brief_path"]), root=ctx.workspace.root)
     if loaded.sha256 != row["brief_sha256"]:
         reason = (
             f"brief {row['brief_path']} changed since batch {batch_id} was created; "
             "run the brief again to start a new batch"
         )
-        _fail_batch(ctx, batch_id, reason)
+        if lease.set_status("failed", reason):
+            ctx.conn.execute(
+                "UPDATE jobs SET status = 'failed', claim = NULL, last_error = ? "
+                "WHERE batch_id = ? AND status IN ('queued', 'downloaded')",
+                (reason, batch_id),
+            )
+            ctx.conn.commit()
         raise ConfigError(reason)
     outcome = BatchOutcome(batch_id=batch_id, status=row["status"])
     outcome.unavailable_providers = dict(ctx.adapters.unavailable)
     ctx.scheduler().run({batch_id: _request_for(loaded)}, sleep=ctx.sleep)
+
+    # An ingest whose process died is reclaimable once its lease lapses.
+    now = ctx.clock()
+    ctx.conn.execute(
+        "UPDATE jobs SET status = 'downloaded', claim = NULL "
+        "WHERE batch_id = ? AND status = 'ingesting' AND next_attempt_at < ?",
+        (batch_id, now.isoformat()),
+    )
+    ctx.conn.commit()
     for job in ctx.conn.execute(
         "SELECT * FROM jobs WHERE batch_id = ? AND status = 'downloaded' ORDER BY id", (batch_id,)
     ).fetchall():
-        try:
-            ingest(ctx, loaded, job)
-        except OSError:
-            raise  # local I/O: transient; the job stays 'downloaded' for the next run
-        except Exception as e:
-            # Permanent (undecodable image, missing tool, removed site/slot):
-            # fail THIS job with the reason; the batch carries on without it.
-            ctx.conn.execute(
-                "UPDATE jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
-                (f"ingest failed: {type(e).__name__}: {e}", ctx.clock().isoformat(), job["id"]),
-            )
-            ctx.conn.commit()
+        ingest(ctx, loaded, job)
+
     jobs = ctx.conn.execute(
-        "SELECT id, status FROM jobs WHERE batch_id = ?", (batch_id,)
+        "SELECT id, status, last_error FROM jobs WHERE batch_id = ?", (batch_id,)
     ).fetchall()
     outcome.completed_jobs = [j["id"] for j in jobs if j["status"] == "ingested"]
     outcome.failed_jobs = [j["id"] for j in jobs if j["status"] == "failed"]
     outcome.deferred_jobs = [
-        j["id"] for j in jobs if j["status"] in ("queued", "submitting", "submitted", "downloaded")
+        j["id"]
+        for j in jobs
+        if j["status"] in ("queued", "submitting", "submitted", "downloaded", "ingesting")
     ]
     if outcome.deferred_jobs:
         outcome.status = "generating"
         return outcome
     if not outcome.completed_jobs:
-        reasons = "; ".join(
-            str(r["last_error"])
-            for r in ctx.conn.execute(
-                "SELECT last_error FROM jobs WHERE batch_id = ? AND last_error IS NOT NULL",
-                (batch_id,),
-            )
-        )
-        ctx.conn.execute(
-            "UPDATE batches SET status = 'failed', reason = ? WHERE id = ?",
-            (reasons or "every job failed", batch_id),
-        )
-        ctx.conn.commit()
+        reasons = "; ".join(str(j["last_error"]) for j in jobs if j["last_error"])
+        lease.set_status("failed", reasons or "every job failed")
         outcome.status = "failed"
         return outcome
-    ctx.conn.execute("UPDATE batches SET status = 'generated' WHERE id = ?", (batch_id,))
-    ctx.conn.commit()
-    outcome.status = "generated"
-    if publish:
-        outcome.publish = publish_batch(
-            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe, ctx.fetch
-        )
-        outcome.status = "published" if outcome.publish.published else "refused"
+    outcome.status = "generated" if lease.set_status("generated") else "generating"
     return outcome
 
 
@@ -292,14 +409,29 @@ def run_brief(ctx: Context, brief_path: Path, publish: bool = True) -> BatchOutc
 
 
 def resume_all(ctx: Context, publish: bool = True) -> list[BatchOutcome]:
-    """Resume every generating batch. One batch's error never stops the others."""
+    """Recover interrupted publications, then resume every generating batch.
+
+    Recovery runs per site; a site that cannot be recovered only holds back
+    the batches that target it. One bad batch never stops the others."""
+    report = recover(ctx.conn, ctx.sites, ctx.notifier, root=ctx.workspace.root)
     rows = ctx.conn.execute(
-        "SELECT id FROM batches WHERE status = 'generating' ORDER BY created_at"
+        "SELECT id, targets_json FROM batches WHERE status = 'generating' ORDER BY created_at"
     ).fetchall()
     outcomes: list[BatchOutcome] = []
-    # Finish or undo any publish a crash interrupted before resuming anything.
-    recover(ctx.conn, ctx.sites)
     for r in rows:
+        targets = {str(site) for site, _ in json.loads(r["targets_json"])}
+        blocked = sorted(targets & set(report.failed_sites))
+        if blocked:
+            outcomes.append(
+                BatchOutcome(
+                    batch_id=r["id"],
+                    status="generating",
+                    driven=False,
+                    error="held back: recovery failed for site(s) "
+                    + ", ".join(f"{s} ({report.failed_sites[s]})" for s in blocked),
+                )
+            )
+            continue
         try:
             outcomes.append(drive_batch(ctx, r["id"], publish=publish))
         except Exception as e:  # one bad batch never stops the others

@@ -23,9 +23,8 @@ from qontinui_studio.library import AssetRecord, VariantRecord
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site, Slot
 
-# ``not_configured`` is a FAILURE (D7: a gate that did not run did not pass);
-# ``waived`` passes but is printed in every operator notice.
-Outcome = Literal["pass", "fail", "not_configured", "waived"]
+# ``not_configured`` is a FAILURE (D7: a gate that did not run did not pass).
+Outcome = Literal["pass", "fail", "not_configured"]
 
 
 @dataclass(frozen=True)
@@ -164,22 +163,14 @@ def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) 
     """A UI Bridge page-health pass over the site's running preview.
 
     A site that declares no ``page_health_url`` is ``not_configured``, which
-    REFUSES publication, unless it is a demo site with ``page_health: waived`` —
-    then the outcome is ``waived`` and every operator notice prints it."""
+    REFUSES publication. There is no waiver (plan D7)."""
     subject = f"site {site.id}"
     if not site.page_health_url:
-        if site.page_health == "waived":
-            return GateResult(
-                "d7_page_health",
-                subject,
-                "waived",
-                f"page health WAIVED for demo site '{site.id}' (no running preview)",
-            )
         return GateResult(
             "d7_page_health",
             subject,
             "not_configured",
-            "site declares no page_health_url and does not waive page health — refused",
+            "site declares no page_health_url; D7 page health is required — refused",
         )
     try:
         body = probe(site.page_health_url)

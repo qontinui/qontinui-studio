@@ -25,7 +25,6 @@ SlotCategory = Literal[
 ExportFormat = Literal["webp", "avif", "png", "jpeg"]
 
 ID_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
-PageHealthPolicy = Literal["required", "waived"]
 
 DEFAULT_ILLUSTRATIVE_LABEL = "Illustrative image (AI-generated)"
 DEFAULT_AI_LABEL = "AI-generated image"
@@ -66,8 +65,8 @@ class Site(BaseModel):
     illustrative_label: str = DEFAULT_ILLUSTRATIVE_LABEL
     ai_label: str = DEFAULT_AI_LABEL
     # UI Bridge page-health endpoint for a running preview of this site, e.g.
-    # http://127.0.0.1:9876/ui-bridge/control/page-health. Unset with
-    # ``page_health: required`` -> the D7 gate REFUSES publication.
+    # http://127.0.0.1:9876/ui-bridge/control/page-health. D7 page health is a
+    # REQUIRED gate with no waiver: unset -> publication to this site is refused.
     page_health_url: str | None = None
     # D7 runs against a PREVIEW, before the live swap: the studio writes the
     # site's live files plus this batch's files and merged manifest into
@@ -77,9 +76,6 @@ class Site(BaseModel):
     # ``page_health_url``.
     preview_dir: Path | None = None
     preview_manifest_url: str | None = None
-    # ``waived`` is allowed only on a demo site (one with no running preview
-    # yet); the operator notice prints the waiver on every publication.
-    page_health: PageHealthPolicy = "required"
     slots: dict[str, Slot] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -104,19 +100,29 @@ class Site(BaseModel):
         for name in self.slots:
             if not re.fullmatch(ID_PATTERN, name):
                 raise ValueError(f"bad slot name '{name}' (must match {ID_PATTERN})")
-        if self.page_health == "waived" and self.kind != "demo":
-            raise ValueError("page_health: waived is allowed only on a demo site")
         if self.page_health_url and not (self.preview_dir and self.preview_manifest_url):
             raise ValueError(
                 "page_health_url needs preview_dir and preview_manifest_url (D7 checks a "
                 "preview of this batch before the live swap)"
             )
-        if (
-            self.preview_dir is not None
-            and self.preview_dir.resolve() == self.publish_dir.resolve()
-        ):
-            raise ValueError("preview_dir must differ from publish_dir")
+        if self.preview_dir is not None:
+            preview, live = self.preview_dir.resolve(), self.publish_dir.resolve()
+            if preview == live or preview.is_relative_to(live) or live.is_relative_to(preview):
+                raise ValueError(
+                    "preview_dir must be neither publish_dir nor inside it nor a parent of it"
+                )
         return self
+
+    def check_paths(self, studio_root: Path) -> None:
+        """The preview dir is rewritten on every publish, so it must sit OUTSIDE
+        the studio root and must not contain it."""
+        if self.preview_dir is None:
+            return
+        preview, root = self.preview_dir.resolve(), studio_root.resolve()
+        if preview == root or preview.is_relative_to(root) or root.is_relative_to(preview):
+            raise ValueError(
+                f"preview_dir {preview} must be outside the studio root {root} and not contain it"
+            )
 
     def label_for_ai(self) -> str:
         return self.illustrative_label if self.kind == "demo" else self.ai_label
@@ -139,12 +145,19 @@ def load_site(path: Path) -> Site:
         raise ConfigError(f"{path}: {e}") from e
 
 
-def load_sites(directory: Path) -> dict[str, Site]:
+def load_sites(directory: Path, root: Path | None = None) -> dict[str, Site]:
+    """Load every ``*.yaml`` site under ``directory``. ``root`` is the studio
+    root (default: ``directory.parent``, the standard ``<root>/sites`` layout)."""
+    root = root if root is not None else directory.parent
     sites: dict[str, Site] = {}
     if not directory.is_dir():
         return sites
     for path in sorted(directory.glob("*.yaml")):
         site = load_site(path)
+        try:
+            site.check_paths(root)
+        except ValueError as e:
+            raise ConfigError(f"{path}: {e}") from e
         if site.id in sites:
             raise ConfigError(f"duplicate site id '{site.id}' ({path})")
         sites[site.id] = site
