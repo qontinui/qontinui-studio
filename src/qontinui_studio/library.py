@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +12,43 @@ from PIL import Image
 
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.providers import Provider
+
+
+@dataclass(frozen=True)
+class TermsSnapshot:
+    """A provider's terms AS REVIEWED, captured when a job is claimed for
+    submission and persisted on the job (D5). Ingest records exactly this, so a
+    later edit to providers.yaml never rewrites the licence an asset was made
+    under."""
+
+    provider: str
+    provider_name: str
+    commercial_use: str
+    commercial_use_source: str | None
+    tos_reviewed: str | None
+    automation_allowed: str
+    watermark: str
+    watermark_visible: bool | None
+
+    @classmethod
+    def of(cls, provider: Provider) -> TermsSnapshot:
+        return cls(
+            provider=provider.id,
+            provider_name=provider.provider,
+            commercial_use=provider.commercial_use.value,
+            commercial_use_source=provider.commercial_use.source,
+            tos_reviewed=provider.tos_reviewed.isoformat() if provider.tos_reviewed else None,
+            automation_allowed=provider.automation_allowed.value,
+            watermark=provider.watermark,
+            watermark_visible=provider.watermark_visible,
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> TermsSnapshot:
+        return cls(**json.loads(text))
 
 
 @dataclass(frozen=True)
@@ -106,16 +144,14 @@ class Library:
         brief_id: str,
         batch_id: str,
         job_id: str,
-        provider: Provider,
+        terms: TermsSnapshot,
         model: str,
         prompt: str,
         created_at: datetime,
         raw_path: Path,
         commit: bool = True,
     ) -> AssetRecord:
-        """Record a generated asset, snapshotting the provider's terms AS REVIEWED
-        at generation time — a later edit to providers.yaml does not rewrite the
-        licence an asset was made under."""
+        """Record a generated asset with the terms snapshot taken at submission."""
         with Image.open(raw_path) as img:
             width, height = img.size
         self.conn.execute(
@@ -129,8 +165,8 @@ class Library:
                 brief_id,
                 batch_id,
                 job_id,
-                provider.id,
-                provider.provider,
+                terms.provider,
+                terms.provider_name,
                 model,
                 prompt,
                 created_at.isoformat(),
@@ -138,12 +174,12 @@ class Library:
                 sha256_file(raw_path),
                 width,
                 height,
-                provider.commercial_use.value,
-                provider.commercial_use.source,
-                provider.tos_reviewed.isoformat() if provider.tos_reviewed else None,
-                provider.automation_allowed.value,
-                provider.watermark,
-                None if provider.watermark_visible is None else int(provider.watermark_visible),
+                terms.commercial_use,
+                terms.commercial_use_source,
+                terms.tos_reviewed,
+                terms.automation_allowed,
+                terms.watermark,
+                None if terms.watermark_visible is None else int(terms.watermark_visible),
             ),
         )
         if commit:

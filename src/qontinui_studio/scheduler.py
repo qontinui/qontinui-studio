@@ -22,6 +22,7 @@ from pathlib import Path
 
 from qontinui_studio.adapters import AdapterSet, GenerationRequest, SubmittedJob
 from qontinui_studio.errors import PermanentProviderError, TransientProviderError
+from qontinui_studio.library import TermsSnapshot
 from qontinui_studio.providers import ProviderInventory
 
 Clock = Callable[[], datetime]
@@ -49,6 +50,9 @@ class RetryPolicy:
     # that provider and moves to the next preferred one.
     max_polls: int = 720
     poll_timeout_s: float = 3600.0
+    # A job claimed for submission ('submitting') whose process died before
+    # recording the outcome is reclaimed after this long.
+    submit_stale_s: float = 900.0
 
     def backoff(self, attempts: int, retry_after_s: float | None) -> float:
         delay: float = min(self.max_backoff_s, self.base_backoff_s * 2.0 ** max(0, attempts - 1))
@@ -155,8 +159,8 @@ class Scheduler:
         report = StepReport()
         now = self.clock()
         rows = self.conn.execute(
-            "SELECT * FROM jobs WHERE status IN ('queued', 'submitted') AND next_attempt_at <= ? "
-            "ORDER BY next_attempt_at, id",
+            "SELECT * FROM jobs WHERE status IN ('queued', 'submitting', 'submitted') "
+            "AND next_attempt_at <= ? ORDER BY next_attempt_at, id",
             (_iso(now),),
         ).fetchall()
         for row in rows:
@@ -164,6 +168,17 @@ class Scheduler:
             if batch_id not in requests:
                 continue
             preference, template = requests[batch_id]
+            if row["status"] == "submitting":
+                # Claimed by a process that never recorded the outcome (it died
+                # mid-request). The provider may have charged; the quota was
+                # already counted. Requeue on the same provider.
+                self.conn.execute(
+                    "UPDATE jobs SET status = 'queued', last_error = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'submitting'",
+                    ("reclaimed a stale submission (outcome unknown)", _iso(now), row["id"]),
+                )
+                self.conn.commit()
+                row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             if row["status"] == "queued":
                 self._submit(row, preference, template, now, report)
             else:
@@ -192,6 +207,7 @@ class Scheduler:
         if (
             provider_id is None
             or provider_id in tried
+            or provider_id not in self.adapters.adapters  # not built this run
             or self.quota_remaining(provider_id, now) <= 0
         ):
             provider_id = self._pick_provider(preference, tried, now)
@@ -224,8 +240,29 @@ class Scheduler:
             aspect_ratio=template.aspect_ratio,
             reference_images=template.reference_images,
         )
+        # Atomic claim: only one process may submit this job. The claim also
+        # records exactly what is being sent (prompt, model) and the terms as
+        # reviewed right now (D5); ingest reads these, never later config.
+        # Quota is spent in the same transaction, BEFORE the request leaves.
+        claimed = self.conn.execute(
+            "UPDATE jobs SET status = 'submitting', provider = ?, prompt = ?, model = ?, "
+            "terms_json = ?, next_attempt_at = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'queued'",
+            (
+                provider_id,
+                request.prompt,
+                adapter.model,
+                TermsSnapshot.of(self.inventory.get(provider_id)).to_json(),
+                _iso(now + timedelta(seconds=self.policy.submit_stale_s)),
+                _iso(now),
+                row["id"],
+            ),
+        ).rowcount
+        if claimed != 1:
+            self.conn.rollback()
+            return  # another process claimed it
         self._consume_quota(provider_id, now)
-        self.conn.commit()  # quota is spent BEFORE the request leaves
+        self.conn.commit()
         try:
             handle = adapter.submit(request, self.staging_dir / row["id"])
         except TransientProviderError as e:
@@ -236,6 +273,7 @@ class Scheduler:
                 delay = self.policy.backoff(attempts, e.retry_after_s)
                 self._update(
                     row["id"],
+                    status="queued",
                     provider=provider_id,
                     attempts=attempts,
                     next_attempt_at=_iso(now + timedelta(seconds=delay)),
@@ -279,15 +317,13 @@ class Scheduler:
 
     def _poll(self, row: sqlite3.Row, now: datetime, report: StepReport) -> None:
         provider_id = row["provider"]
+        tried: list[str] = json.loads(row["tried_providers"])
         adapter = self.adapters.adapters.get(provider_id)
         if adapter is None:
-            self._update(
-                row["id"], status="failed", last_error=f"{provider_id}: adapter unavailable"
-            )
-            report.failed.append(row["id"])
+            # Not built this run (key unset, D4 now off): move on rather than fail.
+            self._give_up_on_provider(row, provider_id, tried, "adapter unavailable this run", now)
             return
         handle = SubmittedJob(external_id=row["external_id"], data=json.loads(row["handle_json"]))
-        tried: list[str] = json.loads(row["tried_providers"])
         polls = int(row["polls"]) + 1
         submitted_at = _parse(row["submitted_at"]) if row["submitted_at"] else now
         overdue = (
@@ -337,6 +373,12 @@ class Scheduler:
         try:
             files = adapter.download(handle, self.raw_dir / row["batch_id"])
         except TransientProviderError as e:
+            # Download retries count against the same poll cap / deadline.
+            if overdue:
+                self._give_up_on_provider(
+                    row, provider_id, tried, f"download deadline passed: {e}", now
+                )
+                return
             self._update(
                 row["id"],
                 polls=polls,
@@ -354,7 +396,7 @@ class Scheduler:
             row["id"],
             status="downloaded",
             polls=polls,
-            files_json=json.dumps({"model": adapter.model, "files": [str(f) for f in files]}),
+            files_json=json.dumps([str(f) for f in files]),
             last_error=None,
         )
         report.completed.append(
@@ -372,7 +414,8 @@ class Scheduler:
 
     def pending_jobs(self, batch_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM jobs WHERE batch_id = ? AND status IN ('queued', 'submitted')",
+            "SELECT * FROM jobs WHERE batch_id = ? "
+            "AND status IN ('queued', 'submitting', 'submitted')",
             (batch_id,),
         ).fetchall()
 

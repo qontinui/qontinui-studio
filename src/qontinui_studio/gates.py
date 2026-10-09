@@ -10,6 +10,7 @@ D3 (the build-record export allowlist) is a gate on the FACTORY's export
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -143,6 +144,9 @@ def d6_not_the_real_thing(
 
 
 PageHealthProbe = Callable[[str], dict[str, object]]
+# Page-health summaries that publish. Anything else — CRITICAL, an unknown or
+# new value — refuses.
+ACCEPTED_SUMMARIES = ("OK", "WARNING")
 
 
 def http_page_health_probe(url: str) -> dict[str, object]:
@@ -179,15 +183,59 @@ def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) 
         )
     try:
         body = probe(site.page_health_url)
-    except (httpx.HTTPError, ValueError) as e:
-        # Unreachable is UNKNOWN, and UNKNOWN does not publish.
-        return GateResult("d7_page_health", subject, "fail", f"page-health probe failed: {e}")
+    except Exception as e:  # any probe failure is UNKNOWN; UNKNOWN does not publish
+        return GateResult(
+            "d7_page_health", subject, "fail", f"page-health probe failed: {type(e).__name__}: {e}"
+        )
+    if not isinstance(body, dict):
+        return GateResult("d7_page_health", subject, "fail", "page-health answered a non-object")
     data = body.get("data")
     summary = data.get("summary") if isinstance(data, dict) else None
     if body.get("success") is not True or not isinstance(summary, str):
         return GateResult(
             "d7_page_health", subject, "fail", f"unreadable page-health answer: {body}"
         )
-    if summary.upper() == "CRITICAL":
-        return GateResult("d7_page_health", subject, "fail", "page-health summary CRITICAL")
+    if summary.upper() not in ACCEPTED_SUMMARIES:
+        return GateResult(
+            "d7_page_health",
+            subject,
+            "fail",
+            f"page-health summary '{summary}' (only {'/'.join(ACCEPTED_SUMMARIES)} publish)",
+        )
     return GateResult("d7_page_health", subject, "pass", f"page-health summary {summary}")
+
+
+ManifestFetch = Callable[[str], bytes]
+
+
+def http_manifest_fetch(url: str) -> bytes:
+    resp = httpx.get(url, timeout=30.0)
+    resp.raise_for_status()
+    return resp.content
+
+
+def d7_preview_manifest(
+    site: Site, expected_sha256: str, fetch: ManifestFetch = http_manifest_fetch
+) -> GateResult:
+    """Confirm the preview the page-health probe will look at is actually
+    serving THIS batch: the manifest it serves must hash to the one just written."""
+    subject = f"site {site.id}"
+    if not site.preview_manifest_url:
+        return GateResult(
+            "d7_preview", subject, "not_configured", "site declares no preview_manifest_url"
+        )
+    try:
+        served = fetch(site.preview_manifest_url)
+    except Exception as e:  # an unreachable preview is a refusal
+        return GateResult(
+            "d7_preview", subject, "fail", f"preview manifest fetch failed: {type(e).__name__}: {e}"
+        )
+    digest = hashlib.sha256(served).hexdigest()
+    if digest != expected_sha256:
+        return GateResult(
+            "d7_preview",
+            subject,
+            "fail",
+            f"preview serves manifest {digest[:12]}, not this batch's {expected_sha256[:12]}",
+        )
+    return GateResult("d7_preview", subject, "pass", f"preview serves manifest {digest[:12]}")

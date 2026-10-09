@@ -53,6 +53,24 @@ class Brief(BaseModel):
     provider_preference: list[str] = Field(min_length=1)
     variants: int = Field(default=1, ge=1, le=8)
 
+    @field_validator("targets")
+    @classmethod
+    def _unique_targets(cls, v: list[Target]) -> list[Target]:
+        seen: set[tuple[str | None, str | None, str | None]] = set()
+        for t in v:
+            key = (t.site, t.slot, t.campaign)
+            if key in seen:
+                raise ValueError(f"duplicate target {t.model_dump(exclude_none=True)}")
+            seen.add(key)
+        return v
+
+    @field_validator("provider_preference")
+    @classmethod
+    def _unique_providers(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("provider_preference names a provider twice")
+        return v
+
     @field_validator("aspect_ratio")
     @classmethod
     def _ratio(cls, v: str) -> str:
@@ -115,9 +133,23 @@ def load_brief(path: Path, root: Path | None = None) -> LoadedBrief:
         brief = Brief.model_validate(raw)
     except ValueError as e:
         raise ConfigError(f"{path}: {e}") from e
-    return LoadedBrief(
-        brief=brief, path=path.resolve(), sha256=hashlib.sha256(text.encode()).hexdigest()
-    )
+    return LoadedBrief(brief=brief, path=path.resolve(), sha256=_digest(text, brief))
+
+
+def _digest(text: str, brief: Brief) -> str:
+    """The batch hash: the brief text AND every file it pulls into the prompt
+    (style guide, reference images), so editing any of them is a different
+    brief. A missing file hashes as absent (validation reports it)."""
+    h = hashlib.sha256()
+    h.update(b"brief\0" + text.encode())
+    files = ([brief.style_guide] if brief.style_guide else []) + list(brief.reference_images)
+    for f in files:
+        h.update(b"\0file\0" + str(f).encode() + b"\0")
+        try:
+            h.update(hashlib.sha256(f.read_bytes()).digest())
+        except OSError:
+            h.update(b"<absent>")
+    return h.hexdigest()
 
 
 def validate_brief(brief: Brief, sites: dict[str, Site], providers: ProviderInventory) -> list[str]:

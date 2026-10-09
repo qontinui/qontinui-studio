@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS batches (
     targets_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN
-        ('generating', 'generated', 'published', 'refused', 'unpublished', 'failed'))
+        ('generating', 'generated', 'publishing', 'published', 'refused', 'unpublished',
+         'failed')),
+    -- Why the batch is failed/refused, when it is.
+    reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -32,7 +35,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- library rows and every target's variants exist. A crash between the two
     -- leaves 'downloaded', which the next run re-ingests.
     status TEXT NOT NULL CHECK (status IN
-        ('queued', 'submitted', 'downloaded', 'ingested', 'failed')),
+        ('queued', 'submitting', 'submitted', 'downloaded', 'ingested', 'failed')),
+    -- Persisted when the job is CLAIMED for submission: the exact prompt sent,
+    -- the model, and the provider's terms as reviewed at that moment (D5).
+    -- Ingest reads these, never the current brief or providers.yaml.
+    prompt TEXT,
+    model TEXT,
+    terms_json TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     polls INTEGER NOT NULL DEFAULT 0,
     submitted_at TEXT,
@@ -120,7 +129,7 @@ CREATE TABLE IF NOT EXISTS publications (
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)

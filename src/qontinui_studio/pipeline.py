@@ -23,13 +23,18 @@ from PIL import Image
 
 from qontinui_studio.adapters import AdapterSet, GenerationRequest
 from qontinui_studio.briefs import LoadedBrief, load_brief, validate_brief
-from qontinui_studio.errors import ConfigError, StudioError
-from qontinui_studio.gates import PageHealthProbe, http_page_health_probe
-from qontinui_studio.library import Library
+from qontinui_studio.errors import ConfigError
+from qontinui_studio.gates import (
+    ManifestFetch,
+    PageHealthProbe,
+    http_manifest_fetch,
+    http_page_health_probe,
+)
+from qontinui_studio.library import Library, TermsSnapshot
 from qontinui_studio.notify import Notifier
 from qontinui_studio.postprocess import crop_to_slot, export, remove_background
 from qontinui_studio.providers import ProviderInventory
-from qontinui_studio.publish import PublishResult, publish_batch
+from qontinui_studio.publish import PublishResult, publish_batch, recover
 from qontinui_studio.scheduler import RetryPolicy, Scheduler, utc_now
 from qontinui_studio.sites import Site
 from qontinui_studio.workspace import Workspace
@@ -69,6 +74,7 @@ class Context:
     sleep: Callable[[float], None] = _sleep
     policy: RetryPolicy = field(default_factory=RetryPolicy)
     probe: PageHealthProbe = http_page_health_probe
+    fetch: ManifestFetch = http_manifest_fetch
 
     def scheduler(self) -> Scheduler:
         return Scheduler(
@@ -126,10 +132,12 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> None:
     variants, then mark the job ``ingested`` — all in one transaction, so a
     crash leaves the job ``downloaded`` with no partial rows."""
     library = Library(ctx.conn)
-    provider = ctx.inventory.get(job["provider"])
-    payload = json.loads(job["files_json"])
-    model = str(payload["model"])
-    files = [Path(p) for p in payload["files"]]
+    # Exactly what was sent and the terms as reviewed at submission (D5), as
+    # persisted on the job when it was claimed.
+    terms = TermsSnapshot.from_json(job["terms_json"])
+    model = str(job["model"])
+    prompt = str(job["prompt"])
+    files = [Path(p) for p in json.loads(job["files_json"])]
     brief = loaded.brief
     out_dir = ctx.workspace.variants_dir / job["batch_id"]
     try:
@@ -141,9 +149,9 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> None:
                 brief_id=brief.id,
                 batch_id=job["batch_id"],
                 job_id=job["id"],
-                provider=provider,
+                terms=terms,
                 model=model,
-                prompt=brief.full_prompt(),
+                prompt=prompt,
                 created_at=ctx.clock(),
                 raw_path=raw,
                 commit=False,
@@ -196,10 +204,12 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> None:
 
 
 def _fail_batch(ctx: Context, batch_id: str, reason: str) -> None:
-    ctx.conn.execute("UPDATE batches SET status = 'failed' WHERE id = ?", (batch_id,))
+    ctx.conn.execute(
+        "UPDATE batches SET status = 'failed', reason = ? WHERE id = ?", (reason, batch_id)
+    )
     ctx.conn.execute(
         "UPDATE jobs SET status = 'failed', last_error = ? "
-        "WHERE batch_id = ? AND status IN ('queued', 'submitted', 'downloaded')",
+        "WHERE batch_id = ? AND status IN ('queued', 'submitting', 'submitted', 'downloaded')",
         (reason, batch_id),
     )
     ctx.conn.commit()
@@ -223,18 +233,41 @@ def drive_batch(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutco
     for job in ctx.conn.execute(
         "SELECT * FROM jobs WHERE batch_id = ? AND status = 'downloaded' ORDER BY id", (batch_id,)
     ).fetchall():
-        ingest(ctx, loaded, job)
+        try:
+            ingest(ctx, loaded, job)
+        except OSError:
+            raise  # local I/O: transient; the job stays 'downloaded' for the next run
+        except Exception as e:
+            # Permanent (undecodable image, missing tool, removed site/slot):
+            # fail THIS job with the reason; the batch carries on without it.
+            ctx.conn.execute(
+                "UPDATE jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
+                (f"ingest failed: {type(e).__name__}: {e}", ctx.clock().isoformat(), job["id"]),
+            )
+            ctx.conn.commit()
     jobs = ctx.conn.execute(
         "SELECT id, status FROM jobs WHERE batch_id = ?", (batch_id,)
     ).fetchall()
     outcome.completed_jobs = [j["id"] for j in jobs if j["status"] == "ingested"]
     outcome.failed_jobs = [j["id"] for j in jobs if j["status"] == "failed"]
-    outcome.deferred_jobs = [j["id"] for j in jobs if j["status"] in ("queued", "submitted")]
+    outcome.deferred_jobs = [
+        j["id"] for j in jobs if j["status"] in ("queued", "submitting", "submitted", "downloaded")
+    ]
     if outcome.deferred_jobs:
         outcome.status = "generating"
         return outcome
     if not outcome.completed_jobs:
-        ctx.conn.execute("UPDATE batches SET status = 'failed' WHERE id = ?", (batch_id,))
+        reasons = "; ".join(
+            str(r["last_error"])
+            for r in ctx.conn.execute(
+                "SELECT last_error FROM jobs WHERE batch_id = ? AND last_error IS NOT NULL",
+                (batch_id,),
+            )
+        )
+        ctx.conn.execute(
+            "UPDATE batches SET status = 'failed', reason = ? WHERE id = ?",
+            (reasons or "every job failed", batch_id),
+        )
         ctx.conn.commit()
         outcome.status = "failed"
         return outcome
@@ -243,7 +276,7 @@ def drive_batch(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutco
     outcome.status = "generated"
     if publish:
         outcome.publish = publish_batch(
-            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe
+            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe, ctx.fetch
         )
         outcome.status = "published" if outcome.publish.published else "refused"
     return outcome
@@ -264,12 +297,17 @@ def resume_all(ctx: Context, publish: bool = True) -> list[BatchOutcome]:
         "SELECT id FROM batches WHERE status = 'generating' ORDER BY created_at"
     ).fetchall()
     outcomes: list[BatchOutcome] = []
+    # Finish or undo any publish a crash interrupted before resuming anything.
+    recover(ctx.conn, ctx.sites)
     for r in rows:
         try:
             outcomes.append(drive_batch(ctx, r["id"], publish=publish))
-        except StudioError as e:
+        except Exception as e:  # one bad batch never stops the others
+            ctx.conn.rollback()
             status = ctx.conn.execute(
                 "SELECT status FROM batches WHERE id = ?", (r["id"],)
             ).fetchone()["status"]
-            outcomes.append(BatchOutcome(batch_id=r["id"], status=status, error=str(e)))
+            outcomes.append(
+                BatchOutcome(batch_id=r["id"], status=status, error=f"{type(e).__name__}: {e}")
+            )
     return outcomes

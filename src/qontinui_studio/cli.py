@@ -150,7 +150,9 @@ def publish_cmd(obj: Obj, batch_id: str) -> None:
     """Run the D5/D6/D7 gates over a generated batch and publish it if they pass."""
     ctx = _context(obj.root)
     try:
-        result = publish_batch(ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe)
+        result = publish_batch(
+            ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock, ctx.probe, ctx.fetch
+        )
     except ConfigError as e:
         raise click.ClickException(str(e)) from e
     except PublicationRefused as e:
@@ -173,6 +175,9 @@ def unpublish_cmd(obj: Obj, batch_id: str) -> None:
         removed = unpublish_batch(ctx.conn, ctx.sites, batch_id, ctx.notifier, ctx.clock)
     except KeyError as e:
         raise click.ClickException(str(e)) from e
+    except PublicationRefused as e:
+        click.echo(f"refused: {e}", err=True)
+        sys.exit(2)
     click.echo(f"unpublished {batch_id}: removed {len(removed)} file(s)")
 
 

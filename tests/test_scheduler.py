@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -205,3 +206,158 @@ def test_changed_brief_refuses_its_batch_and_resume_isolates_it(
     outcomes = {o.batch_id: o for o in resume_all(ctx, publish=False)}
     assert outcomes[b1].error and "changed since batch" in outcomes[b1].error
     assert outcomes[b2].status == "generated"
+
+
+def test_resume_all_survives_any_exception_in_one_batch(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_context()
+    b1 = new_batch(ctx, load_brief(write_brief(name="a.yaml")))
+    b2 = new_batch(ctx, load_brief(write_brief(name="b.yaml")))
+    real = pipeline.drive_batch
+
+    def poisoned(c: Context, batch_id: str, publish: bool = True) -> pipeline.BatchOutcome:
+        if batch_id == b1:
+            raise RuntimeError("not a StudioError")
+        return real(c, batch_id, publish=publish)
+
+    monkeypatch.setattr(pipeline, "drive_batch", poisoned)
+    outcomes = {o.batch_id: o for o in resume_all(ctx, publish=False)}
+    assert outcomes[b1].error and "RuntimeError" in outcomes[b1].error
+    assert outcomes[b2].status == "generated"
+
+
+def test_permanent_ingest_failure_fails_the_job_with_a_reason(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*args: object, **kwargs: object) -> object:
+        raise ValueError("cannot crop")
+
+    monkeypatch.setattr(pipeline, "crop_to_slot", broken)
+    ctx = make_context()
+    out = drive_batch(ctx, new_batch(ctx, load_brief(write_brief())), publish=False)
+    assert out.status == "failed"
+    job = ctx.conn.execute("SELECT * FROM jobs").fetchone()
+    assert job["status"] == "failed" and "cannot crop" in job["last_error"]
+    reason = ctx.conn.execute("SELECT reason FROM batches").fetchone()["reason"]
+    assert "cannot crop" in reason
+
+
+def test_job_whose_provider_adapter_is_not_built_is_repicked(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path]
+) -> None:
+    ctx = make_context()
+    batch = new_batch(ctx, load_brief(write_brief(providers="fake, fake2")))
+    # A previous run had chosen 'fake' and backed off; this run has no 'fake'.
+    ctx.conn.execute("UPDATE jobs SET provider = 'fake', attempts = 1")
+    ctx.conn.commit()
+    ctx.adapters = AdapterSet(adapters={"fake2": FakeImageAdapter("fake2", "fake-v2")})
+    out = drive_batch(ctx, batch, publish=False)
+    assert out.status == "generated"
+    assert ctx.conn.execute("SELECT provider FROM jobs").fetchone()[0] == "fake2"
+
+
+class DownloadAlwaysFlaky(FakeImageAdapter):
+    def download(self, job, dest_dir):  # type: ignore[no-untyped-def]
+        from qontinui_studio.errors import TransientProviderError
+
+        raise TransientProviderError("CDN hiccup")
+
+
+def test_transient_download_errors_respect_the_poll_cap(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path]
+) -> None:
+    ctx = make_context(
+        adapters=AdapterSet(
+            adapters={
+                "fake": DownloadAlwaysFlaky("fake"),
+                "fake2": FakeImageAdapter("fake2", "fake-v2"),
+            }
+        ),
+        policy=RetryPolicy(max_polls=3, poll_interval_s=5),
+    )
+    out = drive_batch(
+        ctx, new_batch(ctx, load_brief(write_brief(providers="fake, fake2"))), publish=False
+    )
+    assert out.status == "generated"
+    row = ctx.conn.execute("SELECT * FROM jobs").fetchone()
+    assert row["provider"] == "fake2"
+    assert json.loads(row["tried_providers"]) == ["fake"]
+
+
+def test_prompt_model_and_terms_are_persisted_at_claim_and_used_by_ingest(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
+) -> None:
+    ctx = make_context()
+    batch = new_batch(ctx, load_brief(write_brief()))
+    ctx.scheduler().run({batch: pipeline._request_for(load_brief(write_brief()))}, sleep=ctx.sleep)
+    job = ctx.conn.execute("SELECT * FROM jobs").fetchone()
+    assert job["status"] == "downloaded"
+    assert "An empty cafe interior" in job["prompt"] and job["model"] == "fake-v1"
+    terms = json.loads(job["terms_json"])
+    assert terms["commercial_use"] == "yes" and terms["tos_reviewed"] == "2026-10-09"
+    # Edit providers.yaml AFTER submission: the asset keeps the terms it was made under.
+    p = studio_root / "providers.yaml"
+    p.write_text(p.read_text().replace("#commercial", "#changed-later", 1))
+    ctx2 = make_context()
+    drive_batch(ctx2, batch, publish=False)
+    asset = ctx2.conn.execute("SELECT * FROM assets").fetchone()
+    assert asset["licence_source"] == "https://example.test/tos#commercial"
+    assert asset["prompt"] == job["prompt"]
+
+
+def test_editing_the_style_guide_changes_the_batch_hash(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path], studio_root: Path
+) -> None:
+    _set_quota(studio_root, "fake", 1)
+    ctx = make_context()
+    batch = new_batch(ctx, load_brief(write_brief(variants=2)))
+    drive_batch(ctx, batch, publish=False)  # one variant deferred
+    (studio_root / "briefs" / "style.md").write_text("Cold and maximal.")
+    with pytest.raises(ConfigError, match="changed since batch"):
+        drive_batch(ctx, batch, publish=False)
+
+
+def test_a_claimed_job_is_not_resubmitted_until_its_claim_is_stale(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path], clock: FakeClock
+) -> None:
+    ctx = make_context(policy=RetryPolicy(submit_stale_s=600))
+    batch = new_batch(ctx, load_brief(write_brief()))
+    later = (clock.now + timedelta(seconds=600)).isoformat()
+    # Another process claimed it and died mid-request.
+    ctx.conn.execute(
+        "UPDATE jobs SET status = 'submitting', provider = 'fake', next_attempt_at = ?", (later,)
+    )
+    ctx.conn.commit()
+    sched = ctx.scheduler()
+    req = {batch: pipeline._request_for(load_brief(write_brief()))}
+    sched.step(req)
+    assert ctx.conn.execute("SELECT status FROM jobs").fetchone()[0] == "submitting"
+    clock.sleep(601)
+    out = drive_batch(ctx, batch, publish=False)
+    assert out.status == "generated"
+    assert "reclaimed a stale submission" not in (
+        ctx.conn.execute("SELECT last_error FROM jobs").fetchone()[0] or ""
+    )
+
+
+def test_claim_is_atomic(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path]
+) -> None:
+    ctx = make_context()
+    batch = new_batch(ctx, load_brief(write_brief()))
+    # Simulate another process winning the claim between our read and our UPDATE.
+    row = ctx.conn.execute("SELECT * FROM jobs").fetchone()
+    ctx.conn.execute("UPDATE jobs SET status = 'submitting'")
+    ctx.conn.commit()
+    sched = ctx.scheduler()
+    preference, template = pipeline._request_for(load_brief(write_brief()))
+    from qontinui_studio.scheduler import StepReport
+
+    sched._submit(row, preference, template, ctx.clock(), StepReport())
+    assert ctx.conn.execute("SELECT COUNT(*) FROM quota_usage").fetchone()[0] == 0
+    assert batch

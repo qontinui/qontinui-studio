@@ -113,8 +113,49 @@ class Provider(BaseModel):
     # spending money is an operator decision, not a scheduler default.
     daily_quota: int | None = Field(default=None, ge=0)
     tos_reviewed: date | None = None
+    # The provider's own web domains: ``host`` (matches the host and its
+    # subdomains) or ``host/path-prefix`` for a first-party page on shared
+    # hosting (e.g. ``intercom.help/leonardo-ai``). Every verdict source and
+    # every entry of ``sources`` must sit under one of them — the primary
+    # first-party check; the mirror denylist is a second line.
+    domains: list[str] = Field(min_length=1)
     sources: list[str] = Field(default_factory=list)
     notes: str | None = None
+
+    @field_validator("domains")
+    @classmethod
+    def _domain_shape(cls, v: list[str]) -> list[str]:
+        for d in v:
+            if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}(/[A-Za-z0-9._~/-]+)?", d):
+                raise ValueError(f"bad provider domain '{d}' (host or host/path-prefix)")
+        return v
+
+    def owns(self, url: str) -> bool:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or "/"
+        for d in self.domains:
+            dhost, _, prefix = d.partition("/")
+            if host != dhost and not host.endswith("." + dhost):
+                continue
+            if not prefix or path == "/" + prefix or path.startswith("/" + prefix + "/"):
+                return True
+        return False
+
+    @model_validator(mode="after")
+    def _sources_are_the_providers_own(self) -> Provider:
+        urls = [
+            v.source
+            for v in (self.api_available, self.automation_allowed, self.commercial_use)
+            if v.source
+        ] + list(self.sources)
+        for url in urls:
+            if not self.owns(url):
+                raise ValueError(
+                    f"provider '{self.id}': source {url} is not on a declared provider domain "
+                    f"{self.domains}"
+                )
+        return self
 
     @field_validator("sources")
     @classmethod
@@ -158,12 +199,23 @@ class ProviderInventory(BaseModel):
         # One account per provider, checked three ways: the row id, the
         # provider's (normalised) name, and the API key env var — two rows that
         # differ only in id or spelling would still be two accounts.
-        seen: dict[str, dict[str, str]] = {"id": {}, "provider": {}, "api_key_env": {}}
+        # Also: at most one row per API adapter kind, and no web domain shared
+        # between rows (one provider, one row).
+        seen: dict[str, dict[str, str]] = {
+            "id": {},
+            "provider": {},
+            "api_key_env": {},
+            "adapter": {},
+            "domain": {},
+        }
         for p in self.providers:
-            keys = {"id": p.id, "provider": _normalise(p.provider)}
+            keys: list[tuple[str, str]] = [("id", p.id), ("provider", _normalise(p.provider))]
             if p.api_key_env:
-                keys["api_key_env"] = p.api_key_env
-            for kind, key in keys.items():
+                keys.append(("api_key_env", p.api_key_env))
+            if p.adapter in ("gemini_api", "openai_images"):
+                keys.append(("adapter", p.adapter))
+            keys += [("domain", d.partition("/")[0] + "/" + d.partition("/")[2]) for d in p.domains]
+            for kind, key in keys:
                 if key in seen[kind]:
                     raise ValueError(
                         f"providers '{seen[kind][key]}' and '{p.id}' share {kind} '{key}' — D4 "

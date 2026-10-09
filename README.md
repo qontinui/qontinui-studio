@@ -38,13 +38,32 @@ site that sets `page_health: waived` (allowed on demo sites only, e.g. a templat
 with no running preview yet). Every operator notice for such a site prints the
 waiver.
 
-Publication is transactional. New files are staged under hidden names, the
-slot's current files are moved aside, and the new ones are renamed into place.
-Manifests are written via a temp file and `os.replace`. The page-health probe
-then checks the new content. If it fails, or any step raises, the previous files,
-manifest and publication rows are put back. Unpublishing the newest batch on a
-slot restores the publication it replaced. A batch publishes only when every
-`{site, slot}` its brief targets has a variant.
+Publication is safe against failures, crashes and concurrent runs:
+
+- **Exclusive.** Every publish and unpublish holds an OS file lock
+  (`<publish_dir>/.studio.lock`) on each affected site, from the first check
+  to the last write.
+- **D7 runs on a preview, before anything goes live.** A site with
+  `page_health_url` must also declare `preview_dir` and `preview_manifest_url`.
+  The studio writes the live files, plus this batch's files and merged manifest,
+  into `preview_dir`. It then confirms the preview serves exactly that manifest
+  (by sha256) and runs UI Bridge page health on it. Only `OK` or `WARNING`
+  publishes. Any other summary, and any probe error, refuses, and live content
+  is never touched.
+- **Journalled swap.** Before any live file moves, a journal at
+  `<publish_dir>/.studio-journal-<batch>.json` records every staged, placed and
+  backup path, plus the manifest before and after. A single `BEGIN IMMEDIATE`
+  transaction that marks the batch `published` is the commit point. Any
+  publish, unpublish or `jobs run` replays a leftover journal: forward if the
+  database committed, backward otherwise. Undo removes only a live file that
+  still holds the bytes this publish placed. While a publish is in flight the
+  batch is `publishing`; recovery turns an orphaned `publishing` into `refused`.
+- **Complete or nothing.** A batch publishes only when every `{site, slot}` its
+  brief targets has a variant.
+- **Unpublish** works only on a live batch. It restores the publication the
+  batch superseded, after checking the stored variant's sha256. It never
+  overwrites a live file holding bytes the studio did not place; such a slot is
+  reported as not restored.
 
 ## Provider inventory: the honest D4 outcome
 
@@ -104,13 +123,21 @@ To let the scheduler use a provider, set `daily_quota` on its row. This is the
 per-UTC-day cap. The scheduler works through a brief's `provider_preference` in
 order and skips providers whose quota is spent. When every preferred provider is
 spent, it defers the job to the next UTC midnight. Transient failures (429, 5xx,
-transport) are retried with exponential backoff. After repeated failures, or a
+transport) are retried with exponential backoff. A job is claimed atomically
+(`submitting`) before its request leaves. That claim records the exact prompt,
+the model and the provider's terms as reviewed, and ingest uses those values
+rather than the current config. A claim whose process died is reclaimed after
+`submit_stale_s`. A batch's hash covers the brief, its style guide and its
+reference images, so editing any of them refuses to resume that batch. After repeated failures, or a
 permanent failure, the job moves to the next preferred provider. All of this
 state is kept in `.studio/studio.db`.
 
 ### Layout
 
-- `providers.yaml`: the terms inventory (Phase 0).
+- `providers.yaml`: the terms inventory (Phase 0). Each row declares the
+  provider's own `domains`, and every source URL must sit under one of them.
+  There is at most one row per API adapter kind, and no domain, name or key
+  env var may be shared between rows.
 - `sites/*.yaml`: publication targets. Each declares its kind (`demo` /
   `real_business` / `product`), whether it is `commercial`, `publish_dir`,
   `page_health_url`, and per-slot size, category, formats, focal point and

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,7 +8,13 @@ import httpx
 import pytest
 from PIL import Image
 
-from qontinui_studio.gates import d5_licence, d5_provenance, d6_not_the_real_thing, d7_page_health
+from qontinui_studio.gates import (
+    d5_licence,
+    d5_provenance,
+    d6_not_the_real_thing,
+    d7_page_health,
+    d7_preview_manifest,
+)
 from qontinui_studio.library import AssetRecord, VariantRecord
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site, Slot
@@ -125,9 +132,29 @@ def test_d6_rules(records: tuple[AssetRecord, VariantRecord]) -> None:
 def test_page_health_gate() -> None:
     assert d7_page_health(_site()).outcome == "not_configured"
     assert d7_page_health(_site()).failed
-    site = _site(page_health_url="http://127.0.0.1:9876/ui-bridge/control/page-health")
-    ok = d7_page_health(site, lambda u: {"success": True, "data": {"summary": "HEALTHY"}})
-    assert ok.outcome == "pass"
+    site = _site(
+        page_health_url="http://127.0.0.1:9876/ui-bridge/control/page-health",
+        preview_dir="/tmp/preview",
+        preview_manifest_url="http://127.0.0.1:3000/studio-manifest.json",
+    )
+    for summary in ("OK", "WARNING", "ok"):
+        ok = d7_page_health(site, lambda u, s=summary: {"success": True, "data": {"summary": s}})
+        assert ok.outcome == "pass"
+    for summary in ("HEALTHY", "CRITICAL", "UNKNOWN", ""):
+        bad = d7_page_health(site, lambda u, s=summary: {"success": True, "data": {"summary": s}})
+        assert bad.failed
+
+    def invalid_url(url: str) -> dict[str, object]:
+        raise httpx.InvalidURL("not an http error")
+
+    assert "InvalidURL" in d7_page_health(site, invalid_url).detail
+
+    good = b'{"slots": {}}'
+    sha = hashlib.sha256(good).hexdigest()
+    assert d7_preview_manifest(site, sha, lambda u: good).outcome == "pass"
+    stale = d7_preview_manifest(site, sha, lambda u: b"{}")
+    assert stale.failed and "not this batch" in stale.detail
+    assert d7_preview_manifest(site, sha, invalid_url).failed
     crit = d7_page_health(site, lambda u: {"success": True, "data": {"summary": "CRITICAL"}})
     assert crit.failed
     assert d7_page_health(site, lambda u: {"success": False}).failed

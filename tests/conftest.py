@@ -32,17 +32,19 @@ providers:
     model: fake-v1
     daily_quota: 10
     tos_reviewed: 2026-10-09
+    domains: [example.test]
   - id: fake2
     provider: Second fake generator
     plan: test
-    api_available: {value: "yes", source: "https://example.test/api"}
-    automation_allowed: {value: "yes", source: "https://example.test/tos"}
-    commercial_use: {value: "no", source: "https://example.test/tos#noncommercial"}
+    api_available: {value: "yes", source: "https://example2.test/api"}
+    automation_allowed: {value: "yes", source: "https://example2.test/tos"}
+    commercial_use: {value: "no", source: "https://example2.test/tos#noncommercial"}
     watermark: none
     adapter: fake
     model: fake-v2
     daily_quota: 10
     tos_reviewed: 2026-10-09
+    domains: [example2.test]
 """
 
 CAFE = """
@@ -101,6 +103,12 @@ def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:
     matches = sorted(notices_dir.glob(f"{batch_id}-{outcome}-*.md"))
     assert matches, f"no {outcome} notice for {batch_id} in {notices_dir}"
     return matches[-1].read_text()
+
+
+def debris(publish_dir: Path) -> list[Path]:
+    """Hidden staging/backup/journal/tmp files left in a publish dir (the
+    persistent lock file is expected and excluded)."""
+    return [p for p in publish_dir.iterdir() if p.name.startswith(".") and p.name != ".studio.lock"]
 
 
 class FakeClock:

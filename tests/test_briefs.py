@@ -142,3 +142,24 @@ def test_real_business_sites_must_state_slot_categories(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="bad slot name"):
         load_sites(tmp_path)
+
+
+def test_duplicate_targets_and_providers_are_rejected() -> None:
+    base = {
+        "id": "x",
+        "purpose": "p",
+        "aspect_ratio": "1:1",
+        "prompt": "p",
+    }
+    with pytest.raises(ValueError, match="duplicate target"):
+        Brief.model_validate(
+            {
+                **base,
+                "targets": [{"site": "a", "slot": "b"}, {"site": "a", "slot": "b"}],
+                "provider_preference": ["fake"],
+            }
+        )
+    with pytest.raises(ValueError, match="names a provider twice"):
+        Brief.model_validate(
+            {**base, "targets": [{"campaign": "c"}], "provider_preference": ["fake", "fake"]}
+        )

@@ -69,6 +69,14 @@ class Site(BaseModel):
     # http://127.0.0.1:9876/ui-bridge/control/page-health. Unset with
     # ``page_health: required`` -> the D7 gate REFUSES publication.
     page_health_url: str | None = None
+    # D7 runs against a PREVIEW, before the live swap: the studio writes the
+    # site's live files plus this batch's files and merged manifest into
+    # ``preview_dir`` (served by the preview whose page ``page_health_url``
+    # checks), then fetches ``preview_manifest_url`` to confirm the preview
+    # actually serves this batch's manifest (by sha256). Required with
+    # ``page_health_url``.
+    preview_dir: Path | None = None
+    preview_manifest_url: str | None = None
     # ``waived`` is allowed only on a demo site (one with no running preview
     # yet); the operator notice prints the waiver on every publication.
     page_health: PageHealthPolicy = "required"
@@ -98,6 +106,16 @@ class Site(BaseModel):
                 raise ValueError(f"bad slot name '{name}' (must match {ID_PATTERN})")
         if self.page_health == "waived" and self.kind != "demo":
             raise ValueError("page_health: waived is allowed only on a demo site")
+        if self.page_health_url and not (self.preview_dir and self.preview_manifest_url):
+            raise ValueError(
+                "page_health_url needs preview_dir and preview_manifest_url (D7 checks a "
+                "preview of this batch before the live swap)"
+            )
+        if (
+            self.preview_dir is not None
+            and self.preview_dir.resolve() == self.publish_dir.resolve()
+        ):
+            raise ValueError("preview_dir must differ from publish_dir")
         return self
 
     def label_for_ai(self) -> str:
@@ -111,9 +129,10 @@ def load_site(path: Path) -> Site:
         raise ConfigError(f"cannot read {path}: {e}") from e
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: expected a mapping")
-    publish_dir = raw.get("publish_dir")
-    if isinstance(publish_dir, str) and not Path(publish_dir).is_absolute():
-        raw["publish_dir"] = str((path.parent / publish_dir).resolve())
+    for key in ("publish_dir", "preview_dir"):
+        value = raw.get(key)
+        if isinstance(value, str) and not Path(value).is_absolute():
+            raw[key] = str((path.parent / value).resolve())
     try:
         return Site.model_validate(raw)
     except ValueError as e:

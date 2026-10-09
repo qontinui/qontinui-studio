@@ -7,6 +7,8 @@
 #   a Qontinui GUI-automation adapter would be permitted).
 # - Every `yes`/`no` cites the URL it was read from. Anything not confirmed from a
 #   first-party page is `unknown`, and `unknown` keeps the adapter OFF (D4).
+# - `domains` are the provider's own web domains; every source URL must sit under
+#   one of them (a third-party copy of a terms page is not a source).
 # - `daily_quota` is the per-UTC-day cap the scheduler uses. It is set only where a
 #   FREE quota usable by the studio was confirmed. Unset means the scheduler assigns
 #   this provider nothing; setting it on a billed API is a spending decision for the
@@ -48,6 +50,7 @@ providers:
     api_key_env: GEMINI_API_KEY
     daily_quota: null
     tos_reviewed: 2026-10-09
+    domains: [google.dev, google.com]
     sources:
       - https://ai.google.dev/gemini-api/docs/pricing
       - https://ai.google.dev/gemini-api/terms
@@ -86,6 +89,7 @@ providers:
     api_key_env: OPENAI_API_KEY
     daily_quota: null
     tos_reviewed: 2026-10-09
+    domains: [openai.com]
     sources:
       - https://openai.com/policies/terms-of-use/
       - https://help.openai.com/en/articles/8912793-c2pa-in-chatgpt-images
@@ -116,6 +120,7 @@ providers:
     media: [image]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [bing.com, microsoft.com]
     sources:
       - https://www.bing.com/new/termsofuseimagecreator
       - https://www.microsoft.com/en-us/servicesagreement
@@ -139,6 +144,7 @@ providers:
     media: [image]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [leonardo.ai, intercom.help/leonardo-ai]
     sources:
       - https://intercom.help/leonardo-ai/en/articles/8044018-commercial-usage
       - https://leonardo.ai/terms-of-service/
@@ -164,6 +170,7 @@ providers:
     media: [image]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [ideogram.ai]
     sources:
       - https://ideogram.ai/legal/usage-policy
       - https://ideogram.ai/legal/tos
@@ -191,6 +198,7 @@ providers:
     media: [image, video]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [adobe.com]
     sources:
       - https://www.adobe.com/products/firefly/plans.html
       - https://www.adobe.com/legal/terms.html
@@ -216,6 +224,7 @@ providers:
     media: [video, image]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [runway.com, runwayml.com]
     sources:
       - https://runway.com/terms-of-use
       - https://runway.com/pricing
@@ -245,6 +254,7 @@ providers:
     adapter: none
     daily_quota: 0
     tos_reviewed: 2026-10-09
+    domains: [pika.art]
     sources:
       - https://pika.art/terms-of-service
       - https://pika.art/pricing
@@ -269,6 +279,7 @@ providers:
     media: [video, image]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [lumalabs.ai]
     sources:
       - https://lumalabs.ai/legal/tos
       - https://lumalabs.ai/pricing
@@ -294,6 +305,7 @@ providers:
     media: [video, image]
     adapter: none
     tos_reviewed: 2026-10-09
+    domains: [kling.ai]
     sources:
       - https://kling.ai/docs/user-policy
       - https://kling.ai/document-api/protocols/paidServiceProtocol

@@ -145,3 +145,28 @@ def test_cli_brief_run_backs_off_through_transient_failures(
 def test_cli_publish_unknown_batch_is_a_clean_error(studio_root: Path) -> None:
     r = CliRunner().invoke(main, ["--root", str(studio_root), "publish", "--batch", "nope"])
     assert r.exit_code == 1 and "no batch 'nope'" in r.output
+
+
+def test_cli_jobs_run_resumes_a_quota_deferred_batch(
+    studio_root: Path, write_brief: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = studio_root / "providers.yaml"
+    p.write_text(p.read_text().replace("daily_quota: 10", "daily_quota: 1", 1))
+    clock = FakeClock()
+    monkeypatch.setattr(pipeline, "utc_now", clock)
+    monkeypatch.setattr(pipeline.time, "sleep", clock.sleep)
+    runner = CliRunner()
+    root = ["--root", str(studio_root)]
+    r = runner.invoke(main, [*root, "brief", "run", str(write_brief(variants=2))])
+    assert r.exit_code == 3, r.output
+    assert "deferred" in r.output
+    assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
+
+    r = runner.invoke(main, [*root, "jobs", "run"])
+    assert r.exit_code == 3 and "generating" in r.output  # same day: still deferred
+
+    clock.sleep(24 * 3600)
+    r = runner.invoke(main, [*root, "jobs", "run"])
+    assert r.exit_code == 0, r.output
+    assert ": published" in r.output
+    assert (studio_root / "published" / "cafe" / "hero.webp").is_file()

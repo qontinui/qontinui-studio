@@ -15,7 +15,7 @@ from qontinui_studio.pipeline import Context, run_brief
 from qontinui_studio.publish import unpublish_batch
 from qontinui_studio.review import build_review_page
 
-from .conftest import notice_text
+from .conftest import debris, notice_text
 
 
 def test_one_brief_two_sites_zero_manual_steps(
@@ -46,7 +46,7 @@ def test_one_brief_two_sites_zero_manual_steps(
         assert entry["licence"]["commercial_use"] == "yes"
         assert entry["batch_id"] == outcome.batch_id
         # No staging/backup debris left behind.
-        assert not [p for p in publish_dir.iterdir() if p.name.startswith(".")]
+        assert not debris(publish_dir)
 
     # Full D5 provenance on every library row.
     lib = Library(ctx.conn)
