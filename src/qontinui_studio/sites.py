@@ -110,6 +110,16 @@ def forbidden_bridge_reason(url: str) -> str | None:
     return None
 
 
+def _origin(url: str) -> tuple[str, str, int | None]:
+    """(scheme, host, port) with the default port dropped."""
+    p = urlparse(url)
+    scheme = p.scheme.lower()
+    port = p.port
+    if port == {"http": 80, "https": 443}.get(scheme):
+        port = None
+    return scheme, (p.hostname or "").lower(), port
+
+
 def is_local_host(host: str) -> bool:
     """Whether ``host`` names this machine: localhost names, loopback or
     unspecified addresses (any spelling), or one of this machine's interface
@@ -225,6 +235,16 @@ class Site(BaseModel):
                 raise ValueError(why)
         if self.preview_url and urlparse(self.preview_url).scheme not in ("http", "https"):
             raise ValueError(f"preview_url must be an http(s) URL, got '{self.preview_url}'")
+        if (
+            self.preview_url
+            and self.preview_manifest_url
+            and _origin(self.preview_url) != _origin(self.preview_manifest_url)
+        ):
+            raise ValueError(
+                "preview_manifest_url must be on the preview_url's origin: the slot files "
+                "are served beside the manifest, and D7 requires the page to show them "
+                f"from there (got {self.preview_manifest_url} for {self.preview_url})"
+            )
         for field_name in ("ui_bridge_url", "preview_url", "preview_manifest_url"):
             value = getattr(self, field_name)
             if value and "#" in value:

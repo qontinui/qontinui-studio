@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urljoin
 
 import httpx
 import pytest
@@ -223,7 +224,8 @@ class Bridge:
         return {"success": True, "data": {"summary": "OK"}}
 
 
-SHA = "a" * 64
+# The bytes the fake preview serves for every file (``_run``'s default fetch).
+SHA = hashlib.sha256(b"").hexdigest()
 
 
 def _img(
@@ -264,7 +266,7 @@ def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
     assert _run(site, broken, files)[-1].failed
     missing = Bridge("same", [_img(f"/other.webp?sha={SHA}")])
     last = _run(site, missing, files)[-1]
-    assert last.failed and "not one of the slot's files" in last.detail
+    assert last.failed and "not one of the slot's preview files" in last.detail
     nothing = Bridge("same", [_img(f"/hero.webp?sha={SHA}", mid="img-illustrative")])
     last = _run(site, nothing, files)[-1]
     assert last.failed and 'data-media-id="studio-picture-hero"' in last.detail
@@ -283,9 +285,9 @@ def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
 def test_d7_navigation_compares_browser_normalised_urls(preview_url: str) -> None:
     from .conftest import browser_href
 
-    site = _site(**{**PREVIEW, "preview_url": preview_url})
-    origin_url = browser_href(preview_url)
-    bridge = Bridge(None, [_img(f"{origin_url.rsplit('/', 1)[0]}/hero.webp?sha={SHA}")])
+    manifest = urljoin(preview_url, "studio-manifest.json")
+    site = _site(**{**PREVIEW, "preview_url": preview_url, "preview_manifest_url": manifest})
+    bridge = Bridge(None, [_img(f"{urljoin(manifest, 'hero.webp')}?sha={SHA}")])
     bridge.navigate = lambda url, hard=False: setattr(bridge, "url", browser_href(url))  # type: ignore[method-assign]
     results = _run(site, bridge, {"hero": {"hero.webp": SHA}})
     assert [g.outcome for g in results] == ["pass", "pass", "pass"], results
@@ -320,10 +322,14 @@ def test_d7_images_must_come_from_the_preview_with_this_batchs_sha() -> None:
         ],
     }
     g = d7_images(site, snap, files, lambda u: b"")
-    assert g.failed and "not one of the slot's files on the preview" in g.detail
-    snap["elements"] = [_img(f"/hero.webp?sha={SHA}")]  # avif missing
+    assert g.failed and "not one of the slot's preview files" in g.detail
+    snap["elements"] = [_img(f"/hero.webp?sha={SHA}")]  # avif fetched: wrong bytes
     g = d7_images(site, snap, files, lambda u: b"")
     assert g.failed and "hero.avif" in g.detail
+    # The right basename in the WRONG directory is not the slot's file.
+    snap["elements"] = [_img(f"/images/hero.webp?sha={SHA}")]
+    g = d7_images(site, snap, files, lambda u: b"")
+    assert g.failed and "not one of the slot's preview files" in g.detail
     snap["elements"] = [
         _img("/hero.webp?sha=" + "c" * 64),
         _img("/hero.avif?sha=" + "b" * 64, mid="studio-img-hero"),

@@ -365,14 +365,31 @@ NO_MEDIA = (
 )
 
 
+def expected_file_url(site: Site, name: str) -> str:
+    """Where the preview serves a slot file: beside the manifest, since both
+    live in ``preview_dir``."""
+    base = site.preview_manifest_url or site.preview_url
+    assert base is not None
+    return urljoin(base, name)
+
+
+def _file_at(site: Site, url: str, files: dict[str, str]) -> str | None:
+    """The slot file ``url`` (already absolute) points at, matching scheme,
+    host, port and the FULL path against where the preview serves it — never
+    just the basename — or None."""
+    for name in files:
+        if normalise_url(url) == normalise_url(expected_file_url(site, name)):
+            return name
+    return None
+
+
 def _slot_elements(
     site: Site, page_url: str, media: dict[str, dict[str, Any]], slot: str, files: dict[str, str]
 ) -> tuple[list[tuple[str, dict[str, Any], str | None, list[str] | None]], list[str]]:
     """The slot's elements, found by ``data-media-id``: (id, metadata, file
-    name or None when the source is not one of the slot's files on the preview
-    origin, ?sha= values). Also returns the problems seen while matching."""
+    name or None when the source is not exactly one of the slot's preview file
+    URLs, ?sha= values). Also returns the problems seen while matching."""
     assert site.preview_url is not None
-    preview_origin = origin(site.preview_url)
     picture_id, img_id = slot_media_ids(slot)
     found: list[tuple[str, dict[str, Any], str | None, list[str] | None]] = []
     problems: list[str] = []
@@ -389,16 +406,16 @@ def _slot_elements(
             found.append((mid, meta, None, None))
             continue
         src = urljoin(page_url, src_raw)
-        parsed = urlparse(src)
-        name = PurePosixPath(parsed.path).name
-        if origin(src) != preview_origin or name not in files:
+        name = _file_at(site, src, files)
+        if name is None:
+            expected = ", ".join(expected_file_url(site, n) for n in sorted(files))
             problems.append(
-                f"slot '{slot}' element '{mid}' shows {src_raw}, which is not one of the "
-                f"slot's files on the preview ({site.preview_url})"
+                f"slot '{slot}' element '{mid}' shows {src}, which is not one of the slot's "
+                f"preview files ({expected})"
             )
             found.append((mid, meta, None, None))
             continue
-        found.append((mid, meta, name, parse_qs(parsed.query).get("sha")))
+        found.append((mid, meta, name, parse_qs(urlparse(src).query).get("sha")))
     return found, problems
 
 
@@ -443,14 +460,7 @@ def images_settled(
     return True
 
 
-def _fetch_check(
-    site: Site, slot: str, name: str, sha: str, fetch: Callable[[str], bytes]
-) -> str | None:
-    # Slot files sit beside the manifest in preview_dir, so they are served
-    # beside preview_manifest_url.
-    base = site.preview_manifest_url or site.preview_url
-    assert base is not None
-    url = urljoin(base, name)
+def _hash_check(slot: str, url: str, sha: str, fetch: Callable[[str], bytes]) -> str | None:
     try:
         got = hashlib.sha256(fetch(url)).hexdigest()
     except Exception as e:  # unreachable is UNKNOWN; UNKNOWN does not publish
@@ -458,6 +468,12 @@ def _fetch_check(
     if got != sha:
         return f"slot '{slot}' {url} is not this batch's bytes"
     return None
+
+
+def _fetch_check(
+    site: Site, slot: str, name: str, sha: str, fetch: Callable[[str], bytes]
+) -> str | None:
+    return _hash_check(slot, expected_file_url(site, name), sha, fetch)
 
 
 def d7_images(
@@ -529,14 +545,24 @@ def d7_images(
                         f"(naturalWidth={m.get('naturalWidth')}, state={state})"
                     )
                 else:
-                    shown_ok = True
-                    to_fetch.pop(name, None)
+                    # Hash the bytes at the exact URL the element shows.
+                    shown_url = urljoin(page_url, m["src"])
+                    problem = _hash_check(slot, shown_url, files[name], fetch)
+                    if problem:
+                        problems.append(problem)
+                    else:
+                        shown_ok = True
+                        to_fetch.pop(name, None)
                 for url in _srcset_urls(m):
                     resolved = urljoin(page_url, url)
-                    sname = PurePosixPath(urlparse(resolved).path).name
-                    if sname in files and parse_qs(urlparse(resolved).query).get("sha") != [
-                        files[sname]
-                    ]:
+                    if PurePosixPath(urlparse(resolved).path).name not in files:
+                        continue
+                    sname = _file_at(site, resolved, files)
+                    if sname is None:
+                        problems.append(
+                            f"slot '{slot}' source {resolved} is not one of the slot's preview files"
+                        )
+                    elif parse_qs(urlparse(resolved).query).get("sha") != [files[sname]]:
                         problems.append(
                             f"slot '{slot}' source {url} is not this batch's {sname} (?sha=)"
                         )

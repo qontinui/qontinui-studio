@@ -180,6 +180,11 @@ A site template renders each studio slot from `studio-manifest.json`:
 - The preview page runs the UI Bridge React auto-registration provider with
   media discovery.
 
+- Slot files are served beside `studio-manifest.json`, and
+  `preview_manifest_url` must be on the preview page's origin. D7 accepts an
+  element only when its source is exactly `<manifest dir>/<file>`: same scheme,
+  host, port and full path, not just the file name. D7 also fetches the exact
+  URL the page shows, and every other format, and compares sha256.
 - Every file URL carries `?sha=<sha256>` from the manifest. It busts caches,
   and D7 checks it.
 - Studio slot images must be `loading="eager"`. D7 refuses a `lazy` image,

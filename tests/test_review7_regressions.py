@@ -318,3 +318,85 @@ def test_r10_srcless_slot_elements_fail_d7_images_and_never_settle(tmp_path: Pat
         g = d7_images(site, snap, files, lambda u: b"")
         assert g.failed and "has no src" in g.detail and "shows none of its files" in g.detail
         assert not images_settled(site, snap, files)
+
+
+# ---- eleventh review -------------------------------------------------------------
+
+
+def _r11_site(tmp_path: Path, manifest: str = "http://preview.test/studio/studio-manifest.json"):  # type: ignore[no-untyped-def]
+    from qontinui_studio.sites import Site
+
+    return Site.model_validate(
+        {
+            "id": "demo",
+            "name": "Demo",
+            "kind": "demo",
+            "commercial": False,
+            "publish_dir": str(tmp_path / "live"),
+            "preview_dir": str(tmp_path / "preview"),
+            "ui_bridge_url": "http://preview.test/__ui-bridge",
+            "preview_url": "http://preview.test/",
+            "preview_manifest_url": manifest,
+            "slots": {"hero": {"width": 64, "height": 36, "formats": ["webp", "avif"]}},
+        }
+    )
+
+
+def test_r11_the_shown_file_must_be_the_preview_file_and_is_hashed(tmp_path: Path) -> None:
+    import hashlib
+
+    from qontinui_studio import gates
+
+    site = _r11_site(tmp_path)
+    new_webp, new_avif, old = b"new-webp", b"new-avif", b"the site's OLD hero image"
+
+    def sha(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
+
+    files = {"hero": {"hero.webp": sha(new_webp), "hero.avif": sha(new_avif)}}
+    served = {
+        "http://preview.test/studio/hero.webp": new_webp,
+        "http://preview.test/studio/hero.avif": new_avif,
+    }
+    fetched: list[str] = []
+
+    def fetch(url: str) -> bytes:
+        fetched.append(url)
+        return served.get(url.split("?")[0], old)
+
+    def snap(src: str) -> dict[str, object]:
+        return {
+            "page": {"url": "http://preview.test/?studio_batch=B&studio_attempt=x"},
+            "elements": [
+                {
+                    "id": "studio-img-hero",
+                    "mediaMetadata": {"src": src, "loadingState": "loaded", "naturalWidth": 64},
+                }
+            ],
+        }
+
+    # Right ?sha=, wrong directory (the site's own old /images/hero.webp).
+    wrong = snap(f"/images/hero.webp?sha={sha(new_webp)}")
+    assert not gates.images_settled(site, wrong, files)
+    g = gates.d7_images(site, wrong, files, fetch)
+    assert g.failed and "not one of the slot's preview files" in g.detail
+
+    # Right path, and the bytes at the EXACT shown URL are hashed too.
+    fetched.clear()
+    right = snap(f"/studio/hero.webp?sha={sha(new_webp)}")
+    assert gates.d7_images(site, right, files, fetch).outcome == "pass"
+    assert f"http://preview.test/studio/hero.webp?sha={sha(new_webp)}" in fetched
+    assert "http://preview.test/studio/hero.avif" in fetched
+
+    # Same URL, but the preview serves other bytes there: refused.
+    served["http://preview.test/studio/hero.webp"] = old
+    g = gates.d7_images(site, right, files, fetch)
+    assert g.failed and "hero.webp?sha=" in g.detail and "not this batch's bytes" in g.detail
+
+
+def test_r11_manifest_must_share_the_preview_origin(tmp_path: Path) -> None:
+    import pytest as _pytest
+
+    assert _r11_site(tmp_path, "http://preview.test:80/studio/studio-manifest.json")
+    with _pytest.raises(ValueError, match="preview_url's origin"):
+        _r11_site(tmp_path, "http://cdn.example/studio-manifest.json")
