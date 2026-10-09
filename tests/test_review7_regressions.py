@@ -248,3 +248,73 @@ def test_r9_target_params_land_in_the_query_and_fragments_must_match(tmp_path: P
     assert not gates.same_page(target + "#other", target)
     stale = "http://preview.test/app/?lang=de&studio_batch=A&studio_attempt=old"
     assert not gates.same_page(stale, target)
+
+
+# ---- tenth review ----------------------------------------------------------------
+
+
+def _srcless(preview: FakePreview, drop: tuple[str, ...]):  # type: ignore[no-untyped-def]
+    real = preview.bridge
+
+    def factory(base_url: str) -> FakeBridge:
+        bridge = real(base_url)
+        snapshot = bridge.snapshot
+
+        def without_src() -> dict[str, object]:
+            snap = snapshot()
+            for element in snap.get("elements", []):  # type: ignore[union-attr]
+                meta = element.get("mediaMetadata")
+                if isinstance(meta, dict):
+                    for key in drop:
+                        meta.pop(key, None)
+                    meta["loadingState"] = "loaded"
+            return snap
+
+        bridge.snapshot = without_src  # type: ignore[method-assign]
+        return bridge
+
+    return factory
+
+
+def test_r10_a_slot_rendered_without_src_is_refused_end_to_end(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path], preview: FakePreview
+) -> None:
+    """The template's <img> renders with NO src (a manifest-lookup miss), and
+    the bridge reports {src: undefined, loadingState: 'loaded'}."""
+    factory = _srcless(preview, ("src", "srcset", "sources", "naturalWidth"))
+    out = run_brief(make_context(bridge=factory), write_brief())
+    assert out.status == "refused"
+    assert out.publish is not None
+    details = " ".join(g.detail for g in out.publish.failures if g.gate == "d7_images")
+    assert "has no src" in details and "shows none of its files" in details
+
+
+def test_r10_srcless_slot_elements_fail_d7_images_and_never_settle(tmp_path: Path) -> None:
+    from qontinui_studio.gates import d7_images, images_settled
+    from qontinui_studio.sites import Site
+
+    site = Site.model_validate(
+        {
+            "id": "s",
+            "name": "s",
+            "kind": "demo",
+            "commercial": False,
+            "publish_dir": str(tmp_path / "live"),
+            "preview_dir": str(tmp_path / "preview"),
+            "ui_bridge_url": "http://preview.test/__ui-bridge",
+            "preview_url": "http://preview.test/",
+            "preview_manifest_url": "http://preview.test/studio-manifest.json",
+            "slots": {"hero": {"width": 64, "height": 36}},
+        }
+    )
+    files = {"hero": {"hero.webp": "a" * 64}}
+    for elements in (
+        # <img> without src
+        [{"id": "studio-img-hero", "mediaMetadata": {"loadingState": "loaded"}}],
+        # <picture> without an <img> inside
+        [{"id": "studio-picture-hero", "mediaMetadata": {"mediaType": "picture"}}],
+    ):
+        snap = {"page": {"url": "http://preview.test/"}, "elements": elements}
+        g = d7_images(site, snap, files, lambda u: b"")
+        assert g.failed and "has no src" in g.detail and "shows none of its files" in g.detail
+        assert not images_settled(site, snap, files)

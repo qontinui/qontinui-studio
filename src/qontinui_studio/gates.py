@@ -381,7 +381,11 @@ def _slot_elements(
         if meta is None:
             continue
         src_raw = meta.get("src")
-        if not isinstance(src_raw, str):
+        if not isinstance(src_raw, str) or not src_raw:
+            problems.append(
+                f"slot '{slot}' element '{mid}' has no src — the page rendered no image for "
+                "this slot (e.g. the template's manifest lookup missed)"
+            )
             found.append((mid, meta, None, None))
             continue
         src = urljoin(page_url, src_raw)
@@ -430,7 +434,11 @@ def images_settled(
         if not site.slots[slot].rendered:
             continue
         found, _ = _slot_elements(site, page_url, media, slot, files)
-        if not found or any(m.get("loadingState") == "pending" for _, m, _, _ in found):
+        # Settled only once some element actually shows one of the slot's
+        # files and none is still loading; a src-less element never settles.
+        if not any(name is not None for _, _, name, _ in found):
+            return False
+        if any(m.get("loadingState") == "pending" for _, m, _, _ in found):
             return False
     return True
 
@@ -533,6 +541,10 @@ def d7_images(
                             f"slot '{slot}' source {url} is not this batch's {sname} (?sha=)"
                         )
             if not shown_ok:
+                problems.append(
+                    f"slot '{slot}' shows none of its files ({', '.join(sorted(files))}) "
+                    "loaded with this batch's ?sha="
+                )
                 continue
         for name, sha in sorted(to_fetch.items()):
             problem = _fetch_check(site, slot, name, sha, fetch)
