@@ -65,24 +65,42 @@ Publication is safe against failures, crashes and concurrent runs:
   `preview_manifest_url`, all four or none:
   - `ui_bridge_url` is the `/control/*` prefix of the UI Bridge in the browser
     showing the preview, e.g. the injection proxy in front of the preview
-    server. The runner's own UI (`:9876`) is refused.
+    server. Ports 9875 and 9876 (the supervisor's and runner's own UIs) are
+    refused on any host that resolves to this machine. That covers every
+    loopback or unspecified spelling (`127.0.0.2`, `127.1`, `::ffff:127.0.0.1`,
+    `0.0.0.0`) and this machine's own interface addresses.
   - The studio writes the live files, this batch's files and the merged
     manifest into `preview_dir`, and confirms the preview serves exactly that
     manifest (by sha256).
   - It drives the bridge to `preview_url?studio_batch=<batch>` with
-    `POST /control/page/navigate`, then confirms the page is there from its own
-    URL (`GET /control/snapshot` → `page.url`).
+    `POST /control/page/navigate`. It then polls `GET /control/snapshot` until
+    `page.url` is that page, or a 30 s deadline passes. A bridge error while
+    the tab re-registers is retried.
+  - URLs are compared as a browser reports them: lowercase scheme and host,
+    default port dropped, dot segments resolved, an empty path as `/`. The
+    page's origin must be the preview's origin.
   - It runs page health (`POST /control/page-health`). Only `OK` or `WARNING`
     pass.
-  - It confirms the page did not move, then checks that every changed slot's
-    image elements loaded. Image data comes from the snapshot's media elements:
-    `mediaMetadata.naturalWidth > 0` and `loadingState == "loaded"`.
+  - It confirms the page did not move, then checks every changed slot from the
+    snapshot's media elements:
+    - every file of the slot must appear as an image whose source resolves
+      under the preview's origin;
+    - each image must carry `?sha=<that file's sha256>`, which the manifest's
+      per-format `sha256` gives the template, so the page provably shows this
+      batch's bytes;
+    - each image must have loaded (`naturalWidth > 0`,
+      `loadingState == "loaded"`).
+  - A slot marked `rendered: false` is meta-only, e.g. an `og:image`. It is
+    verified by fetching each file from the preview server and comparing its
+    sha256.
+  - The preview drops exactly the superseded files the swap will move away,
+    so D7 checks the state that actually goes live.
 
   Any failure, or any bridge error, refuses, and live content is never touched.
   The bridge has a navigate control (`/control/page/navigate` in
   `ui-bridge/packages/ui-bridge/src/server/handlers.ts`), so no separate
   headless browser is needed. A navigate is fire-and-forget, so the studio
-  waits for idle and then verifies the URL itself.
+  polls the snapshot until the page reports the target URL.
 - **Journalled swap and unpublish.** Before any live file moves, a journal at
   `<publish_dir>/.studio-journal-<batch>.json` records every staged, placed and
   backup path, plus the manifest before and after. A single `BEGIN IMMEDIATE`
@@ -107,7 +125,9 @@ Publication is safe against failures, crashes and concurrent runs:
 - **Unpublish** works only on a live batch whose site configs are all loaded.
   It restores the publication the batch superseded only if that publication
   passes D5/D6 against the CURRENT site config and D7 on a preview of the
-  result. Otherwise the slot is left empty and the notice says why. It checks
+  result. Otherwise the slot is left empty and the notice says why. A restored
+  slot carries the current site's label (the string D6 checked), in both the
+  manifest and the publication row. It checks
   the stored variant's sha256 and never overwrites a live file holding bytes the
   studio did not place.
 - **Nothing is stranded.** `studio jobs run` also publishes `generated` batches,

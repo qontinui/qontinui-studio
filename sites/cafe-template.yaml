@@ -22,3 +22,6 @@ slots:
     height: 630
     category: decorative
     formats: [png]
+    # An og:image <meta> tag, never an <img>: D7 fetches it from the preview
+    # server and compares its sha256 instead of looking for a rendered image.
+    rendered: false

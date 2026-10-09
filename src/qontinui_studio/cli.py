@@ -162,6 +162,7 @@ def publish_cmd(obj: Obj, batch_id: str) -> None:
             bridge=ctx.bridge,
             fetch=ctx.fetch,
             root=obj.root,
+            sleep=ctx.sleep,
         )
     except PublicationRefused as e:
         click.echo(f"refused: {e}", err=True)
@@ -191,6 +192,7 @@ def unpublish_cmd(obj: Obj, batch_id: str) -> None:
             root=obj.root,
             bridge=ctx.bridge,
             fetch=ctx.fetch,
+            sleep=ctx.sleep,
         )
     except KeyError as e:
         raise click.ClickException(str(e)) from e

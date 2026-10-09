@@ -12,6 +12,7 @@ from qontinui_studio.gates import (
     d5_licence,
     d5_provenance,
     d6_not_the_real_thing,
+    d7_images,
     d7_page_health,
     d7_preview_manifest,
     d7_preview_page,
@@ -138,11 +139,40 @@ PREVIEW = {
 }
 
 
-def test_the_runners_own_ui_is_never_the_bridge() -> None:
-    with pytest.raises(ValueError, match="runner's own UI"):
-        _site(**{**PREVIEW, "ui_bridge_url": "http://127.0.0.1:9876/ui-bridge"})
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:9876/ui-bridge",
+        "http://127.0.0.2:9876/ui-bridge",
+        "http://[::ffff:127.0.0.1]:9876/ui-bridge",
+        "http://127.1:9876/ui-bridge",
+        "http://127.0.0.1:9875/ui-bridge",
+        "http://localhost:9876/ui-bridge",
+        "http://0.0.0.0:9876/ui-bridge",
+        "http://[::1]:9875/ui-bridge",
+    ],
+)
+def test_the_runner_and_supervisor_uis_are_never_the_bridge(url: str) -> None:
+    with pytest.raises(ValueError, match="runner/supervisor's own UI"):
+        _site(**{**PREVIEW, "ui_bridge_url": url})
+
+
+def test_bridge_guard_allows_other_ports_and_needs_all_fields() -> None:
+    assert _site(**{**PREVIEW, "ui_bridge_url": "http://127.0.0.1:4001/__ui-bridge"})
+    assert _site(**{**PREVIEW, "ui_bridge_url": "http://preview.example:9876/__ui-bridge"})
     with pytest.raises(ValueError, match="needs all of"):
         _site(ui_bridge_url="http://127.0.0.1:3000/__ui-bridge")
+
+
+class FakeTime:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+
+    def monotonic(self) -> float:
+        return self.t
 
 
 class Bridge:
@@ -151,45 +181,139 @@ class Bridge:
         self.elements = elements
         self.url: str | None = "http://127.0.0.1:3000/stale"
         self.navigated: list[str] = []
+        self.fail_snapshots = 0
 
     def navigate(self, url: str) -> None:
         self.navigated.append(url)
         self.url = self.url_after_nav if self.url_after_nav != "same" else url
 
     def snapshot(self) -> dict[str, object]:
+        if self.fail_snapshots:
+            self.fail_snapshots -= 1
+            raise ConnectionError("tab re-registering")
         return {"page": {"url": self.url}, "elements": self.elements}
 
     def page_health(self) -> dict[str, object]:
         return {"success": True, "data": {"summary": "OK"}}
 
 
-def _img(name: str, width: int, state: str = "loaded") -> dict[str, object]:
-    return {
-        "mediaMetadata": {
-            "src": f"http://127.0.0.1:3000/{name}?v=1",
-            "naturalWidth": width,
-            "loadingState": state,
-        }
-    }
+SHA = "a" * 64
+
+
+def _img(src: str, width: int = 1600, state: str = "loaded") -> dict[str, object]:
+    return {"mediaMetadata": {"src": src, "naturalWidth": width, "loadingState": state}}
+
+
+def _run(site: Site, bridge: Bridge, files: dict[str, dict[str, str]], fetch=None):  # type: ignore[no-untyped-def]
+    t = FakeTime()
+    return d7_preview_page(
+        site,
+        "batch-1",
+        files,
+        lambda _u: bridge,
+        fetch or (lambda u: b""),
+        sleep=t.sleep,
+        monotonic=t.monotonic,
+    )
 
 
 def test_d7_is_bound_to_the_batch_preview_and_checks_images() -> None:
     site = _site(**PREVIEW)
-    files = {"hero": ["hero.webp", "hero.avif"]}
-    good = Bridge("same", [_img("hero.webp", 1600)])
-    results = d7_preview_page(site, "batch-1", files, lambda _u: good)
-    assert [g.outcome for g in results] == ["pass", "pass", "pass"]
+    files = {"hero": {"hero.webp": SHA}}
+    good = Bridge("same", [_img(f"/hero.webp?sha={SHA}")])
+    assert [g.outcome for g in _run(site, good, files)] == ["pass", "pass", "pass"]
     assert good.navigated == ["http://127.0.0.1:3000/index.html?studio_batch=batch-1"]
 
-    stale = Bridge(None, [_img("hero.webp", 1600)])  # the tab never moved
-    [nav] = d7_preview_page(site, "batch-1", files, lambda _u: stale)
+    stale = Bridge(None, [_img(f"/hero.webp?sha={SHA}")])  # the tab never moved
+    [nav] = _run(site, stale, files)
     assert nav.gate == "d7_navigate" and nav.failed
 
-    broken = Bridge("same", [_img("hero.webp", 0, "error")])
-    assert d7_preview_page(site, "b", files, lambda _u: broken)[-1].failed
-    missing = Bridge("same", [_img("other.webp", 1600)])
-    last = d7_preview_page(site, "b", files, lambda _u: missing)[-1]
+    broken = Bridge("same", [_img(f"/hero.webp?sha={SHA}", 0, "error")])
+    assert _run(site, broken, files)[-1].failed
+    missing = Bridge("same", [_img(f"/other.webp?sha={SHA}")])
+    last = _run(site, missing, files)[-1]
     assert last.failed and "not rendered" in last.detail
+
+
+@pytest.mark.parametrize(
+    "preview_url",
+    [
+        "http://127.0.0.1:4000",
+        "http://Preview.Local:4000/index.html",
+        "http://preview.local:80/index.html",
+        "http://preview.local/a/../index.html",
+        "http://preview.local/index.html",
+    ],
+)
+def test_d7_navigation_compares_browser_normalised_urls(preview_url: str) -> None:
+    from .conftest import browser_href
+
+    site = _site(**{**PREVIEW, "preview_url": preview_url})
+    origin_url = browser_href(preview_url)
+    bridge = Bridge(None, [_img(f"{origin_url.rsplit('/', 1)[0]}/hero.webp?sha={SHA}")])
+    bridge.navigate = lambda url: setattr(bridge, "url", browser_href(url))  # type: ignore[method-assign]
+    results = _run(site, bridge, {"hero": {"hero.webp": SHA}})
+    assert [g.outcome for g in results] == ["pass", "pass", "pass"], results
+
+
+def test_d7_retries_while_the_tab_re_registers() -> None:
+    site = _site(**PREVIEW)
+    bridge = Bridge("same", [_img(f"/hero.webp?sha={SHA}")])
+    bridge.fail_snapshots = 3
+    assert [g.outcome for g in _run(site, bridge, {"hero": {"hero.webp": SHA}})] == [
+        "pass",
+        "pass",
+        "pass",
+    ]
+
+
+def test_d7_refuses_a_page_on_another_origin() -> None:
+    site = _site(**PREVIEW)
+    other = Bridge("http://127.0.0.1:9876/index.html?studio_batch=batch-1", [])
+    [nav] = _run(site, other, {"hero": {"hero.webp": SHA}})
+    assert nav.failed and "not the preview origin" in nav.detail
+
+
+def test_d7_images_must_come_from_the_preview_with_this_batchs_sha() -> None:
+    site = _site(**PREVIEW)
+    files = {"hero": {"hero.webp": SHA, "hero.avif": "b" * 64}}
+    snap = {
+        "page": {"url": "http://127.0.0.1:3000/index.html?studio_batch=b"},
+        "elements": [
+            _img("https://cafe.example.com/img/hero.webp"),
+            _img("https://cdn.other.example/hero.avif?v=old"),
+        ],
+    }
+    g = d7_images(site, snap, files, lambda u: b"")
+    assert g.failed and "not rendered from the preview" in g.detail
+    snap["elements"] = [_img(f"/hero.webp?sha={SHA}")]  # avif missing
+    g = d7_images(site, snap, files, lambda u: b"")
+    assert g.failed and "hero.avif" in g.detail
+    snap["elements"] = [_img("/hero.webp?sha=" + "c" * 64), _img("/hero.avif?sha=" + "b" * 64)]
+    g = d7_images(site, snap, files, lambda u: b"")
+    assert g.failed and "not this batch's hero.webp" in g.detail
+
+
+def test_d7_meta_only_slots_are_verified_by_fetch() -> None:
+    site = _site(
+        **PREVIEW,
+        slots={
+            "hero": {"width": 4, "height": 4, "category": "decorative"},
+            "og": {"width": 4, "height": 4, "category": "decorative", "rendered": False},
+        },
+    )
+    data = b"og-bytes"
+    sha = hashlib.sha256(data).hexdigest()
+    snap = {"page": {"url": "http://127.0.0.1:3000/index.html"}, "elements": []}
+    fetched: list[str] = []
+
+    def fetch(url: str) -> bytes:
+        fetched.append(url)
+        return data
+
+    assert d7_images(site, snap, {"og": {"og.png": sha}}, fetch).outcome == "pass"
+    assert fetched == ["http://127.0.0.1:3000/og.png"]
+    assert d7_images(site, snap, {"og": {"og.png": "0" * 64}}, fetch).failed
 
 
 def test_page_health_gate() -> None:

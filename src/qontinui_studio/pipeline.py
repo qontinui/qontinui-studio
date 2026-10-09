@@ -177,8 +177,55 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
     brief = loaded.brief
     out_dir = ctx.workspace.variants_dir / job["batch_id"]
     try:
+        # 1. All image work happens OUTSIDE any database transaction, so a slow
+        #    encode never holds SQLite's write lock against other writers.
+        planned: list[
+            tuple[str, Path, list[tuple[str, str | None, str | None, str | None, str, Path]]]
+        ] = []
         for n, raw in enumerate(files):
             uid = f"{job['id']}-{n}"
+            with Image.open(raw) as opened:
+                keep_alpha = opened.mode in ("RGBA", "LA", "P")
+                source = opened.convert("RGBA" if keep_alpha else "RGB")
+            variants: list[tuple[str, str | None, str | None, str | None, str, Path]] = []
+            for target in brief.targets:
+                if target.is_slot:
+                    site = ctx.sites[target.site or ""]
+                    slot = site.slots[target.slot or ""]
+                    img = source
+                    if slot.remove_background:
+                        img = remove_background(img)
+                    img = crop_to_slot(img, slot.width, slot.height, (slot.focal_x, slot.focal_y))
+                    for fmt in slot.formats:
+                        path = export(img, out_dir / f"{uid}--{site.id}--{target.slot}", fmt)
+                        variants.append(
+                            (
+                                f"{uid}:{site.id}:{target.slot}:{fmt}",
+                                site.id,
+                                target.slot,
+                                None,
+                                fmt,
+                                path,
+                            )
+                        )
+                else:
+                    path = export(source, out_dir / f"{uid}--campaign--{target.campaign}", "webp")
+                    variants.append(
+                        (
+                            f"{uid}:campaign:{target.campaign}:webp",
+                            None,
+                            None,
+                            target.campaign,
+                            "webp",
+                            path,
+                        )
+                    )
+            planned.append((uid, raw, variants))
+
+        # 2. One short write transaction: the rows and the final status.
+        ctx.conn.commit()
+        ctx.conn.execute("BEGIN IMMEDIATE")
+        for uid, raw, variants in planned:
             asset = library.add_asset(
                 uid=uid,
                 asset_id=brief.id,
@@ -192,43 +239,18 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
                 raw_path=raw,
                 commit=False,
             )
-            with Image.open(raw) as opened:
-                keep_alpha = opened.mode in ("RGBA", "LA", "P")
-                source = opened.convert("RGBA" if keep_alpha else "RGB")
-            for target in brief.targets:
-                if target.is_slot:
-                    site = ctx.sites[target.site or ""]
-                    slot = site.slots[target.slot or ""]
-                    img = source
-                    if slot.remove_background:
-                        img = remove_background(img)
-                    img = crop_to_slot(img, slot.width, slot.height, (slot.focal_x, slot.focal_y))
-                    for fmt in slot.formats:
-                        path = export(img, out_dir / f"{uid}--{site.id}--{target.slot}", fmt)
-                        library.add_variant(
-                            variant_id=f"{uid}:{site.id}:{target.slot}:{fmt}",
-                            asset_uid=asset.uid,
-                            site=site.id,
-                            slot=target.slot,
-                            campaign=None,
-                            fmt=fmt,
-                            path=path,
-                            created_at=ctx.clock(),
-                            commit=False,
-                        )
-                else:
-                    path = export(source, out_dir / f"{uid}--campaign--{target.campaign}", "webp")
-                    library.add_variant(
-                        variant_id=f"{uid}:campaign:{target.campaign}:webp",
-                        asset_uid=asset.uid,
-                        site=None,
-                        slot=None,
-                        campaign=target.campaign,
-                        fmt="webp",
-                        path=path,
-                        created_at=ctx.clock(),
-                        commit=False,
-                    )
+            for variant_id, site_id, slot_name, campaign, vfmt, vpath in variants:
+                library.add_variant(
+                    variant_id=variant_id,
+                    asset_uid=asset.uid,
+                    site=site_id,
+                    slot=slot_name,
+                    campaign=campaign,
+                    fmt=vfmt,
+                    path=vpath,
+                    created_at=ctx.clock(),
+                    commit=False,
+                )
         done = ctx.conn.execute(
             "UPDATE jobs SET status = 'ingested', claim = NULL, updated_at = ? "
             "WHERE id = ? AND status = 'ingesting' AND claim = ?",
@@ -373,6 +395,7 @@ def _publish_into(ctx: Context, outcome: BatchOutcome) -> None:
             bridge=ctx.bridge,
             fetch=ctx.fetch,
             root=ctx.workspace.root,
+            sleep=ctx.sleep,
         )
     except StudioError as e:
         ctx.conn.rollback()

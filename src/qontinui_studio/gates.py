@@ -11,12 +11,14 @@ D3 (the build-record export allowlist) is a gate on the FACTORY's export
 from __future__ import annotations
 
 import hashlib
+import posixpath
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import httpx
 
@@ -251,9 +253,8 @@ class HttpUiBridge:
         data = body.get("data")
         if isinstance(data, dict) and data.get("delivered") is False:
             raise BridgeError("navigate was not delivered to any tab")
-        # navigate is fire-and-forget (DELIVERED, not EXECUTED): wait for the new
-        # document to settle; the caller then confirms the URL via a snapshot.
-        self._body(self.http.post(f"{self.base}/control/wait-for-idle", json={"timeout": 20000}))
+        # navigate is fire-and-forget (DELIVERED, not EXECUTED); the caller
+        # polls the snapshot until the page reports the target URL.
 
     def snapshot(self) -> dict[str, Any]:
         data = self._body(self.http.get(f"{self.base}/control/snapshot")).get("data")
@@ -273,82 +274,180 @@ def preview_target(site: Site, batch_id: str) -> str:
     return f"{site.preview_url}{sep}{urlencode({'studio_batch': batch_id})}"
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def normalise_url(url: str) -> tuple[str, str, int | None, str]:
+    """(scheme, host, port, path) as a browser would report them: lowercase
+    scheme and host, the default port dropped, dot segments resolved, an empty
+    path as ``/`` (WHATWG URL serialisation, for the parts D7 compares)."""
+    p = urlparse(url)
+    scheme = p.scheme.lower()
+    port = p.port
+    if port == _DEFAULT_PORTS.get(scheme):
+        port = None
+    path = p.path or "/"
+    norm = posixpath.normpath(path)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    if path.endswith("/") and norm != "/":
+        norm += "/"
+    return scheme, (p.hostname or "").lower(), port, norm
+
+
+def origin(url: str) -> tuple[str, str, int | None]:
+    scheme, host, port, _ = normalise_url(url)
+    return scheme, host, port
+
+
+def same_page(actual: str | None, target: str, batch_id: str) -> bool:
+    """Whether the bridged page's URL is this batch's preview: same origin and
+    path (browser-normalised) and ``studio_batch`` = this batch."""
+    if not actual:
+        return False
+    if normalise_url(actual) != normalise_url(target):
+        return False
+    return parse_qs(urlparse(actual).query).get("studio_batch") == [batch_id]
+
+
 def _current_url(snapshot: dict[str, Any]) -> str | None:
     page = snapshot.get("page")
     url = page.get("url") if isinstance(page, dict) else None
     return url if isinstance(url, str) else None
 
 
-def d7_images(site: Site, snapshot: dict[str, Any], slot_files: dict[str, list[str]]) -> GateResult:
-    """Every slot this batch changes renders on the preview page: at least one
-    image element whose source is one of the slot's files, and every such
-    element loaded (``naturalWidth > 0``, ``loadingState == 'loaded'``)."""
+def d7_images(
+    site: Site,
+    snapshot: dict[str, Any],
+    slot_files: dict[str, dict[str, str]],
+    fetch: Callable[[str], bytes],
+) -> GateResult:
+    """Every slot this batch changes is really on the preview, as THIS batch's bytes.
+
+    ``slot_files`` maps slot -> {file name: sha256}. For a rendered slot, EVERY
+    file must appear as an image element whose source resolves under the
+    preview's origin, carries ``?sha=<that file's sha256>`` (the cache-buster
+    the manifest gives the template), and loaded (``naturalWidth > 0``,
+    ``loadingState == 'loaded'``). A slot declared ``rendered: false`` (meta
+    only, e.g. an ``og:image``) is verified by fetching each file from the
+    preview server and comparing its sha256."""
     subject = f"site {site.id}"
+    if not site.preview_url:
+        return GateResult("d7_images", subject, "not_configured", "site declares no preview_url")
+    page_url = _current_url(snapshot) or site.preview_url
+    preview_origin = origin(site.preview_url)
     media: list[dict[str, Any]] = []
     for element in snapshot.get("elements") or []:
         meta = element.get("mediaMetadata") if isinstance(element, dict) else None
         if isinstance(meta, dict) and isinstance(meta.get("src"), str):
             media.append(meta)
     problems: list[str] = []
-    for slot, names in sorted(slot_files.items()):
-        shown = [m for m in media if PurePosixPath(urlparse(m["src"]).path).name in names]
-        if not shown:
-            problems.append(
-                f"slot '{slot}' ({', '.join(names)}) is not rendered on the preview page"
-            )
+    for slot, files in sorted(slot_files.items()):
+        if not site.slots[slot].rendered:
+            for name, sha in sorted(files.items()):
+                url = urljoin(site.preview_url, name)
+                try:
+                    got = hashlib.sha256(fetch(url)).hexdigest()
+                except Exception as e:  # unreachable is UNKNOWN; UNKNOWN does not publish
+                    problems.append(
+                        f"slot '{slot}' {url} could not be fetched ({type(e).__name__})"
+                    )
+                    continue
+                if got != sha:
+                    problems.append(f"slot '{slot}' {url} is not this batch's bytes")
             continue
-        for m in shown:
-            if not (isinstance(m.get("naturalWidth"), int | float) and m["naturalWidth"] > 0) or (
-                m.get("loadingState") != "loaded"
-            ):
+        for name, sha in sorted(files.items()):
+            shown = []
+            for m in media:
+                src = urljoin(page_url, m["src"])
+                parsed = urlparse(src)
+                if origin(src) != preview_origin or PurePosixPath(parsed.path).name != name:
+                    continue
+                shown.append((m, parse_qs(parsed.query).get("sha")))
+            if not shown:
                 problems.append(
-                    f"slot '{slot}' image {m['src']} did not load "
-                    f"(naturalWidth={m.get('naturalWidth')}, state={m.get('loadingState')})"
+                    f"slot '{slot}' file {name} is not rendered from the preview "
+                    f"({site.preview_url}) — maybe served from another host, or not at all"
                 )
+                continue
+            for m, tag in shown:
+                if tag != [sha]:
+                    problems.append(f"slot '{slot}' {m['src']} is not this batch's {name} (?sha=)")
+                elif not (
+                    isinstance(m.get("naturalWidth"), int | float) and m["naturalWidth"] > 0
+                ) or (m.get("loadingState") != "loaded"):
+                    problems.append(
+                        f"slot '{slot}' image {m['src']} did not load "
+                        f"(naturalWidth={m.get('naturalWidth')}, state={m.get('loadingState')})"
+                    )
     if problems:
         return GateResult("d7_images", subject, "fail", "; ".join(problems))
     return GateResult(
-        "d7_images", subject, "pass", f"{len(slot_files)} slot(s) rendered and loaded"
+        "d7_images", subject, "pass", f"{len(slot_files)} slot(s) verified on the preview"
     )
 
 
 def d7_preview_page(
     site: Site,
     batch_id: str,
-    slot_files: dict[str, list[str]],
+    slot_files: dict[str, dict[str, str]],
     bridge_factory: BridgeFactory,
+    fetch: Callable[[str], bytes],
+    *,
+    deadline_s: float = 30.0,
+    poll_s: float = 0.5,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> list[GateResult]:
     """D7 bound to THIS batch's preview: navigate the bridged page to the
-    batch's preview URL and confirm (by the page's own URL) that it is there,
-    run page health, confirm the page did not move during it, and check every
-    changed slot's images loaded."""
+    batch's preview URL, poll its snapshot until the page reports that URL
+    (browser-normalised; a bridge error while the tab re-registers is retried
+    until the deadline), require its origin to be the preview's, run page
+    health, confirm the page did not move, and verify every changed slot."""
     subject = f"site {site.id}"
     if not (site.ui_bridge_url and site.preview_url):
         return [d7_page_health(site)]
     target = preview_target(site, batch_id)
-    try:
-        bridge = bridge_factory(site.ui_bridge_url)
-        bridge.navigate(target)
-        before = bridge.snapshot()
-    except Exception as e:  # an unreachable bridge is UNKNOWN; UNKNOWN does not publish
-        return [GateResult("d7_navigate", subject, "fail", f"{type(e).__name__}: {e}")]
-    if _current_url(before) != target:
-        return [
-            GateResult(
-                "d7_navigate",
-                subject,
-                "fail",
-                f"bridged page is at {_current_url(before)!r}, not this batch's preview {target!r}",
-            )
-        ]
-    results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {target}")]
+    stop = monotonic() + deadline_s
+    bridge: UiBridge | None = None
+    navigated = False
+    seen: str | None = None
+    last_error = ""
+    before: dict[str, Any] | None = None
+    while True:
+        try:
+            if bridge is None:
+                bridge = bridge_factory(site.ui_bridge_url)
+            if not navigated:
+                bridge.navigate(target)
+                navigated = True
+            snap = bridge.snapshot()
+            seen = _current_url(snap)
+            if same_page(seen, target, batch_id):
+                before = snap
+                break
+        except Exception as e:  # e.g. the tab is re-registering after navigation
+            last_error = f"{type(e).__name__}: {e}"
+        if monotonic() >= stop:
+            break
+        sleep(poll_s)
+    if before is None or bridge is None:
+        why = (
+            f"bridged page is at {seen!r}, not this batch's preview {target!r}"
+            if seen is not None or not last_error
+            else f"bridge unavailable: {last_error}"
+        )
+        if seen is not None and origin(seen) != origin(target):
+            why += f" (origin {origin(seen)} is not the preview origin {origin(target)})"
+        return [GateResult("d7_navigate", subject, "fail", f"{why} after {deadline_s:.0f}s")]
+    results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {seen}")]
     results.append(d7_page_health(site, lambda _url: bridge.page_health()))
     try:
         after = bridge.snapshot()
     except Exception as e:
         results.append(GateResult("d7_navigate", subject, "fail", f"{type(e).__name__}: {e}"))
         return results
-    if _current_url(after) != target:
+    if not same_page(_current_url(after), target, batch_id):
         results.append(
             GateResult(
                 "d7_navigate",
@@ -358,7 +457,7 @@ def d7_preview_page(
             )
         )
         return results
-    results.append(d7_images(site, after, slot_files))
+    results.append(d7_images(site, after, slot_files, fetch))
     return results
 
 

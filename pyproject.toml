@@ -66,3 +66,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-q"]
+markers = [
+    "local_http: may connect to a loopback server the test itself started",
+]

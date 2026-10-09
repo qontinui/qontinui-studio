@@ -50,6 +50,7 @@ import os
 import re
 import shutil
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -162,10 +163,19 @@ def _write_manifest(publish_dir: Path, data: dict[str, Any]) -> None:
 
 
 def _manifest_entry(
-    asset: AssetRecord, files: dict[str, str], label: str, batch_id: str, published_at: str
+    asset: AssetRecord,
+    files: dict[str, str],
+    shas: dict[str, str],
+    label: str,
+    batch_id: str,
+    published_at: str,
 ) -> dict[str, Any]:
+    """One slot's manifest entry. ``sha256`` (format -> digest) is what a site
+    template appends as ``?sha=`` to each file URL: a cache-buster, and the
+    proof D7 checks that the page shows THIS batch's bytes."""
     return {
         "files": files,
+        "sha256": shas,
         "label": label,
         "ai_generated": True,
         "asset_uid": asset.uid,
@@ -685,6 +695,7 @@ def _plan(
         plan.manifest["slots"][slot_name] = _manifest_entry(
             rows[0][0],
             {variant.format: dest.name for _, variant, dest in rows},
+            {variant.format: variant.sha256 for _, variant, _ in rows},
             site.label_for_ai(),
             batch_id,
             now_iso,
@@ -748,9 +759,10 @@ def _d7(
     overlay: dict[str, Path],
     drop: set[str],
     manifest: dict[str, Any],
-    slot_files: dict[str, list[str]],
+    slot_files: dict[str, dict[str, str]],
     bridge: BridgeFactory,
     fetch: ManifestFetch,
+    waiter: Waiter,
 ) -> list[GateResult]:
     """The full D7 for one site's would-be state: preview written and confirmed
     by manifest sha, then the bridged page bound to it and checked."""
@@ -760,7 +772,31 @@ def _d7(
     preview_gate = d7_preview_manifest(site, _sha_bytes(written), fetch)
     if preview_gate.failed:
         return [preview_gate]
-    return [preview_gate, *d7_preview_page(site, label, slot_files, bridge)]
+    return [
+        preview_gate,
+        *d7_preview_page(
+            site,
+            label,
+            slot_files,
+            bridge,
+            fetch,
+            sleep=waiter.sleep,
+            monotonic=waiter.monotonic,
+        ),
+    ]
+
+
+@dataclass(frozen=True)
+class Waiter:
+    """How D7 waits for the bridged page: ``sleep`` and a clock in seconds.
+    Built from the caller's clock and sleep so tests run in fake time."""
+
+    sleep: Callable[[float], None]
+    monotonic: Callable[[], float]
+
+    @classmethod
+    def of(cls, clock: Callable[[], datetime], sleep: Callable[[float], None]) -> Waiter:
+        return cls(sleep=sleep, monotonic=lambda: clock().timestamp())
 
 
 def _lock_dirs(sites: list[Site]) -> list[Path]:
@@ -781,6 +817,7 @@ def publish_batch(
     bridge: BridgeFactory = HttpUiBridge,
     fetch: ManifestFetch = http_manifest_fetch,
     root: Path | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> PublishResult:
     """Gate and publish one batch.
 
@@ -812,7 +849,18 @@ def publish_batch(
         conn.commit()
         if claimed != 1:
             raise PublicationRefused(f"batch {batch_id} changed status concurrently", [])
-        return _publish_locked(conn, sites, batch, selected, notifier, clock(), bridge, fetch, root)
+        return _publish_locked(
+            conn,
+            sites,
+            batch,
+            selected,
+            notifier,
+            clock(),
+            bridge,
+            fetch,
+            root,
+            Waiter.of(clock, sleep),
+        )
 
 
 def _publish_locked(
@@ -825,6 +873,7 @@ def _publish_locked(
     bridge: BridgeFactory,
     fetch: ManifestFetch,
     root: Path | None,
+    waiter: Waiter,
 ) -> PublishResult:
     batch_id = batch["id"]
     result = PublishResult(batch_id=batch_id, published=False)
@@ -899,10 +948,23 @@ def _publish_locked(
                 for _, variant, dest in rows
             }
             slot_files = {
-                slot: [dest.name for _, _, dest in rows] for slot, rows in plan.slots.items()
+                slot: {dest.name: variant.sha256 for _, variant, dest in rows}
+                for slot, rows in plan.slots.items()
             }
+            # The preview must be exactly what the swap will produce: the
+            # slot's currently live files that this batch does not overwrite
+            # are moved away by the swap, so they are dropped here too.
+            drop = {
+                Path(r["published_path"]).name
+                for slot in plan.slots
+                for r in conn.execute(
+                    "SELECT published_path FROM publications "
+                    "WHERE site = ? AND slot = ? AND unpublished_at IS NULL",
+                    (plan.site.id, slot),
+                )
+            } - set(overlay)
             result.gate_results += _d7(
-                plan.site, batch_id, overlay, set(), plan.manifest, slot_files, bridge, fetch
+                plan.site, batch_id, overlay, drop, plan.manifest, slot_files, bridge, fetch, waiter
             )
         if result.failures:
             return _refuse(conn, notifier, result, now, "D7 failed; nothing went live")
@@ -1093,6 +1155,7 @@ def _unpublish_locked(
     now: datetime,
     bridge: BridgeFactory,
     fetch: ManifestFetch,
+    waiter: Waiter,
 ) -> UnpublishResult:
     """Journalled like a publish: decide everything (re-gating every restore),
     stage restore copies, write the journals, apply, then commit the DB."""
@@ -1109,7 +1172,7 @@ def _unpublish_locked(
         by_site.setdefault(row["site"], []).append(row)
 
     journals: list[Journal] = []
-    restore_rows: list[int] = []
+    restore_rows: list[tuple[int, str]] = []  # (publication id, current site label)
     staged_files: list[Path] = []
     try:
         for site_id, site_rows in sorted(by_site.items()):
@@ -1178,10 +1241,13 @@ def _unpublish_locked(
                     )
                     continue
                 restores[slot] = (prev_batch, prev)
+                # The label is the CURRENT site's — the string D6 just checked —
+                # never the one stored when the restored batch first went live.
                 manifest["slots"][slot] = _manifest_entry(
                     library.asset(prev[0]["asset_uid"]),
                     {r["vformat"]: Path(r["published_path"]).name for r in prev},
-                    prev[0]["label"],
+                    {r["vformat"]: r["vsha"] for r in prev},
+                    site.label_for_ai(),
                     prev_batch,
                     prev[0]["published_at"],
                 )
@@ -1193,7 +1259,7 @@ def _unpublish_locked(
                     for r in prev
                 }
                 slot_files = {
-                    slot: [Path(r["published_path"]).name for r in prev]
+                    slot: {Path(r["published_path"]).name: r["vsha"] for r in prev}
                     for slot, (_, prev) in restores.items()
                 }
                 d7 = _d7(
@@ -1205,6 +1271,7 @@ def _unpublish_locked(
                     slot_files,
                     bridge,
                     fetch,
+                    waiter,
                 )
                 out.gate_results += [_as_restore(g) for g in d7]
                 failed = [f"{g.gate}: {g.detail}" for g in d7 if g.failed]
@@ -1224,7 +1291,7 @@ def _unpublish_locked(
                         staged_files.append(staged)
                         shutil.copyfile(r["vpath"], staged)
                         journal.placed.append((staged, dest, r["vsha"]))
-                    restore_rows.append(int(r["id"]))
+                    restore_rows.append((int(r["id"]), site.label_for_ai()))
                 out.restored.append(f"{site_id}/{slot} <- {prev_batch}")
             journal.manifest_after = manifest_bytes(manifest)
             journal.write()
@@ -1253,10 +1320,11 @@ def _unpublish_locked(
                 (r["superseded_by"], batch_id, r["site"], r["slot"]),
             )
         conn.execute("UPDATE publications SET superseded_by = NULL WHERE batch_id = ?", (batch_id,))
-        for rid in restore_rows:
+        for rid, label in restore_rows:
             conn.execute(
-                "UPDATE publications SET unpublished_at = NULL, superseded_by = NULL WHERE id = ?",
-                (rid,),
+                "UPDATE publications SET unpublished_at = NULL, superseded_by = NULL, label = ? "
+                "WHERE id = ?",
+                (label, rid),
             )
         _record_gates(conn, batch_id, out.gate_results, now)
         conn.execute(
@@ -1292,6 +1360,7 @@ def unpublish_batch(
     root: Path | None = None,
     bridge: BridgeFactory = HttpUiBridge,
     fetch: ManifestFetch = http_manifest_fetch,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> list[Path]:
     """Remove a batch's live files and manifest entries. On each slot, the
     publication it superseded is restored only if it passes D5/D6 against the
@@ -1339,7 +1408,7 @@ def unpublish_batch(
                 f"batch {batch_id} is '{status}' and has no live publication; nothing to unpublish",
                 [],
             )
-        out = _unpublish_locked(conn, sites, batch_id, now, bridge, fetch)
+        out = _unpublish_locked(conn, sites, batch_id, now, bridge, fetch, Waiter.of(clock, sleep))
         lines = [f"Removed {len(out.removed)} file(s): " + ", ".join(str(p) for p in out.removed)]
         lines += [f"Restored {r}" for r in out.restored]
         lines += [f"NOT restored {r}" for r in out.not_restored]

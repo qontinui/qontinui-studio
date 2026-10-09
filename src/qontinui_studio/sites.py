@@ -7,7 +7,9 @@ content category of every slot a brief may target.
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -27,8 +29,51 @@ ExportFormat = Literal["webp", "avif", "png", "jpeg"]
 
 ID_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 
-RUNNER_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
-RUNNER_PORT = 9876
+# The supervisor (:9875) and the runner (:9876) — dev tooling UIs, never a
+# site preview. Refused on any host that resolves to this machine.
+FORBIDDEN_LOCAL_PORTS = frozenset({9875, 9876})
+
+
+def _local_addresses() -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """This machine's own interface addresses (best effort, no DNS lookups
+    beyond the local host name)."""
+    out: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    try:
+        name = socket.gethostname()
+        for info in socket.getaddrinfo(name, None):
+            out.add(ipaddress.ip_address(str(info[4][0]).split("%")[0]))
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def _host_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``host`` as an IP address, accepting the IPv4 shorthands a browser or
+    the OS accepts (``127.1``, ``2130706433``) and unwrapping IPv4-mapped IPv6."""
+    try:
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            addr = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def is_local_host(host: str) -> bool:
+    """Whether ``host`` names this machine: localhost names, loopback or
+    unspecified addresses (any spelling), or one of this machine's interface
+    addresses."""
+    host = host.rstrip(".").lower()
+    if host in ("localhost", socket.gethostname().lower()) or host.endswith(".localhost"):
+        return True
+    addr = _host_address(host)
+    if addr is None:
+        return False
+    return addr.is_loopback or addr.is_unspecified or addr in _local_addresses()
+
 
 DEFAULT_ILLUSTRATIVE_LABEL = "Illustrative image (AI-generated)"
 DEFAULT_AI_LABEL = "AI-generated image"
@@ -50,6 +95,9 @@ class Slot(BaseModel):
     category: SlotCategory
     formats: list[ExportFormat] = Field(default_factory=_default_formats, min_length=1)
     remove_background: bool = False
+    # False for a slot that is never an <img> on the page (meta only, e.g. an
+    # og:image): D7 then verifies it by fetching it from the preview server.
+    rendered: bool = True
     focal_x: float = Field(default=0.5, ge=0.0, le=1.0)
     focal_y: float = Field(default=0.5, ge=0.0, le=1.0)
 
@@ -124,10 +172,11 @@ class Site(BaseModel):
                 raise ValueError(
                     f"ui_bridge_url must be an http(s) URL, got '{self.ui_bridge_url}'"
                 )
-            if bridge.hostname in RUNNER_HOSTS and bridge.port == RUNNER_PORT:
+            if bridge.port in FORBIDDEN_LOCAL_PORTS and is_local_host(bridge.hostname):
                 raise ValueError(
-                    "ui_bridge_url points at the runner's own UI (port 9876); D7 must "
-                    "check the site's PREVIEW page, through the preview's bridge"
+                    f"ui_bridge_url points at the runner/supervisor's own UI (port "
+                    f"{bridge.port} on this machine); D7 must check the site's PREVIEW "
+                    "page, through the preview's bridge"
                 )
         if self.preview_url and urlparse(self.preview_url).scheme not in ("http", "https"):
             raise ValueError(f"preview_url must be an http(s) URL, got '{self.preview_url}'")

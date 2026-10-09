@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import posixpath
 import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from PIL import Image
@@ -94,16 +96,38 @@ variants: {variants}
 
 
 @pytest.fixture(autouse=True)
-def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_network(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
     """Tests never touch the network: provider HTTP is mocked with respx, which
-    intercepts at the httpx transport, so any real socket connect is a bug."""
+    intercepts at the httpx transport, so any real socket connect is a bug.
+    A test marked ``local_http`` may connect to the loopback address only (to a
+    server the test itself started)."""
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_create = socket.create_connection
+    loopback_ok = request.node.get_closest_marker("local_http") is not None
 
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("tests must not open network connections")
+    def allowed(address: object) -> bool:
+        host = address[0] if isinstance(address, tuple) and address else None
+        return loopback_ok and host in ("127.0.0.1", "::1", "localhost")
 
-    monkeypatch.setattr(socket.socket, "connect", refuse)
-    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
-    monkeypatch.setattr(socket, "create_connection", refuse)
+    def connect(self: socket.socket, address: object) -> None:
+        if not allowed(address):
+            raise RuntimeError("tests must not open network connections")
+        real_connect(self, address)  # type: ignore[arg-type]
+
+    def connect_ex(self: socket.socket, address: object) -> int:
+        if not allowed(address):
+            raise RuntimeError("tests must not open network connections")
+        return real_connect_ex(self, address)  # type: ignore[arg-type]
+
+    def create_connection(address: object, *args: object, **kwargs: object) -> socket.socket:
+        if not allowed(address):
+            raise RuntimeError("tests must not open network connections")
+        return real_create(address, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket, "create_connection", create_connection)
 
 
 def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:
@@ -166,12 +190,30 @@ def _async_fakes(adapters: AdapterSet) -> AdapterSet:
     return adapters
 
 
+def browser_href(url: str) -> str:
+    """What a browser reports as ``location.href`` for ``url`` (the WHATWG
+    serialisation, for the parts that matter here): lowercase scheme and host,
+    the default port dropped, dot segments resolved, an empty path as ``/``."""
+    p = urlsplit(url)
+    scheme = p.scheme.lower()
+    host = (p.hostname or "").lower()
+    port = p.port
+    if port is not None and port != {"http": 80, "https": 443}.get(scheme):
+        host = f"{host}:{port}"
+    path = p.path or "/"
+    norm = posixpath.normpath(path)
+    if path.endswith("/") and norm != "/":
+        norm += "/"
+    return urlunsplit((scheme, host, norm, p.query, p.fragment))
+
+
 class FakeBridge:
     """A fake UI Bridge in front of one site's preview server. ``navigate``
-    "loads" a URL; ``snapshot`` reports that URL as ``page.url`` and one media
-    element per file the preview manifest lists, with ``naturalWidth`` taken
-    from actually decoding the file in the preview dir (0 when it does not
-    decode) — so a broken preview image really fails D7's image check."""
+    "loads" a URL and reports it browser-normalised as ``page.url``;
+    ``snapshot`` lists one media element per file the preview manifest names,
+    with ``src`` carrying the manifest's ``?sha=`` cache-buster (as a site
+    template does) and ``naturalWidth`` from actually decoding the file in the
+    preview dir (0 when it does not decode)."""
 
     def __init__(self, preview: FakePreview, site: str) -> None:
         self.preview = preview
@@ -180,8 +222,9 @@ class FakeBridge:
 
     def navigate(self, url: str) -> None:
         self.preview.navigated.append(url)
-        if url.startswith(f"http://preview.test/{self.site}/") and not self.preview.ignore_navigate:
-            self.url = url
+        href = browser_href(url)
+        if href.startswith(f"http://preview.test/{self.site}") and not self.preview.ignore_navigate:
+            self.url = href
 
     def snapshot(self) -> dict[str, object]:
         site_dir = self.preview.previews / self.site
@@ -190,7 +233,7 @@ class FakeBridge:
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text())
             for entry in manifest.get("slots", {}).values():
-                for name in entry.get("files", {}).values():
+                for fmt, name in entry.get("files", {}).items():
                     width = 0
                     try:
                         with Image.open(site_dir / name) as img:
@@ -198,12 +241,13 @@ class FakeBridge:
                             width = img.width
                     except (OSError, ValueError):
                         width = 0
+                    sha = entry.get("sha256", {}).get(fmt, "")
                     elements.append(
                         {
                             "id": f"img-{name}",
                             "category": "media",
                             "mediaMetadata": {
-                                "src": f"http://preview.test/{self.site}/{name}",
+                                "src": f"/{self.site}/{name}?sha={sha}",
                                 "naturalWidth": width,
                                 "loadingState": "loaded" if width else "error",
                             },
@@ -230,8 +274,9 @@ class FakePreview:
         self.stale_url: dict[str, str] = {}
 
     def fetch(self, url: str) -> bytes:
-        site = url.removeprefix("http://preview.test/").split("/", 1)[0]
-        return (self.previews / site / "studio-manifest.json").read_bytes()
+        """The preview server: serves any file of a site's preview dir."""
+        site, _, name = urlsplit(url).path.lstrip("/").partition("/")
+        return (self.previews / site / name).read_bytes()
 
     def bridge(self, base_url: str) -> FakeBridge:
         site = base_url.removeprefix("http://preview.test/").split("/", 1)[0]
