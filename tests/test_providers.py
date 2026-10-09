@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from qontinui_studio.adapters import build_adapter, build_adapters
+from qontinui_studio.errors import AdapterDisabledError, ConfigError
+from qontinui_studio.providers import ProviderInventory, SourcedVerdict, load_providers
+
+REPO = Path(__file__).resolve().parent.parent
+
+REQUIRED = {
+    "gemini",
+    "openai",
+    "bing",
+    "leonardo",
+    "ideogram",
+    "firefly",
+    "runway",
+    "pika",
+    "luma",
+    "kling",
+}
+
+
+def test_shipped_inventory_covers_every_provider_with_sourced_verdicts() -> None:
+    inv = load_providers(REPO / "providers.yaml")
+    assert inv.operator_accounts_owed is True
+    assert REQUIRED <= {p.id for p in inv.providers}
+    for p in inv.providers:
+        for verdict in (p.automation_allowed, p.commercial_use, p.api_available):
+            assert verdict.value in ("yes", "no", "unknown")
+            if verdict.value != "unknown":
+                assert verdict.source and verdict.source.startswith("https://")
+        assert p.tos_reviewed is not None
+        assert p.sources
+
+
+def test_d4_unknown_or_no_automation_keeps_the_adapter_off() -> None:
+    inv = load_providers(REPO / "providers.yaml")
+    for p in inv.providers:
+        if p.automation_allowed.value != "yes":
+            assert p.adapter_gate() is not None, p.id
+            with pytest.raises(AdapterDisabledError):
+                build_adapter(p)
+
+
+def test_no_gui_adapter_is_shipped() -> None:
+    """Every no-API provider's terms forbid (or do not confirm) UI automation,
+    so the honest D4 outcome is that no GUI-automation adapter exists."""
+    inv = load_providers(REPO / "providers.yaml")
+    for p in inv.providers:
+        if p.api_available.value != "yes":
+            assert p.adapter == "none", p.id
+            assert p.automation_allowed.value in ("no", "unknown"), p.id
+
+
+def test_billed_apis_are_not_scheduled_without_an_operator_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inv = load_providers(REPO / "providers.yaml")
+    for pid in ("gemini", "openai"):
+        p = inv.get(pid)
+        assert p.adapter_gate() is None
+        assert p.schedulable_reason() is not None
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    built = build_adapters(inv)
+    assert not built.adapters
+    assert "env var GEMINI_API_KEY is unset" in built.unavailable["gemini"]
+    assert "automation_allowed is 'no'" in built.unavailable["bing"]
+
+
+def test_one_account_per_provider_is_enforced() -> None:
+    row = {
+        "id": "x",
+        "provider": "X",
+        "plan": "free",
+        "api_available": {"value": "unknown"},
+        "automation_allowed": {"value": "unknown"},
+        "commercial_use": {"value": "unknown"},
+        "watermark": "none",
+    }
+    with pytest.raises(ValueError, match="one account per provider"):
+        ProviderInventory.model_validate(
+            {"note": "n", "operator_accounts_owed": True, "providers": [row, row]}
+        )
+
+
+def test_a_yes_needs_a_source_and_bare_yaml_bools_coerce() -> None:
+    with pytest.raises(ValueError, match="cite a source"):
+        SourcedVerdict(value="yes")
+    assert SourcedVerdict.model_validate({"value": True, "source": "https://x"}).value == "yes"
+    assert SourcedVerdict.model_validate({"value": False, "source": "https://x"}).value == "no"
+
+
+def test_malformed_file_is_a_config_error(tmp_path: Path) -> None:
+    bad = tmp_path / "providers.yaml"
+    bad.write_text("note: n\nproviders: [{id: Bad Id}]\n")
+    with pytest.raises(ConfigError):
+        load_providers(bad)

@@ -1,0 +1,19 @@
+# Demo/template site (plan Phase 4 slate item 5). AI imagery here is labelled
+# illustrative (D6). publish_dir points at local state until the template repo exists.
+id: cafe-template
+name: Café template
+kind: demo
+commercial: false
+publish_dir: ../.studio/sites/cafe-template
+illustrative_label: Illustrative image (AI-generated)
+slots:
+  hero:
+    width: 1600
+    height: 900
+    category: decorative
+    formats: [webp, avif]
+  og:
+    width: 1200
+    height: 630
+    category: decorative
+    formats: [png]

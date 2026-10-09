@@ -1,0 +1,12 @@
+id: barber-template
+name: Barber template
+kind: demo
+commercial: false
+publish_dir: ../.studio/sites/barber-template
+illustrative_label: Illustrative image (AI-generated)
+slots:
+  hero:
+    width: 1440
+    height: 1080
+    category: decorative
+    formats: [webp, avif]

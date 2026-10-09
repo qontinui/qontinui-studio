@@ -1,0 +1,66 @@
+[tool.poetry]
+name = "qontinui-studio"
+version = "0.1.0"
+description = "Asset pipeline for products shipped by the Qontinui software factory (a client of the factory, not part of it)"
+authors = ["Joshua Spinak <jspinak@alum.mit.edu>"]
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/qontinui/qontinui-studio"
+packages = [{include = "qontinui_studio", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.15"
+pydantic = "^2.11"
+pyyaml = "^6.0"
+click = "^8.1"
+httpx = "^0.28"
+pillow = "^12"
+google-genai = "^1.0"
+# Optional [bg] extra: background removal. Absent -> BackgroundRemovalUnavailable.
+rembg = { version = "^2.0", optional = true }
+
+[tool.poetry.extras]
+bg = ["rembg"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+respx = "^0.22"
+ruff = "^0.14"
+mypy = "^1.18"
+types-pyyaml = "^6.0"
+
+[tool.poetry.scripts]
+studio = "qontinui_studio.cli:run"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["qontinui_studio"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+explicit_package_bases = true
+packages = ["qontinui_studio"]
+
+[[tool.mypy.overrides]]
+module = ["rembg"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-q"]

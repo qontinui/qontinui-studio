@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-ansi
+
+      - name: Ruff (lint)
+        run: poetry run ruff check .
+
+      - name: Ruff (format)
+        run: poetry run ruff format --check .
+
+      - name: Mypy
+        run: poetry run mypy
+
+      - name: Pytest
+        run: poetry run pytest
+
+      # The plan's Phase 2 arming gate: the shipped inventory must keep every
+      # unconfirmed or automation-forbidding provider OFF, and the D5 refusal
+      # must hold. Both are pytest cases above; this step makes the inventory
+      # itself fail CI if it stops loading.
+      - name: Provider inventory loads
+        run: poetry run studio providers list

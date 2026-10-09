@@ -1,0 +1,18 @@
+# One brief -> slot-cropped heroes for two template sites (plan Phase 2 acceptance).
+id: template-hero-interior
+purpose: Decorative hero image for the café and barber template sites
+targets:
+  - site: cafe-template
+    slot: hero
+  - site: barber-template
+    slot: hero
+  - campaign: templates-launch
+aspect_ratio: "16:9"
+prompt: >-
+  An inviting, empty small-business interior in the morning: wooden counter,
+  plants, warm light through a large window, shallow depth of field.
+negative_prompt: text, logos, people, watermarks
+style_guide: ../style/warm-minimal.md
+reference_images: []
+provider_preference: [gemini, openai]
+variants: 2
