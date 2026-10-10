@@ -32,8 +32,9 @@ first adapter, and HyperFrames is the tested, opt-in second adapter.
 | --- | --- |
 | `src/adapters/hyperframes/frame-adapter.tsx` | A HyperFrames `FrameAdapter` (type from `@hyperframes/core`). `seekFrame(f)` renders `<SceneRoot key={f} frame={f}/>` inside `flushSync`. |
 | `src/adapters/hyperframes/page.tsx` | The browser entry. It reads the embedded render config, loads the bundled Inter and draws frame 0, and only then registers the adapter with the HyperFrames runtime. It also has a playback clock for `<hyperframes-player>`. |
-| `src/adapters/hyperframes/project.ts` | Writes a self-contained HyperFrames project: `index.html`, `studio-scene.js` (`page.tsx` bundled by esbuild) and `fonts/`. |
-| `src/adapters/hyperframes/render.ts` | `HyperFramesAdapter implements EngineAdapter` (`render`, `renderStills`, `close`). It runs the pinned image with `docker run --network none`. |
+| `src/adapters/hyperframes/project.ts` | Writes a self-contained HyperFrames project: `index.html`, `studio-scene.js` (`page.tsx` bundled by esbuild) and `fonts/`. Like every render path, it refuses a replay without build-record provenance. |
+| `src/adapters/hyperframes/render.ts` | `HyperFramesAdapter implements EngineAdapter` (`render`, `renderStills`, `close`). It runs the pinned image by id in a hardened, limited container with no network. |
+| `src/adapters/hyperframes/image.ts`, `scripts/hyperframes-image.ts` | Image identity: the inputs-hash label, the reference check and the labelled build (`pnpm hyperframes:image`). |
 | `docker/hyperframes/` | The pinned render image: `Dockerfile`, `package.json`, `package-lock.json`. |
 | `src/cli/main.ts` | `--engine remotion\|hyperframes` (default `remotion`). The adapter is loaded by dynamic `import()`, as before. |
 | `tests/golden/hyperframes.test.ts` | Determinism test, opt-in: `pnpm test:hyperframes` (`HYPERFRAMES=1`). |
@@ -237,17 +238,50 @@ fixed when the composition is built (see D7 finding 1).
 | `@hyperframes/core`, `@hyperframes/player` | **0.8.78**, exact `devDependencies` | `core` provides the `FrameAdapter` type (erased at build). `player` is used by the static embed check and by the graph test's live control. |
 | Base image | `node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392` | Upstream uses the floating tag. |
 | Debian packages | `snapshot.debian.org` at `20260925T000000Z` (ffmpeg 5.1.9, fontconfig, the Chrome libraries) | Upstream uses the live mirror. |
-| Browser | chrome-headless-shell **149.0.7790.0** (Chrome for Testing) | The same Chromium version `@remotion/renderer` 4.0.529 pins (`TESTED_VERSION`), so engine differences are not browser differences. Upstream uses `@stable`. |
+| Browser | chrome-headless-shell **149.0.7790.0** (Chrome for Testing), downloaded from the official CfT URL and checked at build against the committed SHA-256 `a3b011ab4c726e215cdeb623907a09cfb48f07054a7271fdda555ee2ae4f804d` | The same Chromium version `@remotion/renderer` 4.0.529 pins (`TESTED_VERSION`), so engine differences are not browser differences. Upstream uses `@stable`, unverified. The hash was computed on 2026-10-11 from the official URL, before install; the zip's MD5 matched the bucket's own `x-goog-hash`. |
 | npm tree | `npm ci` from the committed lockfile | Upstream runs `npm install -g hyperframes@<v>`, which floats every transitive dependency. |
-| Built image | `studio-hyperframes:0.8.78`, id `sha256:bf9b3f51ca8a4bc382086dc6e78412a5ab40e9705893b49b89b0e047858681c1` (config `sha256:132bc0162f2bc923af8bdaa4b41bd3552f3b8949ef6f7fdf80c6b155ccd4e17c`), 465 MB | The image every measurement here used. |
+| Built image | `studio-hyperframes:0.8.78`, id `sha256:16504aeff3cc923b638846cd62b6303cb3c7066c7f9418b87e1235579fb64b88`, label `org.qontinui.studio.inputs-sha256=b6a3f59db3737f998bebde56627df55ede5d6f1e59d31bdc4ced43d967f36db6`, user `studio`, 467 MB | The current image (after review fixes). The spike's measurements used the first build, `sha256:bf9b3f51ca8a4bc382086dc6e78412a5ab40e9705893b49b89b0e047858681c1`. Its Chrome came from `@puppeteer/browsers` at the same version, without a hash check. The current image reproduces that build's 426 frames byte for byte. |
 
 **About "the pinned Docker image".** HyperFrames publishes no render image.
 `hyperframes render --docker` builds `hyperframes-renderer:<version>` locally
 from `packages/cli/src/docker/Dockerfile.render`, which pins neither the base
 image, the browser (`chrome-headless-shell@stable`), the apt packages nor the
 transitive npm tree. So two people running "the same version" on different
-days get different images. `docker/hyperframes/Dockerfile` pins every one of
-those inputs.
+days get different images. `docker/hyperframes/Dockerfile` pins each of those
+inputs by version or digest, and checks it by hash:
+- the base image by digest;
+- apt packages from a dated snapshot, through Debian's signed Release files;
+- Chrome against a committed SHA-256;
+- npm through the lockfile's `integrity` hashes.
+
+**Image identity.** `pnpm hyperframes:image` (`scripts/hyperframes-image.ts`)
+labels the image with a SHA-256 of `docker/hyperframes/{Dockerfile,
+package.json, package-lock.json}` (`src/adapters/hyperframes/image.ts`). The
+adapter checks the image before every render:
+- it recomputes that hash and refuses an image whose label differs, or that
+  has none, with a hint to rebuild;
+- it then runs the image by its resolved `sha256:` id, not by its tag;
+- `STUDIO_HYPERFRAMES_IMAGE` must match an image-reference pattern, and a
+  value starting with `-` is refused.
+
+**Container.** Each render runs in its own container:
+- **Name:** a unique `--name studio-hf-<random>`. On timeout the adapter runs
+  `docker kill <name>` before killing the client, and `close()` kills
+  in-flight containers. Verified with a 4 s timeout: the render was refused
+  and no `studio-hf-*` container was left.
+- **Isolation:** `--network none`, `--read-only` with a tmpfs `/tmp` (the only
+  path HyperFrames and Chrome write besides `/dev/shm` and `/output`),
+  `--cap-drop=ALL` and `--security-opt no-new-privileges`. The image's default
+  user is `studio`; the adapter runs as the caller's uid:gid so the output
+  files belong to the caller.
+- **Limits:** `--pids-limit` 8192, `--memory` 8g and `--cpus` 8, overridable
+  by `STUDIO_HF_PIDS_LIMIT`, `STUDIO_HF_MEMORY` and `STUDIO_HF_CPUS`, which
+  are validated.
+- **Mounts:** `--mount type=bind,…`, not `-v`. A host path containing a comma,
+  quote or newline is refused, because docker's `--mount` cannot take one
+  safely. `:` is safe there.
+
+The gated test passes 9/9 under these settings, byte-identical.
 
 The built image id is local, because a rebuild elsewhere produces a different
 id. Pinning by a digest that CI can pull needs the image published to a
@@ -257,9 +291,15 @@ existing CI jobs are unchanged.
 
 ## Licence and telemetry
 
-- **Licence.** HyperFrames is Apache-2.0: the repository's `LICENSE`, and the
-  `license` field of `hyperframes`, `@hyperframes/core` and `@hyperframes/player`
-  on npm. It is compatible with the MIT studio and with AGPL-3.0 qontinui-web,
+- **Licence.** HyperFrames is Apache-2.0. Each package states it differently:
+  - the repository's `LICENSE`;
+  - `@hyperframes/core` and `@hyperframes/player` ship a `LICENSE` file
+    (Apache-2.0) in their npm tarballs, but **have no `license` field** in
+    their package.json;
+  - the `hyperframes` CLI declares `"license": "Apache-2.0"` but its tarball
+    **ships no LICENSE file**.
+
+  It is compatible with the MIT studio and with AGPL-3.0 qontinui-web,
   and needs no §7 additional permission. Distribution must keep the licence
   and any NOTICE.
 - **CLI telemetry.**
@@ -350,12 +390,20 @@ backward compatibility are not factors.
 
 - `pnpm typecheck`, `pnpm lint`: clean.
 - `pnpm lint:selftest`: 91/91 fixtures (12 new HyperFrames fixtures).
-- `pnpm test`: 112 tests, including 2 new CLI refusals and the graph test's
-  HyperFrames control.
+- `pnpm test`: 123 tests. They include 2 new CLI refusals, the graph test's
+  HyperFrames control, and 11 Docker-free adapter refusals
+  (`tests/unit/hyperframes-adapter.test.ts`):
+  - `render` and `renderStills` each refuse a hand-written replay, scale 0.5,
+    and an existing target;
+  - `writeProject` refuses a hand-written replay;
+  - empty stills return `[]`;
+  - image references and bind-mount paths are validated.
 - `pnpm test:graph`: 34 tests.
 - `pnpm test:golden`: the existing Remotion suite, unchanged and green (51 passed, 9 skipped, 196 s). The
   HyperFrames file is skipped there unless `HYPERFRAMES=1`.
-- `pnpm test:hyperframes`: 9/9 in 127 s. With the remount removed, 7/9 fail.
+- `pnpm test:hyperframes`: 9/9 in 127 s, and 9/9 in 179 s and 181 s after the review
+  fixes (hardened container, explicit 4 workers against 1). With the remount
+  removed, 7/9 fail.
 
 ## Reproducing
 

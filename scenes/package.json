@@ -23,7 +23,7 @@
     "browser:ensure": "tsx scripts/ensure-browser.ts",
     "lint:selftest": "tsx scripts/lint-selftest.ts",
     "test:graph": "vitest run --config vitest.config.ts tests/unit/engine-graph.test.ts",
-    "hyperframes:image": "docker build --platform linux/amd64 -t studio-hyperframes:0.8.78 docker/hyperframes",
+    "hyperframes:image": "tsx scripts/hyperframes-image.ts",
     "test:hyperframes": "HYPERFRAMES=1 vitest run --config vitest.golden.config.ts tests/golden/hyperframes.test.ts"
   },
   "dependencies": {

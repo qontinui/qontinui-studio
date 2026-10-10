@@ -6,8 +6,9 @@
  *
  * - Run to run: two full png-sequence renders of S1 (16:9, 426 frames) are
  *   byte-identical, frame by frame.
- * - Worker count: a single-worker render equals the default (multi-worker)
- *   one, so no frame depends on which frames its worker drew before it.
+ * - Worker count: a single-worker render equals a 4-worker one (explicit, so
+ *   a small machine cannot end up comparing 1 worker with 1), so no frame
+ *   depends on which frames its worker drew before it.
  * - Order: the five golden frame indices rendered as stills in suite order, in
  *   reversed order, and each ALONE in a fresh container equal the same frames
  *   of the full sequence.
@@ -48,8 +49,9 @@ describe.skipIf(!ENABLED)("HyperFrames adapter: S1 determinism", () => {
       (await adapter.render({ scene: SCENE_ID, trace, format: "png", aspect: "16:9", outPath: path.join(HF_OUT, dir) }))
         .files;
     const adapter = new HyperFramesAdapter();
-    first = await sequence(adapter, "seq-1");
-    second = await sequence(adapter, "seq-2");
+    const fourWorkers = new HyperFramesAdapter({ workers: 4 });
+    first = await sequence(fourWorkers, "seq-1");
+    second = await sequence(fourWorkers, "seq-2");
     oneWorker = await sequence(new HyperFramesAdapter({ workers: 1 }), "seq-w1");
 
     const still = (frames: readonly number[], dir: string) =>
@@ -78,7 +80,7 @@ describe.skipIf(!ENABLED)("HyperFrames adapter: S1 determinism", () => {
 
   it("does not depend on the worker count (render history)", () => {
     const differing = first.filter((file, i) => sha256(file) !== sha256(oneWorker[i] as string));
-    expect(differing, "frames that differ between a multi-worker and a single-worker render").toEqual([]);
+    expect(differing, "frames that differ between a 4-worker and a single-worker render").toEqual([]);
   });
 
   it.each(FRAMES.map((f) => [f]))("frame %i: suite order, reversed order and alone all equal the sequence", (frame) => {

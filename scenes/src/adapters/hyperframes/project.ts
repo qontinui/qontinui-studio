@@ -16,6 +16,7 @@ import { build } from "esbuild";
 
 import { ASPECT_SIZES, STUDIO_FPS, type Aspect } from "../../api/layout";
 import { fontFiles } from "../../api/typography";
+import { assertRenderable } from "../../api/trace/provenance";
 import type { SceneTrace } from "../../api/trace/schema";
 import { STUDIO_CONFIG_ELEMENT_ID, type StudioPageConfig } from "./page-config";
 
@@ -68,7 +69,13 @@ function scriptJson(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
 }
 
+/**
+ * Writes a playable composition, so it is a render path: a replay without
+ * build-record provenance is refused here too (plan D2), not only by the
+ * adapter that calls it.
+ */
 export async function writeProject(dir: string, spec: ProjectSpec): Promise<void> {
+  assertRenderable(spec.trace);
   const { width, height } = ASPECT_SIZES[spec.aspect];
   const fps = spec.fps ?? STUDIO_FPS;
   const config: StudioPageConfig = {
