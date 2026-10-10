@@ -4,11 +4,11 @@
  * does not exist, so reaching docker would fail with ENOENT instead of the
  * refusal asserted here.
  */
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import { imageRefProblem } from "../../src/adapters/hyperframes/image";
 import { writeProject } from "../../src/adapters/hyperframes/project";
@@ -22,7 +22,24 @@ const adapter = () => new HyperFramesAdapter({ docker: NO_DOCKER, image: "studio
 const s1 = () => parseTrace(s1TraceJson());
 /** Shape-valid, but hand-written: no build-record provenance. */
 const handWrittenReplay = () => parseTrace(replayTraceJson());
-const tmp = () => mkdtempSync(path.join(tmpdir(), "studio-hf-unit-"));
+/** Directories and files these tests created; afterAll removes exactly these. */
+const createdDirs: string[] = [];
+const createdFiles: string[] = [];
+const tmp = () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "studio-hf-unit-"));
+  createdDirs.push(dir);
+  return dir;
+};
+const writeTestFile = (file: string) => {
+  writeFileSync(file, "keep me");
+  createdFiles.push(file);
+};
+
+afterAll(() => {
+  for (const file of createdFiles) unlinkSync(file);
+  // Each directory must now be empty: a refusal that wrote anything fails here.
+  for (const dir of createdDirs) rmdirSync(dir);
+});
 
 describe("HyperFramesAdapter.render refusals (no Docker)", () => {
   it("refuses a hand-written replay", async () => {
@@ -41,7 +58,7 @@ describe("HyperFramesAdapter.render refusals (no Docker)", () => {
 
   it("refuses an existing target without overwrite", async () => {
     const out = path.join(tmp(), "x.mp4");
-    writeFileSync(out, "keep me");
+    writeTestFile(out);
     await expect(
       adapter().render({ scene: "s1-plan-lifecycle", trace: s1(), format: "mp4", aspect: "16:9", outPath: out }),
     ).rejects.toThrow(/refusing to overwrite .*x\.mp4: it exists/);
@@ -69,7 +86,7 @@ describe("HyperFramesAdapter.renderStills refusals (no Docker)", () => {
 
   it("refuses an existing target without overwrite", async () => {
     const dir = tmp();
-    writeFileSync(path.join(dir, "f0196.png"), "keep me");
+    writeTestFile(path.join(dir, "f0196.png"));
     await expect(stills(dir)).rejects.toThrow(/refusing to overwrite .*f0196\.png: it exists/);
   });
 

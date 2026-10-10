@@ -29,14 +29,17 @@
 # adapter also runs the container with `--network none`.
 #
 # Identity: `pnpm hyperframes:image` (scripts/hyperframes-image.ts) passes
-# STUDIO_INPUTS_SHA256, a hash of this Dockerfile, package.json and
-# package-lock.json, and it lands in a LABEL. The adapter refuses an image whose
+# STUDIO_INPUTS_SHA256, a hash of this Dockerfile, package.json,
+# package-lock.json and studio-hf-render.sh, and it lands in a LABEL. The adapter refuses an image whose
 # label does not match the checked-in files, then runs it by its sha256: id.
 #
 # Runtime user: `studio` (uid 10001). The adapter overrides it with the
 # caller's uid:gid so the frames it writes are the caller's, and runs the
 # container read-only with a tmpfs /tmp, all capabilities dropped and
 # no-new-privileges.
+#
+# Entry point: studio-hf-render.sh renders into the container's tmpfs and
+# copies only the finished artifact to /output (see that script).
 FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
 
 ARG DEBIAN_SNAPSHOT=20260925T000000Z
@@ -69,11 +72,9 @@ RUN curl -fsSL --retry 5 -o /tmp/chs.zip \
 WORKDIR /opt/hyperframes
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund \
-    && printf '#!/bin/sh\nexport PRODUCER_HEADLESS_SHELL_PATH=%s\nexport PUPPETEER_EXECUTABLE_PATH=%s\nexec /opt/hyperframes/node_modules/.bin/hyperframes render "$@"\n' \
-      /opt/chrome/chrome-headless-shell-linux64/chrome-headless-shell /opt/chrome/chrome-headless-shell-linux64/chrome-headless-shell > /usr/local/bin/hf-render \
-    && chmod +x /usr/local/bin/hf-render \
     && /opt/hyperframes/node_modules/.bin/hyperframes --version \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin studio
+COPY --chmod=0755 studio-hf-render.sh /usr/local/bin/studio-hf-render
 
 LABEL org.qontinui.studio.inputs-sha256="${STUDIO_INPUTS_SHA256}" \
       org.qontinui.studio.hyperframes-version="0.8.78" \
@@ -81,4 +82,4 @@ LABEL org.qontinui.studio.inputs-sha256="${STUDIO_INPUTS_SHA256}" \
 
 USER studio
 WORKDIR /project
-ENTRYPOINT ["hf-render"]
+ENTRYPOINT ["studio-hf-render"]

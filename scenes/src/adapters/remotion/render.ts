@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { bundle } from "@remotion/bundler";
 import {
   ensureBrowser,
+  makeCancelSignal,
   openBrowser,
   renderFrames,
   renderMedia,
@@ -114,8 +115,18 @@ async function launchBrowser(logLevel: LogLevel): Promise<HeadlessBrowser> {
   await ensureBrowser({ logLevel });
   const previous = process.env.FONTCONFIG_FILE;
   process.env.FONTCONFIG_FILE = FONTCONFIG_FILE;
+  const sigintBefore = new Set(process.listeners("SIGINT"));
   try {
-    return await openBrowser("chrome", { chromiumOptions: CHROMIUM_OPTIONS, logLevel });
+    const browser = await openBrowser("chrome", { chromiumOptions: CHROMIUM_OPTIONS, logLevel });
+    // Remotion's launcher adds a SIGINT listener that kills Chrome and calls
+    // process.exit(130) at once, which would skip the caller's cleanup (the
+    // CLI's interrupt handler closes this adapter and lets the render unwind
+    // through its staging cleanup). Remove only the listeners added by this
+    // launch; Remotion's 'exit' listener, which kills Chrome, stays.
+    for (const listener of process.listeners("SIGINT")) {
+      if (!sigintBefore.has(listener)) process.off("SIGINT", listener);
+    }
+    return browser;
   } finally {
     if (previous === undefined) delete process.env.FONTCONFIG_FILE;
     else process.env.FONTCONFIG_FILE = previous;
@@ -128,6 +139,9 @@ export class RemotionAdapter implements EngineAdapter {
   private serveUrl: Promise<string> | null;
   private browser: Promise<HeadlessBrowser> | null = null;
   private port: Promise<number>;
+  /** Cancels in-flight renders when close() is called mid-render (e.g. on Ctrl-C). */
+  private readonly cancel = makeCancelSignal();
+  private inFlight = 0;
 
   constructor(options: RemotionAdapterOptions = {}) {
     this.logLevel = options.logLevel ?? "error";
@@ -141,12 +155,17 @@ export class RemotionAdapter implements EngineAdapter {
    * pick a fresh free port and retry once. Nothing else is retried.
    */
   private async onPort<T>(call: (port: number) => Promise<T>): Promise<T> {
+    this.inFlight++;
     try {
-      return await call(await this.port);
-    } catch (err) {
-      if (!(err instanceof Error) || !PORT_CONTENTION.test(err.message)) throw err;
-      this.port = freePort();
-      return call(await this.port);
+      try {
+        return await call(await this.port);
+      } catch (err) {
+        if (!(err instanceof Error) || !PORT_CONTENTION.test(err.message)) throw err;
+        this.port = freePort();
+        return await call(await this.port);
+      }
+    } finally {
+      this.inFlight--;
     }
   }
 
@@ -206,6 +225,7 @@ export class RemotionAdapter implements EngineAdapter {
     );
     const scale = request.scale ?? 1;
     const common = {
+      cancelSignal: this.cancel.cancelSignal,
       serveUrl,
       composition,
       inputProps,
@@ -276,6 +296,7 @@ export class RemotionAdapter implements EngineAdapter {
         const staged = path.join(staging, `f${frame}.png`);
         await this.onPort((port) => renderStill({
           port,
+          cancelSignal: this.cancel.cancelSignal,
           serveUrl,
           composition,
           inputProps,
@@ -294,6 +315,9 @@ export class RemotionAdapter implements EngineAdapter {
   }
 
   async close(): Promise<void> {
+    // Mid-render (an interrupt): cancel the render so it rejects and its
+    // staging cleanup runs, instead of hanging on a closed browser.
+    if (this.inFlight > 0) this.cancel.cancel();
     if (this.browser) {
       const browser = await this.browser;
       this.browser = null;

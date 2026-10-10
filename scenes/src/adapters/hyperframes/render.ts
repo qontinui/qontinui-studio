@@ -15,8 +15,18 @@
  * - the result is published through ../output.ts (nothing is deleted that
  *   this adapter did not write, and nothing recursively).
  *
- * Each container gets a unique name, so a timed-out render is stopped with
- * `docker kill <name>`; killing only the docker client would leave it running.
+ * Each container gets a unique name. A timed-out render is stopped with
+ * `docker kill <name>` (killing only the docker client would leave it
+ * running). The container is made with `docker create` and run with
+ * `docker start --attach`, so a timeout never lands mid-create, and once the
+ * client has exited `docker rm -fv <name>` removes whatever is left (a no-op
+ * after `--rm`).
+ *
+ * The image renders into its own tmpfs and copies only the finished artifact
+ * into the staging directory (docker/hyperframes/studio-hf-render.sh), so a
+ * failed or interrupted render leaves at most `<name>` or `.partial-<name>`
+ * there: a file, or a directory of plain files. cleanContainerOutput removes
+ * exactly those, one level deep.
  *
  * Scenes are the same components the Remotion adapter renders, through the
  * same `SceneRoot` (./frame-adapter.tsx). No scene or primitive knows which
@@ -32,7 +42,7 @@
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, readdir, rename, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, rename, rmdir, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -51,6 +61,8 @@ import { PACKAGE_ROOT, writeProject, type ProjectSpec } from "./project";
 export { DEFAULT_HYPERFRAMES_IMAGE } from "./image";
 const FONTCONFIG_DIR = path.join(PACKAGE_ROOT, "fontconfig");
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
+/** `docker create` returns in seconds; this only bounds a hung daemon. */
+const CREATE_TIMEOUT_MS = 5 * 60_000;
 
 /** Container limits; each can be overridden by its environment variable. */
 const LIMITS = {
@@ -147,6 +159,31 @@ export function bindMount(src: string, dst: string, readonly: boolean): string {
   return `type=bind,src=${src},dst=${dst}${readonly ? ",readonly" : ""}`;
 }
 
+/**
+ * After a failed render: remove what studio-hf-render.sh can have left in
+ * `outputDir` for `name` — `<name>` and `.partial-<name>`, each a plain file
+ * or a directory holding only plain files. Anything else is left, with a note.
+ */
+async function cleanContainerOutput(outputDir: string, name: string): Promise<void> {
+  for (const entry of [name, `.partial-${name}`]) {
+    const target = path.join(outputDir, entry);
+    const st = await lstat(target).catch(() => null);
+    if (!st) continue;
+    if (st.isFile()) {
+      await unlink(target);
+      continue;
+    }
+    if (!st.isDirectory()) {
+      process.stderr.write(`note: left ${target} (not a file or directory)\n`);
+      continue;
+    }
+    for (const child of await readdir(target, { withFileTypes: true })) {
+      if (child.isFile()) await unlink(path.join(target, child.name));
+    }
+    await rmdir(target).catch(() => process.stderr.write(`note: left ${target} (not empty)\n`));
+  }
+}
+
 /** Remove exactly the files ./project.ts wrote, then the (empty) directories. */
 async function removeProject(dir: string): Promise<void> {
   for (const { file } of fontFiles) await unlink(path.join(dir, file)).catch(() => undefined);
@@ -187,6 +224,8 @@ export class HyperFramesAdapter implements EngineAdapter {
   private readonly timeoutMs: number;
   /** Containers started by this adapter and not yet finished. */
   private readonly running = new Set<string>();
+  /** Set by close(): a container created after it is removed, never started. */
+  private closing = false;
 
   constructor(options: HyperFramesAdapterOptions = {}) {
     const image = options.image ?? process.env.STUDIO_HYPERFRAMES_IMAGE ?? DEFAULT_HYPERFRAMES_IMAGE;
@@ -259,6 +298,25 @@ export class HyperFramesAdapter implements EngineAdapter {
   }
 
   /**
+   * `docker rm -fv` (a no-op once `--rm` has removed the container; "No such
+   * container" is ignored). Needed when the client was killed between
+   * create and start, which leaves a created container `--rm` never removes.
+   */
+  private async removeContainer(name: string): Promise<void> {
+    // `--rm`'s own removal can still be in progress (rm then fails with
+    // "removal in progress"), so wait, bounded, until the name is gone.
+    for (let attempt = 0; attempt < 40; attempt++) {
+      await run(this.docker, ["rm", "-fv", "--", name]).catch(() => undefined);
+      const inspected = await run(this.docker, ["container", "inspect", "--format", "{{.State.Status}}", "--", name]).catch(
+        () => null,
+      );
+      if (!inspected || inspected.code !== 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    process.stderr.write(`note: container ${name} could not be removed; run \`docker rm -fv ${name}\`\n`);
+  }
+
+  /**
    * Render `frames` (scene frame per composition frame) of a project into
    * `outputDir` as `<outputName>`; HyperFrames runs at `fps`.
    */
@@ -274,14 +332,16 @@ export class HyperFramesAdapter implements EngineAdapter {
     const outputMount = bindMount(outputDir, "/output", false);
     const projectDir = await mkdtemp(path.join(tmpdir(), "studio-hyperframes-"));
     const name = `studio-hf-${randomBytes(8).toString("hex")}`;
+    let rendered = false;
     try {
       const projectMount = bindMount(projectDir, "/project", true);
       await writeProject(projectDir, spec);
       const uid = process.getuid?.();
       const gid = process.getgid?.();
-      const args = [
-        "run",
+      const createArgs = [
+        "create",
         "--rm",
+        "--init",
         "--name",
         name,
         "--network",
@@ -289,7 +349,7 @@ export class HyperFramesAdapter implements EngineAdapter {
         "--shm-size=2g",
         "--read-only",
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,size=2g",
+        "/tmp:rw,nosuid,nodev,size=4g",
         "--cap-drop=ALL",
         "--security-opt",
         "no-new-privileges",
@@ -315,9 +375,8 @@ export class HyperFramesAdapter implements EngineAdapter {
         "--mount",
         outputMount,
         imageId,
+        outputName,
         "/project",
-        "--output",
-        `/output/${outputName}`,
         "--format",
         format,
         "--fps",
@@ -325,8 +384,18 @@ export class HyperFramesAdapter implements EngineAdapter {
         "--quiet",
         ...(this.workers !== undefined ? ["--workers", String(this.workers)] : []),
       ];
+      // Create, then start attached, as two client calls. A timeout can then
+      // only interrupt `start`, after `create` has completed, so the
+      // container always exists under its name when it is killed and removed.
+      // (Killing a `docker run` client while the daemon was still creating
+      // the container left a created, never-started container behind.)
       this.running.add(name);
-      const result = await run(this.docker, args, {
+      const created = await run(this.docker, createArgs, { timeoutMs: CREATE_TIMEOUT_MS });
+      if (created.timedOut || created.code !== 0) {
+        throw new HyperFramesRenderError(`could not create the HyperFrames container: ${created.output.slice(-2000)}`);
+      }
+      if (this.closing) throw new HyperFramesRenderError("render stopped: the adapter was closed");
+      const result = await run(this.docker, ["start", "--attach", "--", name], {
         log: this.log,
         onTimeout: () => this.killContainer(name),
         timeoutMs: this.timeoutMs,
@@ -337,8 +406,12 @@ export class HyperFramesAdapter implements EngineAdapter {
       if (result.code !== 0) {
         throw new HyperFramesRenderError(`HyperFrames render failed (exit ${result.code}):\n${result.output.slice(-4000)}`);
       }
+      rendered = true;
     } finally {
+      // The client has exited (or never started): nothing writes any more.
+      await this.removeContainer(name);
       this.running.delete(name);
+      if (!rendered) await cleanContainerOutput(outputDir, outputName);
       await removeProject(projectDir);
     }
   }
@@ -412,6 +485,7 @@ export class HyperFramesAdapter implements EngineAdapter {
    * render is in flight (an abort) kills its container.
    */
   async close(): Promise<void> {
-    await Promise.all([...this.running].map((name) => this.killContainer(name)));
+    this.closing = true;
+    await Promise.all([...this.running].map((name) => this.removeContainer(name)));
   }
 }

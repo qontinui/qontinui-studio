@@ -51,6 +51,17 @@ A --trace file must be illustrative; replays come only from --build-record (plan
 
 class UsageError extends Error {}
 
+/** The render was stopped by a signal; the process exits 128 + signal number. */
+class Interrupted extends Error {
+  constructor(readonly signal: NodeJS.Signals) {
+    super(`interrupted by ${signal}`);
+  }
+}
+
+function exitCodeFor(signal: NodeJS.Signals): number {
+  return signal === "SIGTERM" ? 143 : 130;
+}
+
 function requireScene(id: string) {
   if (!scenes[id]) {
     throw new UsageError(`unknown scene "${id}" (known: ${Object.keys(scenes).join(", ")})`);
@@ -179,6 +190,19 @@ async function render(args: string[]) {
   const adapter = await loadAdapter(engine as Engine);
   const outPath = path.resolve(out);
   let lastPct = -1;
+  // Ctrl-C / SIGTERM: stop the engine (adapter.close() kills its browser or
+  // container), let the render unwind so its own cleanup runs (staging and
+  // project directories, exactly as on any other failure), then exit
+  // 130 / 143. A second signal exits at once.
+  let interrupted: NodeJS.Signals | null = null;
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (interrupted) process.exit(exitCodeFor(signal));
+    interrupted = signal;
+    process.stderr.write(`\n${signal}: stopping the render and cleaning up (send it again to exit at once)\n`);
+    void adapter.close().catch(() => undefined);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   try {
     const result = await adapter.render({
       scene: sceneId,
@@ -197,16 +221,22 @@ async function render(args: string[]) {
         }
       },
     });
-    process.stdout.write(
-      `${result.files.length === 1 ? result.files[0] : `${result.files.length} frames in ${outPath}`}\n` +
-        `  ${result.width}x${result.height} @ ${result.fps} fps, ${result.durationInFrames} frames (${trace.meta.mode})\n`,
-    );
+    if (!interrupted) {
+      process.stdout.write(
+        `${result.files.length === 1 ? result.files[0] : `${result.files.length} frames in ${outPath}`}\n` +
+          `  ${result.width}x${result.height} @ ${result.fps} fps, ${result.durationInFrames} frames (${trace.meta.mode})\n`,
+      );
+    }
   } catch (err) {
+    if (interrupted) throw new Interrupted(interrupted);
     if (err instanceof Error && err.name === "OutputRefused") throw new UsageError(`render: ${err.message}`);
     throw err;
   } finally {
     await adapter.close();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
   }
+  if (interrupted) throw new Interrupted(interrupted);
 }
 
 async function validate(args: string[]) {
@@ -251,6 +281,10 @@ async function main(argv: string[]) {
 }
 
 main(process.argv.slice(2)).catch((err: unknown) => {
+  if (err instanceof Interrupted) {
+    process.stderr.write(`${err.message}; cleaned up\n`);
+    process.exit(exitCodeFor(err.signal));
+  }
   if (err instanceof UsageError) {
     process.stderr.write(`${err.message}\n\n${USAGE}\n`);
     process.exit(2);

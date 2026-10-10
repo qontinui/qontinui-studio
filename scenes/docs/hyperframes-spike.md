@@ -240,7 +240,7 @@ fixed when the composition is built (see D7 finding 1).
 | Debian packages | `snapshot.debian.org` at `20260925T000000Z` (ffmpeg 5.1.9, fontconfig, the Chrome libraries) | Upstream uses the live mirror. |
 | Browser | chrome-headless-shell **149.0.7790.0** (Chrome for Testing), downloaded from the official CfT URL and checked at build against the committed SHA-256 `a3b011ab4c726e215cdeb623907a09cfb48f07054a7271fdda555ee2ae4f804d` | The same Chromium version `@remotion/renderer` 4.0.529 pins (`TESTED_VERSION`), so engine differences are not browser differences. Upstream uses `@stable`, unverified. The hash was computed on 2026-10-11 from the official URL, before install; the zip's MD5 matched the bucket's own `x-goog-hash`. |
 | npm tree | `npm ci` from the committed lockfile | Upstream runs `npm install -g hyperframes@<v>`, which floats every transitive dependency. |
-| Built image | `studio-hyperframes:0.8.78`, id `sha256:16504aeff3cc923b638846cd62b6303cb3c7066c7f9418b87e1235579fb64b88`, label `org.qontinui.studio.inputs-sha256=b6a3f59db3737f998bebde56627df55ede5d6f1e59d31bdc4ced43d967f36db6`, user `studio`, 467 MB | The current image (after review fixes). The spike's measurements used the first build, `sha256:bf9b3f51ca8a4bc382086dc6e78412a5ab40e9705893b49b89b0e047858681c1`. Its Chrome came from `@puppeteer/browsers` at the same version, without a hash check. The current image reproduces that build's 426 frames byte for byte. |
+| Built image | `studio-hyperframes:0.8.78`, id `sha256:e9fed5e3d72980f2709a40f0b8653b4d0fbdd647ad53b6edfe43af1e80d4e687`, label `org.qontinui.studio.inputs-sha256=ee27c606d1cabec7bdf1d9b61b34f26ddfce53abb5d00e659f4ce56fb1298262`, user `studio`, entry point `studio-hf-render` | The current image, after two rounds of review fixes. The spike's measurements used the first build, `sha256:bf9b3f51ca8a4bc382086dc6e78412a5ab40e9705893b49b89b0e047858681c1`. Its Chrome came from `@puppeteer/browsers` at the same version, without a hash check. The current image reproduces that build's 426 frames byte for byte. |
 
 **About "the pinned Docker image".** HyperFrames publishes no render image.
 `hyperframes render --docker` builds `hyperframes-renderer:<version>` locally
@@ -256,7 +256,7 @@ inputs by version or digest, and checks it by hash:
 
 **Image identity.** `pnpm hyperframes:image` (`scripts/hyperframes-image.ts`)
 labels the image with a SHA-256 of `docker/hyperframes/{Dockerfile,
-package.json, package-lock.json}` (`src/adapters/hyperframes/image.ts`). The
+package.json, package-lock.json, studio-hf-render.sh}` (`src/adapters/hyperframes/image.ts`). The
 adapter checks the image before every render:
 - it recomputes that hash and refuses an image whose label differs, or that
   has none, with a hint to rebuild;
@@ -265,12 +265,47 @@ adapter checks the image before every render:
   value starting with `-` is refused.
 
 **Container.** Each render runs in its own container:
-- **Name:** a unique `--name studio-hf-<random>`. On timeout the adapter runs
-  `docker kill <name>` before killing the client, and `close()` kills
-  in-flight containers. Verified with a 4 s timeout: the render was refused
-  and no `studio-hf-*` container was left.
-- **Isolation:** `--network none`, `--read-only` with a tmpfs `/tmp` (the only
-  path HyperFrames and Chrome write besides `/dev/shm` and `/output`),
+- **Name and lifecycle:** each render gets a unique `--name studio-hf-<random>`.
+  - It is made by `docker create --rm --init` and run by
+    `docker start --attach` as a separate client call. A timeout can only
+    interrupt `start`, after `create` has completed.
+  - On timeout the adapter runs `docker kill <name>`, then kills the client.
+  - Once the client has exited, `docker rm -fv <name>` runs in a `finally`. It
+    is a no-op after `--rm`, ignores "No such container", and waits (bounded)
+    until the name is gone.
+  - `close()` does the same for every in-flight container, and a container
+    created after `close()` is removed rather than started.
+  - The first version (`docker run`, kill on timeout) failed the reviewer's
+    reproduction. With a 4 s timeout at load ~100, the client was killed
+    between create and start, and the container stayed in `created`, because
+    `--rm` never fires for a container that never started. This box
+    reproduced it with a 300 ms timeout.
+  - After the fix, timeouts of 100 ms to 8 s were run for png and mp4 at
+    load 50–120, 46 renders in all. Every one left no container, no staging
+    entry and no project directory.
+- **Output:** the image renders into its own tmpfs and copies only the
+  finished artifact to `/output`, first as `.partial-<name>` and then renamed
+  to `<name>` (`docker/hyperframes/studio-hf-render.sh`). HyperFrames
+  otherwise writes its `work-*` and `.<name>.hf-transaction-*` trees beside
+  `--output`, inside our staging directory. After a failure the adapter
+  removes `<name>` and `.partial-<name>`, which are a file or a directory of
+  plain files, one level deep.
+- **Interrupts:** the CLI handles SIGINT and SIGTERM.
+  - It closes the adapter, which cancels a Remotion render through
+    `makeCancelSignal` or removes the HyperFrames container, and lets the
+    render unwind through its own staging and project cleanup.
+  - It then exits 130 (INT) or 143 (TERM). A second signal exits at once.
+  - Remotion's browser launcher registers a SIGINT listener that calls
+    `process.exit(130)` immediately, which skipped that cleanup. The Remotion
+    adapter now removes only the SIGINT listeners its own launch added;
+    Remotion's `exit` listener, which kills Chrome, stays.
+  - Verified by hand on both engines (png, mp4 and gif; INT and TERM; signal
+    to the process alone and to its whole process group, as Ctrl-C sends it).
+    Every run exited 130 or 143 and left no staging directory, no project
+    directory and no container.
+- **Isolation:** `--init`, `--network none`, `--read-only` with a 4 GB tmpfs
+  `/tmp` (the only path HyperFrames and Chrome write besides `/dev/shm` and
+  `/output`),
   `--cap-drop=ALL` and `--security-opt no-new-privileges`. The image's default
   user is `studio`; the adapter runs as the caller's uid:gid so the output
   files belong to the caller.
@@ -281,7 +316,8 @@ adapter checks the image before every render:
   quote or newline is refused, because docker's `--mount` cannot take one
   safely. `:` is safe there.
 
-The gated test passes 9/9 under these settings, byte-identical.
+The gated test passes 9/9 under these settings, including `--init` and the
+tmpfs output path, and the 426 frames are byte-identical to the spike's.
 
 The built image id is local, because a rebuild elsewhere produces a different
 id. Pinning by a digest that CI can pull needs the image published to a
@@ -401,7 +437,7 @@ backward compatibility are not factors.
 - `pnpm test:graph`: 34 tests.
 - `pnpm test:golden`: the existing Remotion suite, unchanged and green (51 passed, 9 skipped, 196 s). The
   HyperFrames file is skipped there unless `HYPERFRAMES=1`.
-- `pnpm test:hyperframes`: 9/9 in 127 s, and 9/9 in 179 s and 181 s after the review
+- `pnpm test:hyperframes`: 9/9 in 127 s, and 9/9 in 179 s, 181 s and 189 s after the reviews
   fixes (hardened container, explicit 4 workers against 1). With the remount
   removed, 7/9 fail.
 

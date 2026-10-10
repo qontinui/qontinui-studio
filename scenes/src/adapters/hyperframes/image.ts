@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 export const IMAGE_CONTEXT = path.join(PACKAGE_ROOT, "docker/hyperframes");
-export const IMAGE_INPUTS = ["Dockerfile", "package.json", "package-lock.json"] as const;
+export const IMAGE_INPUTS = ["Dockerfile", "package.json", "package-lock.json", "studio-hf-render.sh"] as const;
 export const INPUTS_LABEL = "org.qontinui.studio.inputs-sha256";
 export const DEFAULT_HYPERFRAMES_IMAGE = "studio-hyperframes:0.8.78";
 
