@@ -28,8 +28,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import sqlite3
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -51,7 +53,7 @@ ASSET_ID_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 INBOX_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
 COMMERCIAL_USE = ("yes", "no", "unknown")
 WATERMARKS = ("none", "invisible", "visible", "unknown")
-HTTPS_URL_PATTERN = r"^https://[^\s/?#]+[^\s]*$"
+HTTPS_URL_PATTERN = r"^https://[A-Za-z0-9][A-Za-z0-9.-]*(:\d+)?([/?#][^\s]*)?$"
 DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 RFC3339_PATTERN = r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$"
 
@@ -185,6 +187,36 @@ def _inbox_file(inbox: Path, raw: object) -> tuple[Path | None, str | None]:
     return resolved, None
 
 
+def _read_inside(inbox: Path, path: Path) -> bytes | str:
+    """The file's bytes, read through a descriptor opened without following a
+    final symlink and re-checked to be the file that was validated (same
+    device and inode), so a path swapped after the check is refused. Returns
+    the reason as a string when it cannot be read."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        expected = path.stat()
+        fd = os.open(path, flags)
+    except OSError as e:
+        return f"cannot be read ({type(e).__name__})"
+    try:
+        actual = os.fstat(fd)
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino) or not (
+            stat.S_ISREG(actual.st_mode)
+        ):
+            return "changed while being imported; refused"
+        if actual.st_nlink > 1:
+            return "has more than one hard link; refused (it may live outside the inbox)"
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read()
+    except OSError as e:
+        return f"cannot be read ({type(e).__name__})"
+    finally:
+        os.close(fd)
+    if not path.resolve(strict=True).is_relative_to(inbox):
+        return "resolves outside the inbox"
+    return data
+
+
 def _decode(data: bytes) -> tuple[str, int, int] | str:
     """(Pillow format, width, height) of a fully decodable PNG/JPEG/WebP, or
     the reason it is not one."""
@@ -316,10 +348,14 @@ def _validate_entry(
     if why is not None:
         err("file", why)
     elif path is not None:
-        data = path.read_bytes()
-        decoded = _decode(data)
-        if isinstance(decoded, str):
-            err("file", f"'{raw['file']}' {decoded}")
+        read = _read_inside(inbox, path)
+        if isinstance(read, str):
+            err("file", f"'{raw['file']}' {read}")
+        else:
+            data = read
+            decoded = _decode(data)
+            if isinstance(decoded, str):
+                err("file", f"'{raw['file']}' {decoded}")
 
     if len(errors) > start or not isinstance(decoded, tuple):
         return None
@@ -379,6 +415,10 @@ def _load_manifest(inbox: Path) -> list[Any]:
         )
     try:
         doc = yaml.load(path.read_text(encoding="utf-8"), Loader=_ManifestLoader)
+    except (OSError, UnicodeDecodeError) as e:
+        raise ImportRefused(
+            f"{MANIFEST_NAME} is unreadable", [f"{MANIFEST_NAME}: unreadable ({e})"]
+        ) from e
     except yaml.YAMLError as e:
         raise ImportRefused(f"{MANIFEST_NAME} is not valid YAML", [f"{MANIFEST_NAME}: {e}"]) from e
     if not isinstance(doc, list) or not doc:
@@ -459,11 +499,18 @@ def import_inbox(
         now = clock().isoformat()
         for entry in entries:
             existing = conn.execute(
-                "SELECT uid FROM assets WHERE origin = 'imported' AND asset_id = ? AND sha256 = ?",
+                "SELECT * FROM assets WHERE origin = 'imported' AND asset_id = ? AND sha256 = ?",
                 (entry.asset_id, entry.sha256),
             ).fetchone()
             if existing is not None:
                 outcome.skipped.append(existing["uid"])
+                drift = _drift(existing, entry)
+                if drift:
+                    outcome.warnings.append(
+                        f"entry {entry.index}: already imported as {existing['uid']}; the "
+                        f"manifest now differs in {drift} and is NOT applied (an import "
+                        "never rewrites provenance; use library approve/reject for approval)"
+                    )
                 continue
             if not batch_exists:
                 conn.execute(
@@ -516,6 +563,26 @@ def import_inbox(
         conn.rollback()
         raise
     return outcome
+
+
+def _drift(row: sqlite3.Row, entry: _Entry) -> list[str]:
+    """Recorded fields an identical-bytes re-import would have set differently."""
+    wanted = {
+        "provider": entry.provider,
+        "model": entry.model,
+        "account": entry.account,
+        "prompt": entry.prompt,
+        "reference_images_json": json.dumps(entry.reference_images, sort_keys=True),
+        "generated_on": entry.generated_on,
+        "licence_terms_url": entry.licence_terms_url,
+        "licence_tos_reviewed": entry.tos_reviewed,
+        "licence_commercial_use": entry.commercial_use,
+        "watermark": entry.watermark,
+        "approval_status": entry.status,
+        "approval_by": entry.approved_by,
+        "approval_on": entry.approved_on,
+    }
+    return sorted(k for k, v in wanted.items() if row[k] != v)
 
 
 def _entry_order(line: str) -> tuple[int, str]:

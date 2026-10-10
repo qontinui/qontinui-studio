@@ -5,6 +5,7 @@ up with exactly the same schema."""
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -196,3 +197,41 @@ def test_the_pipeline_runs_on_an_upgraded_database(
     fresh = Library(ctx.conn).assets(outcome.batch_id)
     assert fresh and all(a.origin == "generated" and a.mime == "image/png" for a in fresh)
     assert all(a.approval_status == "candidate" for a in fresh)
+
+
+def test_a_dangling_reference_that_predates_the_migration_does_not_block_it(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "studio.db"
+    _v0_db(db, write_image(tmp_path / "raw.png"))
+    raw = sqlite3.connect(db)  # foreign keys off, as a hand edit would be
+    raw.execute("UPDATE gate_results SET batch_id = 'gone'")
+    raw.commit()
+    raw.close()
+    conn = connect(db)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
+
+
+def test_concurrent_connects_migrate_exactly_once(tmp_path: Path) -> None:
+    db = tmp_path / "studio.db"
+    _v0_db(db, write_image(tmp_path / "raw.png"))
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            c = connect(db)
+            assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+            c.close()
+        except BaseException as e:  # surfaced below
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    conn = connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 1

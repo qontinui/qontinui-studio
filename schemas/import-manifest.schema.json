@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/qontinui/qontinui-studio/blob/main/schemas/import-manifest.schema.json",
   "title": "qontinui-studio import manifest",
-  "description": "<inbox-dir>/manifest.yaml for `studio library import <inbox-dir>`. A list of entries, one per image file. The studio validates the WHOLE manifest before writing anything: one invalid entry refuses the import, and every problem is reported with its entry index. The YAML is read with YAML 1.2 scalars: only true/false are booleans (`yes`/`no` are strings) and dates are strings. Width, height, SHA-256 and MIME type are measured from the file, never read from the manifest. Rules this schema cannot express, enforced by the studio: `file` must resolve to a regular file inside the inbox (no symlinks) that Pillow decodes as PNG, JPEG or WebP; a string in `reference_images` must be an asset_id already in the library (or elsewhere in this manifest) and not the entry's own; `commercial_use: yes` without `tos_reviewed` is recorded as `unknown` (warning); `status: approved|rejected` without both `approved_by` and `approved_on` is recorded as `candidate` (warning); `status: approved` is refused unless the recorded commercial_use is `yes` (D5); the same file bytes twice under one asset_id in one manifest is refused.",
+  "description": "<inbox-dir>/manifest.yaml for `studio library import <inbox-dir>`. A list of entries, one per image file. The studio validates the WHOLE manifest before writing anything: one invalid entry refuses the import, and every problem is reported with its entry index. The YAML is read with YAML 1.2 scalars: only true/false are booleans (`yes`/`no` are strings) and dates are strings. Width, height, SHA-256 and MIME type are measured from the file, never read from the manifest. Rules this schema cannot express, enforced by the studio: `file` must resolve to a regular file inside the inbox (no symlinks) that Pillow decodes as PNG, JPEG or WebP; a string in `reference_images` must be an asset_id already in the library (or elsewhere in this manifest) and not the entry's own; `commercial_use: yes` without `tos_reviewed` is recorded as `unknown` (warning); `status: approved|rejected` without both `approved_by` and `approved_on` is recorded as `candidate` (warning); `status: approved` is refused unless the recorded commercial_use is `yes` (D5); the same file bytes twice under one asset_id in one manifest is refused. Dates must also be real calendar dates (2026-02-30 is refused even though `format` is only an annotation in draft 2020-12); a file with more than one hard link is refused; re-importing the same bytes under the same asset_id is a no-op and never rewrites the recorded provenance (a differing manifest only warns); two inboxes with the same directory name import into the same batch, import:<name>.",
   "type": "array",
   "minItems": 1,
   "items": { "$ref": "#/$defs/entry" },
@@ -24,7 +24,7 @@
     },
     "httpsUrl": {
       "type": "string",
-      "pattern": "^https://[^\\s/?#]+[^\\s]*$",
+      "pattern": "^https://[A-Za-z0-9][A-Za-z0-9.-]*(:\\d+)?([/?#][^\\s]*)?$",
       "format": "uri"
     },
     "assetId": {

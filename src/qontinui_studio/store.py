@@ -7,6 +7,7 @@ that judged them and the publications they became can be read in one join.
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter
 from pathlib import Path
 
 SCHEMA = """
@@ -279,6 +280,12 @@ def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
 _MIGRATIONS = {0: _migrate_v0_to_v1}
 
 
+def _dangling(conn: sqlite3.Connection) -> Counter[tuple[str, str]]:
+    """Foreign-key violations as (table, parent) counts. Rowids are not
+    compared: a table rebuild renumbers them."""
+    return Counter((r[0], r[2]) for r in conn.execute("PRAGMA foreign_key_check"))
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring the database to :data:`SCHEMA_VERSION`, one version per
     transaction. Foreign keys are off while tables are rebuilt (SQLite ignores
@@ -297,12 +304,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 conn.rollback()
                 return
             try:
+                # Only references the migration itself broke refuse it: a
+                # dangling row that predates it must not brick every command.
+                before = _dangling(conn)
                 _MIGRATIONS[version](conn)
-                broken = conn.execute("PRAGMA foreign_key_check").fetchall()
-                if broken:
+                new = _dangling(conn) - before
+                if new:
                     raise sqlite3.IntegrityError(
                         f"migration {version}->{version + 1} left dangling references: "
-                        f"{[tuple(r) for r in broken][:5]}"
+                        f"{sorted(new.elements())[:5]}"
                     )
                 conn.execute(f"PRAGMA user_version = {version + 1}")
                 conn.commit()

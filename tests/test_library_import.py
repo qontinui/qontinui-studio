@@ -341,6 +341,21 @@ REFUSALS: list[Any] = [
         "licence_terms_url: must be an https URL",
         id="terms-url-no-host",
     ),
+    pytest.param(
+        {"licence_terms_url": "https://@/"},
+        "licence_terms_url: must be an https URL",
+        id="terms-url-userinfo-only",
+    ),
+    pytest.param(
+        {"licence_terms_url": "https://:80/"},
+        "licence_terms_url: must be an https URL",
+        id="terms-url-port-only",
+    ),
+    pytest.param(
+        {"generated_on": "2026-02-30"},
+        "generated_on: must be an ISO date",
+        id="generated-on-not-a-day",
+    ),
     pytest.param({"commercial_use": DROP}, "commercial_use: required", id="commercial-missing"),
     pytest.param(
         {"commercial_use": "maybe"}, "commercial_use: must be one of", id="commercial-bad"
@@ -433,6 +448,36 @@ def test_refusal_symlink_inside_the_inbox(studio_root: Path, tmp_path: Path) -> 
     assert any("symlinks are refused" in e for e in _refused(studio_root, inbox))
 
 
+def test_refusal_hard_link(studio_root: Path, tmp_path: Path) -> None:
+    inbox = make_inbox(tmp_path, [entry(file="linked.png")])
+    try:
+        os.link(write_image(tmp_path / "outside.png"), inbox / "linked.png")
+    except OSError:
+        pytest.skip("hard links unavailable here")
+    assert any("more than one hard link" in e for e in _refused(studio_root, inbox))
+    _nothing_written(studio_root)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs POSIX permissions, non-root"
+)
+def test_unreadable_file_is_reported_and_later_entries_still_checked(
+    studio_root: Path, tmp_path: Path
+) -> None:
+    inbox = make_inbox(
+        tmp_path,
+        [entry(file="a.png"), entry(file="b.png", watermark="faint")],
+        images={"a.png": (1, 1, 1), "b.png": (2, 2, 2)},
+    )
+    (inbox / "a.png").chmod(0)
+    try:
+        errors = _refused(studio_root, inbox)
+    finally:
+        (inbox / "a.png").chmod(0o644)
+    assert any(e.startswith("entry 0: file: 'a.png' cannot be read") for e in errors), errors
+    assert any(e.startswith("entry 1: watermark:") for e in errors), errors
+
+
 def test_refusal_entry_not_a_mapping(studio_root: Path, tmp_path: Path) -> None:
     errors = _refused(studio_root, make_inbox(tmp_path, [entry(), "hero.png"]))
     assert "entry 1: must be a mapping" in errors
@@ -451,14 +496,17 @@ def test_refusal_same_bytes_twice_in_one_manifest(studio_root: Path, tmp_path: P
         pytest.param("a: 1\n", "non-empty list", id="manifest-mapping"),
         pytest.param("[]\n", "non-empty list", id="manifest-empty"),
         pytest.param("- [unclosed\n", "manifest.yaml:", id="manifest-bad-yaml"),
+        pytest.param(b"- file: \xff\xfe\n", "unreadable", id="manifest-not-utf8"),
     ],
 )
 def test_refusal_manifest(
-    studio_root: Path, tmp_path: Path, text: str | None, message: str
+    studio_root: Path, tmp_path: Path, text: str | bytes | None, message: str
 ) -> None:
     inbox = make_inbox(tmp_path)
     if text is None:
         (inbox / "manifest.yaml").unlink()
+    elif isinstance(text, bytes):
+        (inbox / "manifest.yaml").write_bytes(text)
     else:
         (inbox / "manifest.yaml").write_text(text)
     assert any(message in e for e in _refused(studio_root, inbox))
@@ -553,6 +601,22 @@ def test_reimport_of_identical_content_is_a_noop(studio_root: Path, tmp_path: Pa
     third = do_import(studio_root, other)
     assert third.imported == [] and third.skipped == first.imported
     assert conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+
+
+def test_reimport_with_changed_details_warns_and_changes_nothing(
+    studio_root: Path, tmp_path: Path
+) -> None:
+    inbox = make_inbox(tmp_path, [entry(commercial_use="no")])
+    uid = do_import(studio_root, inbox).imported[0]
+    make_inbox(tmp_path, [entry(commercial_use="yes", prompt="fixed prompt")])
+    again = do_import(studio_root, inbox)
+    assert again.skipped == [uid]
+    drift = [w for w in again.warnings if "NOT applied" in w]
+    assert drift and "licence_commercial_use" in drift[0] and "prompt" in drift[0]
+    assert _library(studio_root).asset(uid).licence_commercial_use == "no"
+    # An identical re-import stays silent.
+    make_inbox(tmp_path, [entry(commercial_use="no")])
+    assert do_import(studio_root, inbox).warnings == []
 
 
 def test_same_name_different_bytes_is_a_new_row(studio_root: Path, tmp_path: Path) -> None:
@@ -652,6 +716,8 @@ def test_schema_validates_the_shipped_example_when_jsonschema_is_available(
         [entry(commercial_use="maybe")],
         [entry(reference_images=["./x.png"])],
         [entry(width=3)],
+        [entry(licence_terms_url="https://@/")],
+        [entry(generated_on="2026-10-01T10:00:00")],
         [],
     ):
         assert list(validator.iter_errors(bad)), bad

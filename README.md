@@ -309,7 +309,12 @@ cross-checks the schema file against the validator so the two cannot drift.
 - Each file is copied into `.studio/raw/imported/<sha[:2]>/<sha256>.<ext>`. The
   inbox is never referenced again and can be deleted.
 - Re-importing the same bytes under the same `asset_id` is a no-op. The same
-  name with different bytes is a new row.
+  name with different bytes is a new row. A re-import never rewrites recorded
+  provenance: if the manifest's details changed, it warns and names the fields.
+  Use `library approve|reject` to change approval.
+- A file is read through a descriptor that does not follow symlinks and must be
+  the file that was validated. A file with more than one hard link is refused.
+- Two inboxes with the same directory name import into the same batch.
 - Rows go in batch `import:<inbox basename>` (basename `^[a-z0-9][a-z0-9._-]*$`)
   with status `imported`. **An import is never published.** `publish`,
   `jobs run` and crash recovery all skip it, and a SQL `CHECK` refuses to move
