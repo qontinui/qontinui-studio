@@ -22,7 +22,10 @@ src/api/          the studio scene API — the only thing scenes import (besides
   scene-root.tsx  what every adapter renders: canvas + scene + mode label
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label
 src/scenes/       scenes; S1 "Plan lifecycle" is the first
-src/adapters/     engines. remotion/ is the first adapter; fonts.ts and output.ts are engine-neutral
+src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
+                  fonts.ts and output.ts are engine-neutral
+docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
+docs/             hyperframes-spike.md: the HyperFrames adapter spike result
 src/cli/          the studio-scenes CLI
 traces/           illustrative traces (fixtures)
 tests/unit/       schema, motion, timeline, S1 model, safety and CLI-refusal tests (vitest)
@@ -37,10 +40,12 @@ assets/fonts/     bundled Inter 4.1, full character set (OFL)
 Scenes depend on a small API that the studio owns. The trace goes in, and a
 timeline plus primitives come out. They never import an engine. Remotion is the
 first adapter (`src/adapters/remotion/`). It implements `EngineAdapter`
-(`render`, `renderStills`, `close`) and provides a `StudioPlayer` web embed. A
-different engine, such as the HyperFrames fallback named in the plan's scout
-addendum, would be a second implementation of the same interfaces with no
-changes to any scene.
+(`render`, `renderStills`, `close`) and provides a `StudioPlayer` web embed. HyperFrames
+(`src/adapters/hyperframes/`, Apache-2.0) is the second implementation of the
+same interfaces, with no changes to any scene: `studio-scenes render …
+--engine hyperframes` renders in its pinned Docker image (`pnpm
+hyperframes:image`). The spike that confirmed it as the fallback, with its
+determinism, parity and timing measurements, is `docs/hyperframes-spike.md`.
 
 Two mechanisms enforce the seam.
 
@@ -49,7 +54,8 @@ Two mechanisms enforce the seam.
   `.ts`/`.tsx` file under `src/` except `src/adapters/**` and `src/cli/**`, one
   entry point each, with esbuild, externalising only Node builtins, and fails
   if any module in a graph is under
-  `node_modules/remotion/`, `node_modules/@remotion/` or `src/adapters/`. That
+  `node_modules/remotion/`, `node_modules/@remotion/`, a HyperFrames package
+(`hyperframes`, `@hyperframes/*`, `@heygen/*`) or `src/adapters/`. That
   catches indirection lint cannot see, such as a re-export through a module
   outside `src/`. A control case checks that the adapter's own graph does reach
   Remotion, so the test cannot pass vacuously.
@@ -288,6 +294,7 @@ pnpm lint:selftest   # proves those rules refuse (lint-fixtures/)
 pnpm test:graph      # the engine seam on the resolved module graph
 pnpm test            # unit: schema, motion, timeline, S1 model, safety, CLI refusals
 pnpm test:golden     # golden frames, determinism, order independence, CLI path (needs browser:ensure)
+pnpm test:hyperframes  # opt-in (HYPERFRAMES=1, needs `pnpm hyperframes:image`): HyperFrames determinism
 ```
 
 The golden suite renders fourteen S1 frames: five in 16:9, one each in 9:16
@@ -372,6 +379,12 @@ imports, or a vendored copy if the licences still differ.
 - **AGPL consumers:** qontinui-web may embed `StudioPlayer` only under the §7
   additional permission that names Remotion (plan Phase 4). It loads the player
   as a separate lazy chunk and states Remotion's licence in its NOTICE.
+- **HyperFrames** (`hyperframes`, `@hyperframes/*`): Apache-2.0, no
+  additional permission needed anywhere. Exact-version `devDependencies`
+  (types and the embed check); the CLI runs only inside
+  `docker/hyperframes/`'s image, with `HYPERFRAMES_NO_TELEMETRY=1`,
+  `DO_NOT_TRACK=1` and `--network none` (its CLI sends PostHog telemetry by
+  default).
 - **Inter** (`assets/fonts/`): SIL Open Font License 1.1 (`assets/fonts/OFL.txt`).
   Inter 4.1, full character set (latin, latin-ext, Greek, Cyrillic, Vietnamese,
   arrows and symbols; no CJK), from `inter-ui@4.1.1` (`web/Inter-*.woff2`,
