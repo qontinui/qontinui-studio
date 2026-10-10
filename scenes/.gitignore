@@ -1,0 +1,4 @@
+node_modules/
+.golden-out/
+out/
+*.log

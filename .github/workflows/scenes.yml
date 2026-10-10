@@ -1,0 +1,103 @@
+# Scene framework CI (plan 2026-10-09-qontinui-marketing-studio-animated-process-explainers, Phase 2).
+#
+# Arming gate: golden-frame fails on a visual change to S1; import-lint refuses
+# an engine import inside src/scenes or src/primitives; the golden-frame job's
+# determinism test requires two renders of one trace to be byte-identical.
+name: scenes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scenes/**"
+      - ".github/workflows/scenes.yml"
+  pull_request:
+    paths:
+      - "scenes/**"
+      - ".github/workflows/scenes.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scenes-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: scenes
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  import-lint:
+    name: import-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: scenes/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: scenes/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Lint (engine-import and scene-purity rules)
+        run: pnpm lint
+
+  typecheck-and-unit:
+    name: typecheck-and-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: scenes/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: scenes/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  golden-frame:
+    name: golden-frame
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: scenes/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: scenes/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Shared libraries for Chrome Headless Shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 libgbm1 \
+            libasound2t64 libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 \
+            libxdamage1 libpango-1.0-0 libcairo2 libcups2t64
+      # The browser build is pinned by the exact @remotion/renderer version,
+      # which the lockfile pins, so the lockfile hash is the cache key.
+      - uses: actions/cache@v4
+        with:
+          path: scenes/node_modules/.remotion
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('scenes/pnpm-lock.yaml') }}
+      - run: pnpm browser:ensure
+      - name: Golden frames + determinism
+        run: pnpm test:golden
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-out
+          path: scenes/.golden-out/
+          if-no-files-found: ignore

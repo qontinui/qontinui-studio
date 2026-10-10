@@ -1,0 +1,46 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "One plan, draft to shipped",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s1-plan-lifecycle.json"
+    }
+  },
+  "entities": {
+    "plans": [
+      { "id": "plan-retry-budget", "title": "Add a retry budget to the sync worker" }
+    ],
+    "prs": [
+      {
+        "id": "pr-412",
+        "plan": "plan-retry-budget",
+        "repo": "example/sync-service",
+        "number": 412,
+        "title": "feat: bounded retry budget for sync jobs"
+      }
+    ],
+    "sessions": [
+      { "id": "session-vet", "label": "Vetting session" },
+      { "id": "session-impl", "label": "Implementing session" }
+    ]
+  },
+  "events": [
+    { "id": "e01", "at": "2026-09-14T09:00:00Z", "kind": "plan.drafted", "plan": "plan-retry-budget" },
+    { "id": "e02", "at": "2026-09-14T09:20:00Z", "kind": "session.started", "session": "session-vet", "plan": "plan-retry-budget" },
+    { "id": "e03", "at": "2026-09-14T11:05:00Z", "kind": "plan.vetted", "plan": "plan-retry-budget" },
+    { "id": "e04", "at": "2026-09-14T11:10:00Z", "kind": "session.ended", "session": "session-vet" },
+    { "id": "e05", "at": "2026-09-14T13:00:00Z", "kind": "session.started", "session": "session-impl", "plan": "plan-retry-budget" },
+    { "id": "e06", "at": "2026-09-14T13:00:00Z", "kind": "plan.implementing", "plan": "plan-retry-budget", "session": "session-impl" },
+    { "id": "e07", "at": "2026-09-14T17:40:00Z", "kind": "pr.opened", "pr": "pr-412" },
+    { "id": "e08", "at": "2026-09-14T17:41:00Z", "kind": "ci.started", "pr": "pr-412" },
+    { "id": "e09", "at": "2026-09-14T18:02:00Z", "kind": "ci.failed", "pr": "pr-412", "checks": 14 },
+    { "id": "e10", "at": "2026-09-14T18:30:00Z", "kind": "ci.started", "pr": "pr-412", "note": "The session pushes a fix and the checks run again." },
+    { "id": "e11", "at": "2026-09-14T18:52:00Z", "kind": "ci.passed", "pr": "pr-412", "checks": 14 },
+    { "id": "e12", "at": "2026-09-14T18:55:00Z", "kind": "session.ended", "session": "session-impl" },
+    { "id": "e13", "at": "2026-09-14T19:10:00Z", "kind": "merge_train.queued", "pr": "pr-412" },
+    { "id": "e14", "at": "2026-09-14T20:05:00Z", "kind": "pr.landed", "pr": "pr-412" },
+    { "id": "e15", "at": "2026-09-15T08:30:00Z", "kind": "plan.shipped", "plan": "plan-retry-budget" }
+  ]
+}
