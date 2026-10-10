@@ -128,8 +128,9 @@ export const EVENT_KINDS = [
 // ---------------------------------------------------------------------------
 
 /**
- * Capped so the on-screen mode line (date range + source) fits in at most
- * three wrapped lines at the narrowest aspect (9:16); see ModeLabel.
+ * Capped so a realistic on-screen mode line (date range + source) fits in the
+ * three lines ModeLabel allows at 9:16. ModeLabel clamps at three lines with
+ * an ellipsis regardless (e.g. 120 "W"s); the full source stays in the trace.
  */
 export const SOURCE_REF_MAX = 120;
 const sourceRef = z.string().min(1).max(SOURCE_REF_MAX);

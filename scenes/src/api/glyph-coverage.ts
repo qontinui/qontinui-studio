@@ -2,6 +2,18 @@
 // Code points every bundled weight of Inter 4.1 has a glyph for, as
 // inclusive [first, last] ranges.
 // 2851 code points in 206 ranges.
+//
+// Generated from these font files; a unit test fails if the files change
+// without regenerating this table.
+//   Inter-Regular.woff2  sha256 e06f6b1bc553aaea4e4668023ed0ab0a147129c3107f511bc7d03d361b0ae085
+//   Inter-SemiBold.woff2  sha256 5cb7103e4e605989afebc03d989c79201e54b21b5183db33981f70db9178a301
+//   Inter-Bold.woff2  sha256 fa888127b6da015b65569f0351f3b5c391ad928904951f1c20e9f8462a8d95ea
+export const FONT_SHA256: Readonly<Record<string, string>> = {
+  "Inter-Regular.woff2": "e06f6b1bc553aaea4e4668023ed0ab0a147129c3107f511bc7d03d361b0ae085",
+  "Inter-SemiBold.woff2": "5cb7103e4e605989afebc03d989c79201e54b21b5183db33981f70db9178a301",
+  "Inter-Bold.woff2": "fa888127b6da015b65569f0351f3b5c391ad928904951f1c20e9f8462a8d95ea",
+};
+
 export const GLYPH_RANGES: readonly (readonly [number, number])[] = [
   [0x0020, 0x007e],
   [0x00a0, 0x00ac],

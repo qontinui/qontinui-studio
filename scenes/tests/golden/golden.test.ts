@@ -15,7 +15,7 @@ import { PNG } from "pngjs";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { RemotionAdapter } from "../../src/adapters/remotion/render";
-import { GOLDEN_CASES, GOLDEN_DIR, GOLDEN_SCALE, OUT_DIR, PIXEL_THRESHOLD, SCENE_ID, goldenName } from "./cases";
+import { GOLDEN_CASES, GOLDEN_DIR, GOLDEN_DOWNSAMPLE, OUT_DIR, PIXEL_THRESHOLD, SCENE_ID, goldenName } from "./cases";
 
 const UPDATE = process.env.UPDATE_GOLDENS === "1";
 
@@ -31,7 +31,7 @@ async function renderAll(outDir: string): Promise<Map<string, string>> {
         frames: c.frames,
         outDir,
         prefix: `${c.id}-`,
-        scale: GOLDEN_SCALE,
+        scale: 1,
       });
       written.forEach((file) => files.set(path.basename(file), file));
     }
@@ -41,22 +41,54 @@ async function renderAll(outDir: string): Promise<Map<string, string>> {
   return files;
 }
 
+/** Deterministic NxN box-filter reduction (integer arithmetic, rounded). */
+function downsample(png: PNG, factor: number): PNG {
+  const width = Math.floor(png.width / factor);
+  const height = Math.floor(png.height / factor);
+  const out = new PNG({ width, height });
+  const n = factor * factor;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      for (let c = 0; c < 4; c++) {
+        let sum = 0;
+        for (let dy = 0; dy < factor; dy++) {
+          for (let dx = 0; dx < factor; dx++) {
+            sum += png.data[((y * factor + dy) * png.width + (x * factor + dx)) * 4 + c] as number;
+          }
+        }
+        out.data[(y * width + x) * 4 + c] = Math.round(sum / n);
+      }
+    }
+  }
+  return out;
+}
+
 const names = GOLDEN_CASES.flatMap((c) => c.frames.map((f) => goldenName(c, f)));
 let first: Map<string, string>;
 let second: Map<string, string>;
+const reducedFiles = new Map<string, string>();
 
 beforeAll(async () => {
   // .golden-out/ is this suite's own scratch directory (git-ignored).
   rmSync(OUT_DIR, { recursive: true, force: true });
-  first = await renderAll(path.join(OUT_DIR, "actual"));
-  second = await renderAll(path.join(OUT_DIR, "repeat"));
+  // Full-size renders (the determinism test compares these byte for byte)...
+  first = await renderAll(path.join(OUT_DIR, "full"));
+  second = await renderAll(path.join(OUT_DIR, "full-repeat"));
+  // ...reduced to golden size for the golden comparison.
+  mkdirSync(path.join(OUT_DIR, "actual"), { recursive: true });
+  for (const name of names) {
+    const reduced = downsample(PNG.sync.read(readFileSync(first.get(name) as string)), GOLDEN_DOWNSAMPLE);
+    const file = path.join(OUT_DIR, "actual", name);
+    writeFileSync(file, PNG.sync.write(reduced));
+    reducedFiles.set(name, file);
+  }
   if (UPDATE) {
     mkdirSync(GOLDEN_DIR, { recursive: true });
     // Remove only stale golden PNGs, file by file.
     for (const name of readdirSync(GOLDEN_DIR)) {
       if (name.endsWith(".png") && !names.includes(name)) unlinkSync(path.join(GOLDEN_DIR, name));
     }
-    for (const name of names) copyFileSync(first.get(name) as string, path.join(GOLDEN_DIR, name));
+    for (const name of names) copyFileSync(reducedFiles.get(name) as string, path.join(GOLDEN_DIR, name));
     process.stdout.write(`updated ${names.length} goldens in ${GOLDEN_DIR}\n`);
   }
 });
@@ -67,7 +99,7 @@ describe("S1 golden frames", () => {
     if (!existsSync(goldenPath)) {
       throw new Error(`missing golden ${name}; run \`pnpm goldens:update\` and commit it`);
     }
-    const actualPath = first.get(name);
+    const actualPath = reducedFiles.get(name);
     if (!actualPath) throw new Error(`render produced no ${name}`);
     const golden = PNG.sync.read(readFileSync(goldenPath));
     const actual = PNG.sync.read(readFileSync(actualPath));
@@ -88,7 +120,7 @@ describe("S1 golden frames", () => {
 });
 
 describe("S1 determinism", () => {
-  it.each(names)("%s is byte-identical across two independent renders", (name) => {
+  it.each(names)("%s is byte-identical across two independent full-size renders", (name) => {
     const a = first.get(name);
     const b = second.get(name);
     if (!a || !b) throw new Error(`render produced no ${name}`);

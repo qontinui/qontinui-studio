@@ -21,7 +21,8 @@
     "test:golden": "vitest run --config vitest.golden.config.ts",
     "goldens:update": "UPDATE_GOLDENS=1 vitest run --config vitest.golden.config.ts",
     "browser:ensure": "tsx scripts/ensure-browser.ts",
-    "lint:selftest": "tsx scripts/lint-selftest.ts"
+    "lint:selftest": "tsx scripts/lint-selftest.ts",
+    "test:graph": "vitest run --config vitest.config.ts tests/unit/engine-graph.test.ts"
   },
   "dependencies": {
     "react": "19.2.8",
@@ -44,6 +45,7 @@
     "@types/pngjs": "6.0.5",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.6",
+    "esbuild": "0.28.1",
     "eslint": "9.39.5",
     "pixelmatch": "7.2.0",
     "pngjs": "7.0.0",

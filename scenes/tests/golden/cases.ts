@@ -10,7 +10,9 @@
  *   425 last frame: every stage done
  * plus one mid-scene frame for each of the other two aspects, and one
  * frame per aspect of a replay with the longest allowed source (the mode
- * label must wrap, not clip, and must not collide with the header).
+ * label must wrap, not clip, and must not collide with the header); a
+ * replay whose source is 120 "W"s (the label clamps to three lines) and a
+ * 160-character title (clamped to two lines) at 9:16 and 1:1.
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -27,8 +29,17 @@ export const OUT_DIR = path.join(PACKAGE_ROOT, ".golden-out");
 export const SCENE_ID = "s1-plan-lifecycle";
 export const TRACE_FILE = path.join(PACKAGE_ROOT, "traces/illustrative/s1-plan-lifecycle.json");
 
-/** Goldens render at half size: enough to catch any visual change, small in git. */
-export const GOLDEN_SCALE = 0.5;
+/**
+ * Goldens are rendered at native size (scale 1) and then reduced 2x2 by a
+ * box filter in JavaScript, so they stay small in git.
+ *
+ * Why not render at --scale 0.5 directly: at a fractional device scale one
+ * edge pixel of S1 came out ±1 in one channel in about 1 frame in 40 across
+ * repeated renders of the same frame (Chrome rasterisation at half-pixel
+ * geometry). At scale 1 the same frames were byte-identical over 6 runs. The
+ * reduction is deterministic arithmetic, so the golden inherits that.
+ */
+export const GOLDEN_DOWNSAMPLE = 2;
 
 /**
  * Goldens must match EXACTLY: zero differing pixels at pixelmatch threshold 0
@@ -77,6 +88,29 @@ export function longSourceReplayTrace(): SceneTrace {
   return attestReplayForTests(parseTrace(json));
 }
 
+/** 160 characters: the schema's maximum plan title. */
+export const LONG_TITLE =
+  "Replace the sync worker's unbounded retry loop with a per-tenant retry budget, report budget exhaustion as a typed alert, and backfill metrics for every new job";
+
+/** A replay whose source is 120 "W"s: the widest glyph, no break opportunities. */
+export function wideSourceReplayTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(TRACE_FILE, "utf8"));
+  json.meta = {
+    mode: "replay",
+    title: json.meta.title,
+    source: { kind: "build-record", ref: "W".repeat(120), export_version: "1" },
+    date_range: { from: "2026-09-14T00:00:00Z", to: "2026-09-15T23:59:59Z" },
+  };
+  return attestReplayForTests(parseTrace(json));
+}
+
+/** The illustrative trace with a 160-character plan title. */
+export function longTitleTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(TRACE_FILE, "utf8"));
+  json.entities.plans[0].title = LONG_TITLE;
+  return parseTrace(json);
+}
+
 export const GOLDEN_CASES: readonly GoldenCase[] = [
   { id: `${SCENE_ID}-16x9`, aspect: "16:9", frames: [0, 48, 196, 290, 425], trace: loadS1Trace },
   { id: `${SCENE_ID}-9x16`, aspect: "9:16", frames: [250], trace: loadS1Trace },
@@ -84,6 +118,10 @@ export const GOLDEN_CASES: readonly GoldenCase[] = [
   { id: `${SCENE_ID}-16x9-replay-long-source`, aspect: "16:9", frames: [250], trace: longSourceReplayTrace },
   { id: `${SCENE_ID}-9x16-replay-long-source`, aspect: "9:16", frames: [250], trace: longSourceReplayTrace },
   { id: `${SCENE_ID}-1x1-replay-long-source`, aspect: "1:1", frames: [250], trace: longSourceReplayTrace },
+  { id: `${SCENE_ID}-9x16-replay-wide-source`, aspect: "9:16", frames: [250], trace: wideSourceReplayTrace },
+  { id: `${SCENE_ID}-1x1-replay-wide-source`, aspect: "1:1", frames: [250], trace: wideSourceReplayTrace },
+  { id: `${SCENE_ID}-9x16-long-title`, aspect: "9:16", frames: [250], trace: longTitleTrace },
+  { id: `${SCENE_ID}-1x1-long-title`, aspect: "1:1", frames: [250], trace: longTitleTrace },
 ];
 
 export function goldenName(c: GoldenCase, frame: number): string {

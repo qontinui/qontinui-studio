@@ -192,3 +192,19 @@ describe("StudioPlayer does not take the trace on trust", () => {
     expect(html(s1TraceJson())).not.toContain("Scene cannot be shown");
   });
 });
+
+describe("glyph table matches the bundled fonts", () => {
+  it("records the SHA-256 of every font file in assets/fonts", async () => {
+    const { createHash } = await import("node:crypto");
+    const { FONT_SHA256 } = await import("../../src/api/glyph-coverage");
+    const { fontFiles } = await import("../../src/api/typography");
+    const dir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../assets/fonts");
+    const onDisk = readdirSync(dir).filter((f) => f.endsWith(".woff2")).sort();
+    expect(Object.keys(FONT_SHA256).sort(), "fonts on disk vs glyph table").toEqual(onDisk);
+    expect(fontFiles.map((f) => path.basename(f.file)).sort(), "fonts loaded vs glyph table").toEqual(onDisk);
+    for (const name of onDisk) {
+      const digest = createHash("sha256").update(readFileSync(path.join(dir, name))).digest("hex");
+      expect(digest, `${name} changed; run scripts/gen-glyph-coverage.py`).toBe(FONT_SHA256[name]);
+    }
+  });
+});

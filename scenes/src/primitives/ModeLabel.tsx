@@ -15,12 +15,17 @@ export interface ModeLabelProps {
  * renders this above the scene on every frame, so a scene cannot leave it out
  * or cover it.
  *
- * The detail line wraps inside the title-safe width instead of being clipped;
- * `SOURCE_REF_MAX` in the schema bounds it to three lines at 9:16.
+ * The detail line wraps inside the title-safe width and is clamped to three
+ * lines with an ellipsis, so it can never reach the scene's header (which
+ * starts below that room). `SOURCE_REF_MAX` keeps realistic sources within
+ * the three lines; the full source always stays in the trace.
  *
  * Badge colours are neutral (border / brand tokens), not attention-layer
  * state colours: the mode says what the footage IS, not who must act.
  */
+/** The mode label never grows past this many detail lines. */
+export const MAX_DETAIL_LINES = 3;
+
 export function ModeLabel({ meta, layout }: ModeLabelProps) {
   const { badge, detail } = modeLine(meta);
   const u = layout.unit;
@@ -73,6 +78,10 @@ export function ModeLabel({ meta, layout }: ModeLabelProps) {
           paddingTop: Math.round(3 * u),
           whiteSpace: "normal",
           overflowWrap: "anywhere",
+          display: "-webkit-box",
+          WebkitBoxOrient: "vertical",
+          WebkitLineClamp: MAX_DETAIL_LINES,
+          overflow: "hidden",
         }}
       >
         {detail}

@@ -3,7 +3,8 @@ import { Caption, Counter, Edge, Gate, Node, PrCard, SessionLane, Timeline, type
 import { STAGES, s1State } from "./model";
 
 interface Placement {
-  header: { x: number; y: number; width: number };
+  /** `titleSize` in reference px; the title is clamped to two lines. */
+  header: { x: number; y: number; width: number; titleSize: number };
   nodes: Point[];
   node: { width: number; height: number };
   caption: { x: number; y: number; width: number };
@@ -16,8 +17,8 @@ interface Placement {
 
 /**
  * Where everything goes, per orientation. Pure function of the layout. The
- * header starts below the room the mode label needs at its longest (three
- * wrapped lines with a 120-character source).
+ * header starts below the room the mode label needs at its longest (clamped
+ * to three lines), and the stages start below a two-line (clamped) title.
  */
 function place(layout: Layout): Placement {
   const { safe, unit: u } = layout;
@@ -26,8 +27,8 @@ function place(layout: Layout): Placement {
   if (layout.orientation === "landscape") {
     const step = safe.width / STAGES.length;
     return {
-      header: { x: safe.x, y: 140 * u, width: safe.width },
-      nodes: STAGES.map((_, i) => ({ x: safe.x + step * (i + 0.5), y: 330 * u })),
+      header: { x: safe.x, y: 140 * u, width: safe.width, titleSize: 48 },
+      nodes: STAGES.map((_, i) => ({ x: safe.x + step * (i + 0.5), y: 355 * u })),
       node: { width: step - 30 * u, height: 104 * u },
       caption: { x: safe.x, y: 480 * u, width: 860 * u },
       pr: { x: right - 620 * u - 250 * u, y: 470 * u, width: 620 * u },
@@ -40,12 +41,12 @@ function place(layout: Layout): Placement {
 
   if (layout.orientation === "portrait") {
     const colWidth = 400 * u;
-    const top = 350 * u;
+    const top = 384 * u;
     const step = 118 * u;
     const rightX = safe.x + colWidth + 48 * u;
     const rightW = right - rightX;
     return {
-      header: { x: safe.x, y: 170 * u, width: safe.width },
+      header: { x: safe.x, y: 170 * u, width: safe.width, titleSize: 48 },
       nodes: STAGES.map((_, i) => ({ x: safe.x + colWidth / 2, y: top + step * i })),
       node: { width: colWidth, height: 92 * u },
       caption: { x: rightX, y: top - 40 * u, width: rightW },
@@ -63,19 +64,19 @@ function place(layout: Layout): Placement {
   const cardWidth = 620 * u;
   const sideX = safe.x + 300 * u;
   return {
-    header: { x: safe.x, y: 150 * u, width: safe.width },
+    header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
     nodes: STAGES.map((_, i) => {
       const row = Math.floor(i / perRow);
       const col = row === 0 ? i : perRow - 1 - (i - perRow);
-      return { x: safe.x + step * (col + 0.5), y: (300 + row * 124) * u };
+      return { x: safe.x + step * (col + 0.5), y: (330 + row * 124) * u };
     }),
     node: { width: step - 26 * u, height: 84 * u },
-    caption: { x: safe.x, y: 498 * u, width: safe.width },
-    pr: { x: safe.x, y: 622 * u, width: cardWidth },
-    gate: { x: safe.x + cardWidth + (safe.width - cardWidth) / 2, y: 657 * u, size: 80 * u },
-    counter: { x: safe.x, y: 786 * u },
-    lanes: { x: sideX, y: 778 * u, width: right - sideX, step: 58 * u },
-    axis: { x: safe.x, y: 950 * u, width: safe.width },
+    caption: { x: safe.x, y: 528 * u, width: safe.width },
+    pr: { x: safe.x, y: 652 * u, width: cardWidth },
+    gate: { x: safe.x + cardWidth + (safe.width - cardWidth) / 2, y: 687 * u, size: 80 * u },
+    counter: { x: safe.x, y: 816 * u },
+    lanes: { x: sideX, y: 808 * u, width: right - sideX, step: 58 * u },
+    axis: { x: safe.x, y: 970 * u, width: safe.width },
   };
 }
 
@@ -109,10 +110,17 @@ export function PlanLifecycle({ trace, frame, layout, timeline }: SceneProps) {
         <div
           style={{
             color: text.primary,
-            fontSize: Math.round(typeScale.display * 0.75 * u),
+            fontSize: Math.round(p.header.titleSize * u),
             fontWeight: fontWeights.bold,
             lineHeight: 1.1,
             marginTop: Math.round(8 * u),
+            // At most two lines, whatever the title length (schema max 160);
+            // the layout below reserves exactly that much room.
+            display: "-webkit-box",
+            WebkitBoxOrient: "vertical",
+            WebkitLineClamp: 2,
+            overflow: "hidden",
+            overflowWrap: "anywhere",
           }}
         >
           {state.plan.title}

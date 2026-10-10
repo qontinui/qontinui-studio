@@ -22,16 +22,21 @@ export interface GateProps {
 export function Gate({ x, y, size, label, open, level, appear = 1, unit }: GateProps) {
   const palette = attention[level];
   const o = Math.min(1, Math.max(0, open));
-  const leafWidth = size * 0.32;
-  const postWidth = Math.max(3, size * 0.06);
+  // All geometry is on whole pixels. With fractional edges (and a scaleX()
+  // fold) one edge pixel of a leaf rasterised nondeterministically, ±1 in
+  // one channel across renders of the same frame; the determinism test
+  // caught it. Integer edges have no partial coverage to disagree about.
+  const box = Math.round(size);
+  const leafWidth = Math.round(box * 0.32);
+  const postWidth = Math.max(3, Math.round(box * 0.06));
   const span = leafWidth * 2 + postWidth * 2;
-  // Opening folds each leaf against its post.
-  const fold = 1 - 0.85 * o;
+  // Opening folds each leaf against its post by shrinking its width.
+  const foldedWidth = Math.max(1, Math.round(leafWidth * (1 - 0.85 * o)));
   const leafStyle = {
     position: "absolute" as const,
-    top: size * 0.12,
+    top: Math.round(box * 0.12),
     width: leafWidth,
-    height: size * 0.76,
+    height: Math.round(box * 0.76),
     background: palette.bg,
     border: `${Math.max(1, Math.round(2 * unit))}px solid ${palette.border}`,
     boxSizing: "border-box" as const,
@@ -41,24 +46,23 @@ export function Gate({ x, y, size, label, open, level, appear = 1, unit }: GateP
     <div
       data-studio-gate={label}
       data-level={level}
-      data-open={o}
       style={{
         position: "absolute",
-        left: x - span / 2,
-        top: y - size / 2,
+        left: Math.round(x - span / 2),
+        top: Math.round(y - box / 2),
         width: span,
-        height: size,
+        height: box,
         opacity: appear,
       }}
     >
-      <div style={{ position: "absolute", left: 0, top: 0, width: postWidth, height: size, background: palette.fg, borderRadius: postWidth }} />
-      <div style={{ position: "absolute", right: 0, top: 0, width: postWidth, height: size, background: palette.fg, borderRadius: postWidth }} />
-      <div style={{ ...leafStyle, left: postWidth, transform: `scaleX(${fold})`, transformOrigin: "left center" }} />
-      <div style={{ ...leafStyle, right: postWidth, transform: `scaleX(${fold})`, transformOrigin: "right center" }} />
+      <div style={{ position: "absolute", left: 0, top: 0, width: postWidth, height: box, background: palette.fg, borderRadius: postWidth }} />
+      <div style={{ position: "absolute", right: 0, top: 0, width: postWidth, height: box, background: palette.fg, borderRadius: postWidth }} />
+      <div style={{ ...leafStyle, left: postWidth, width: foldedWidth }} />
+      <div style={{ ...leafStyle, right: postWidth, width: foldedWidth }} />
       <div
         style={{
           position: "absolute",
-          top: size + Math.round(10 * unit),
+          top: box + Math.round(10 * unit),
           left: "50%",
           transform: "translateX(-50%)",
           whiteSpace: "nowrap",

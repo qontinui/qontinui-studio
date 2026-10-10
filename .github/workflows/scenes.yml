@@ -1,8 +1,8 @@
 # Scene framework CI (plan 2026-10-09-qontinui-marketing-studio-animated-process-explainers, Phase 2).
 #
 # Arming gate: golden-frame fails on any visual change to S1 (exact match);
-# import-lint runs the rules AND a self-test proving they refuse an engine
-# import (static, export-from, import(), require) outside src/adapters; the
+# import-lint runs the rules, a self-test proving they refuse, and the
+# resolved-module-graph test (the seam's authority); the
 # golden-frame job's determinism test requires two renders of one trace to be
 # byte-identical. Actions are pinned by commit SHA.
 name: scenes
@@ -53,6 +53,10 @@ jobs:
       # its expected error (and the clean controls none).
       - name: Lint self-test
         run: pnpm lint:selftest
+      # The authority for the seam: the resolved module graph of the API,
+      # primitives and scenes must reach no engine and no adapter.
+      - name: Engine seam (resolved module graph)
+        run: pnpm test:graph
 
   typecheck-and-unit:
     name: typecheck-and-unit

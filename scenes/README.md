@@ -42,24 +42,36 @@ different engine, such as the HyperFrames fallback named in the plan's scout
 addendum, would be a second implementation of the same interfaces with no
 changes to any scene.
 
-ESLint enforces the seam across all of `src/**` except `src/adapters/**`.
-Outside the adapters, an engine (`remotion`, `@remotion/*`, Revideo, Motion
-Canvas, HyperFrames) cannot be loaded by a static import, an `export … from`,
-a dynamic `import()` or a `require()`, and `import()` needs a literal
-specifier. Nothing outside the adapters imports an adapter statically: the CLI
-reaches the Remotion adapter only through its dynamic
-`import("../adapters/remotion/render")`. Scenes and primitives additionally
-may not import wall-clock animation libraries (`framer-motion`/`motion`,
-react-spring, gsap, anime) or the CLI.
+Two mechanisms enforce the seam.
+
+- **The resolved module graph is the authority.** `pnpm test:graph`
+  (`tests/unit/engine-graph.test.ts`, also part of `pnpm test`) bundles
+  `src/api`, `src/primitives` and `src/scenes` with esbuild, externalising
+  only Node builtins, and fails if any module in the graph is under
+  `node_modules/remotion/`, `node_modules/@remotion/` or `src/adapters/`. That
+  catches indirection lint cannot see, such as a re-export through a module
+  outside `src/`. A control case checks that the adapter's own graph does reach
+  Remotion, so the test cannot pass vacuously.
+- **ESLint** gives the early, per-file error. Everywhere in `src/**` except
+  `src/adapters/**`, an engine (`remotion`, `@remotion/*`, Revideo, Motion
+  Canvas, HyperFrames) cannot be loaded by a static import, `export … from`,
+  `import()` or `require()`; `module`/`node:module` and `createRequire` are
+  refused; and `import()` needs a literal specifier. No file outside the
+  adapters imports an adapter statically, and only `src/cli/**` may load one
+  with `import()` (it does, `import("../adapters/remotion/render")`). Scenes
+  and primitives additionally may not import wall-clock animation libraries
+  (`framer-motion`/`motion`, react-spring, gsap, anime), `react-dom` or the
+  CLI.
 
 **Lint self-test.** `pnpm lint:selftest` (`scripts/lint-selftest.ts`) lints
-every file in `lint-fixtures/<area>/` as if it lived in `src/<area>/`. Each
-starts with `// expect: <rule>[, <rule>]` or `// expect: none`, and the test
-fails unless every expected rule fires, the clean controls stay clean (an
-engine import inside `src/adapters`, the CLI's dynamic adapter import, a pure
-scene), and no virtual path is ignored by the config. CI therefore proves the
-rules refuse, not only that today's code has no violation. The `import-lint`
-CI job runs both `pnpm lint` and the self-test.
+every file in `lint-fixtures/<area>/` as if it lived at
+`src/<area>/__lint_selftest__/` (or `tests/…`, `scripts/…`, or an explicit
+`// path:`). Each fixture declares `// expect: <rule-id> :: <message
+substring>` lines or `// expect: none`. A fixture passes only when every
+expectation is met by an error with that rule id and message, and every error
+it raised is expected. A missing header or an ignored virtual path fails, and
+every fixture is counted in the summary. The `import-lint` CI job runs `pnpm
+lint`, the self-test and the graph test.
 
 ## Scene purity
 
@@ -77,7 +89,18 @@ forbids:
 - `fetch`;
 - React state, refs and effects, by named import or through a default or
   namespace `React` import;
-- module-level `let`/`var` (state that survives between frames);
+- module-level `let`/`var`, and module-level `new Map/Set/WeakMap/WeakSet/WeakRef/Array`
+  (state that survives between frames). Module-level array and object
+  *literals* are allowed, because scenes use them as constant lookup tables
+  (`STAGES`, captions). Lint cannot see a later mutation of one; the
+  determinism test is the backstop for that;
+- `eval`, string `setTimeout`/`setInterval` and `new Function` (everywhere,
+  not only in scenes);
+- `react-dom` (e.g. `createPortal`, which would escape the scene and its mode
+  label);
+- media that plays on its own clock: `<video>`, `<audio>`, `<iframe>`,
+  `<marquee>`, any `autoPlay` attribute, and an `<img>` whose literal `src` is
+  a `.gif`/`.apng`;
 - CSS-timed motion in any spelling: `transition`/`animation` keys, prefixed
   (`WebkitAnimation`) or string (`"-webkit-transition"`) keys, computed keys,
   `@keyframes`/`transition:` in strings, `<style>` elements,
@@ -91,9 +114,13 @@ replay also shows its date range and source. `SceneRoot` draws the mode label
 on every frame from the trace's own metadata, in a layer above the scene; the
 scene sits in its own stacking context (`isolation: isolate`), so it cannot
 omit, restyle or cover the label. The label's detail line wraps within the
-title-safe width rather than clipping; `source.ref` is capped at 120
-characters so it needs at most three lines at 9:16. Both mode badges use
-neutral token colours (border/brand), not attention-layer state colours.
+title-safe width and is clamped to three lines with an ellipsis, and every
+scene layout starts its header below that room, so the label can neither clip
+sideways nor reach the header. The full source always stays in the trace;
+`source.ref` is capped at 120 characters. S1's plan title is clamped to two
+lines. Goldens cover a 120-character realistic source, a source of 120 "W"s
+and a 160-character title. Both mode badges use neutral token colours
+(border/brand), not attention-layer state colours.
 
 ## Traces
 
@@ -125,7 +152,8 @@ The validator also checks that:
   character outside that set (e.g. CJK) is refused, named with its code point,
   rather than rendered as a missing-glyph box or a machine-dependent fallback.
   `src/api/glyph-coverage.ts` is generated from the fonts by
-  `scripts/gen-glyph-coverage.py`.
+  `scripts/gen-glyph-coverage.py` and records each font file's SHA-256; a unit
+  test fails if a font changes without the table being regenerated.
 
 Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
 may add shape checks (`check`; S1 needs exactly one plan and at most one PR).
@@ -142,8 +170,17 @@ sibling plan ships the export (Phase 3 here), `fromBuildRecord` throws
 `not implemented: needs the sibling plan's build-record export`, so every
 replay is refused. The export is never reshaped to suit a scene (plan D6).
 Tests that must draw the REPLAY label use `attestReplayForTests`
-(`src/api/trace/testing.ts`), which refuses to run outside vitest and is not
-reachable from the CLI or the player.
+(`src/api/trace/testing.ts`), which refuses to run outside vitest. Lint keeps
+both doors narrow: `recordReplayProvenance` may appear only in
+`provenance.ts`, `from-build-record.ts` and `testing.ts`, and `trace/testing`
+may be imported only under `tests/**`.
+
+**Phase 3 caveat.** The attestation lives on the object `fromBuildRecord`
+returned. Anything that re-parses or copies it (`parseTrace`, `validateTrace`,
+`structuredClone`, a JSON round trip, `postMessage`) produces an unattested
+trace, which every render path refuses. A replay must therefore be built in
+the process that renders it and passed through unchanged; the web player must
+receive the object `fromBuildRecord` returned, not a serialised copy.
 
 ## Rendering
 
@@ -160,7 +197,9 @@ pnpm studio-scenes render s1-plan-lifecycle \
 - `--trace <file>` takes an illustrative trace; `--build-record <export>` is
   the only replay path (refused until Phase 3, see "Traces").
 - `--scale` must give even whole pixel sizes at every aspect (0.25, 0.3, 0.5,
-  1, 2 …); others are refused. `--frame` is checked against the scene's
+  1, 2 …); others are refused. Determinism is established at scale 1: at a
+  fractional scale an edge pixel was seen to differ by 1 in one channel in
+  about 1 frame in 40 across repeated renders (see "Tests"). `--frame` is checked against the scene's
   duration before anything is bundled.
 - **Output safety.** A render writes into a fresh staging directory beside the
   target and then moves the result into place. It never deletes anything it
@@ -213,18 +252,25 @@ The same trace always produces the same frames:
 pnpm typecheck
 pnpm lint            # includes the engine-seam and purity rules
 pnpm lint:selftest   # proves those rules refuse (lint-fixtures/)
+pnpm test:graph      # the engine seam on the resolved module graph
 pnpm test            # unit: schema, motion, timeline, S1 model, safety, CLI refusals
 pnpm test:golden     # golden frames + determinism (needs browser:ensure)
 ```
 
-The golden suite renders ten S1 frames at half scale: five in 16:9, one each in
-9:16 and 1:1, and one per aspect of a replay with the longest allowed source
-(the mode label must wrap, not clip). Each must match its golden in
-`tests/golden/__goldens__/` **exactly**: zero differing pixels at pixelmatch
-threshold 0 with anti-aliased pixels counted. pixelmatch only counts and draws
-the diff image. Any visual change fails it, down to one digit of a PR number.
-The suite also renders the same frames a second time with a fresh bundle and a
-fresh browser, and requires the two renders to be byte-identical. When it
+The golden suite renders fourteen S1 frames: five in 16:9, one each in 9:16
+and 1:1, one per aspect of a replay with the longest realistic source, and at
+9:16 and 1:1 a replay whose source is 120 "W"s and a trace with a
+160-character title. Frames render at native size (scale 1) and are reduced
+2x2 by a deterministic box filter in JavaScript to keep the goldens small.
+Rendering at `--scale 0.5` directly was not deterministic: one edge pixel
+differed by 1 in one channel in about 1 frame in 40 across repeated renders,
+while the same frames at scale 1 were byte-identical over 6 runs. Each reduced
+frame must match its golden in `tests/golden/__goldens__/` **exactly**: zero
+differing pixels at pixelmatch threshold 0 with anti-aliased pixels counted.
+pixelmatch only counts and draws the diff image. Any visual change fails it,
+down to one digit of a PR number. The suite also renders every frame a second
+time at full size with a fresh bundle and a fresh browser, and requires the
+two renders to be byte-identical. When it
 fails, the actual and diff images are in `.golden-out/`, and CI uploads them as
 an artifact.
 
@@ -289,4 +335,6 @@ imports, or a vendored copy if the licences still differ.
   as a separate lazy chunk and states Remotion's licence in its NOTICE.
 - **Inter** (`assets/fonts/`): SIL Open Font License 1.1 (`assets/fonts/OFL.txt`).
   Inter 4.1, full character set (latin, latin-ext, Greek, Cyrillic, Vietnamese,
-  arrows and symbols; no CJK), from `inter-ui@4.1.1` (`web/Inter-*.woff2`).
+  arrows and symbols; no CJK), from `inter-ui@4.1.1` (`web/Inter-*.woff2`,
+  "Version 4.001;git-9221beed3"). The copyright line in `OFL.txt` is the one in
+  the fonts' own name table ("Copyright 2016 The Inter Project Authors").

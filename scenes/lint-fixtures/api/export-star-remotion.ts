@@ -1,2 +1,2 @@
-// expect: no-restricted-imports
+// expect: no-restricted-imports :: 'remotion' import is restricted
 export * from "remotion";
