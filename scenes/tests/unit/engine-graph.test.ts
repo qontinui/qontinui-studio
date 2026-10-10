@@ -5,8 +5,8 @@
  * globs (or any indirection it does not model) can still pull the engine in.
  * This test bundles every file under src/ except src/adapters/** and
  * src/cli/** with esbuild, one entry point each, and fails if any module in a
- * graph is Remotion or an adapter. Nothing is externalised except Node
- * builtins.
+ * graph is an engine (Remotion or HyperFrames) or an adapter. Nothing is
+ * externalised except Node builtins.
  */
 import { globSync } from "node:fs";
 import { builtinModules } from "node:module";
@@ -26,12 +26,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const ENTRY_POINTS = globSync("src/**/*.{ts,tsx}", { cwd: ROOT })
   .filter((file) => !/^src\/(adapters|cli)\//.test(file))
   .sort();
-const FORBIDDEN = [/node_modules\/(@remotion|remotion)\//, /(^|\/)src\/adapters\//];
+/** Engine packages: Remotion, and HyperFrames (the CLI, every @hyperframes/* package, @heygen/*). */
+const ENGINES = /node_modules\/(@remotion|remotion|@hyperframes|hyperframes|@heygen)\//;
+const FORBIDDEN = [ENGINES, /(^|\/)src\/adapters\//];
 
-async function graphOf(entry: string): Promise<string[]> {
+async function graphOf(entry: string | { contents: string }): Promise<string[]> {
   const result = await build({
     absWorkingDir: ROOT,
-    entryPoints: [entry],
+    ...(typeof entry === "string"
+      ? { entryPoints: [entry] }
+      : { stdin: { contents: entry.contents, resolveDir: ROOT, loader: "ts" as const, sourcefile: "control.ts" } }),
     bundle: true,
     write: false,
     metafile: true,
@@ -62,5 +66,14 @@ describe("engine seam: resolved module graph (plan D7)", () => {
   it("the check is live: the adapter entry does reach Remotion", async () => {
     const inputs = await graphOf("src/adapters/remotion/StudioComposition.tsx");
     expect(inputs.some((input) => /node_modules\/(@remotion|remotion)\//.test(input))).toBe(true);
+  });
+
+  it("the check is live for HyperFrames: an import of @hyperframes/player resolves into the forbidden set", async () => {
+    // The HyperFrames adapter itself drives the engine through Docker and
+    // imports only types from @hyperframes/core (erased), so the control
+    // bundles a real runtime import of the player package instead.
+    const inputs = await graphOf({ contents: 'import "@hyperframes/player";' });
+    expect(inputs.some((input) => /node_modules\/@hyperframes\//.test(input))).toBe(true);
+    expect(inputs.some((input) => ENGINES.test(input))).toBe(true);
   });
 });

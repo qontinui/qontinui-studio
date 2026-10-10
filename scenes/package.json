@@ -22,7 +22,9 @@
     "goldens:update": "UPDATE_GOLDENS=1 vitest run --config vitest.golden.config.ts tests/golden/golden.test.ts",
     "browser:ensure": "tsx scripts/ensure-browser.ts",
     "lint:selftest": "tsx scripts/lint-selftest.ts",
-    "test:graph": "vitest run --config vitest.config.ts tests/unit/engine-graph.test.ts"
+    "test:graph": "vitest run --config vitest.config.ts tests/unit/engine-graph.test.ts",
+    "hyperframes:image": "docker build --platform linux/amd64 -t studio-hyperframes:0.8.78 docker/hyperframes",
+    "test:hyperframes": "HYPERFRAMES=1 vitest run --config vitest.golden.config.ts tests/golden/hyperframes.test.ts"
   },
   "dependencies": {
     "react": "19.2.8",
@@ -38,6 +40,8 @@
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
+    "@hyperframes/core": "0.8.78",
+    "@hyperframes/player": "0.8.78",
     "@remotion/bundler": "4.0.529",
     "@remotion/player": "4.0.529",
     "@remotion/renderer": "4.0.529",

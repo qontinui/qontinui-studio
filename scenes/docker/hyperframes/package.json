@@ -1,0 +1,9 @@
+{
+  "name": "studio-hyperframes-renderer",
+  "private": true,
+  "description": "Exact HyperFrames CLI for the studio's pinned render image (see Dockerfile). The lockfile pins every transitive dependency.",
+  "license": "MIT",
+  "dependencies": {
+    "hyperframes": "0.8.78"
+  }
+}

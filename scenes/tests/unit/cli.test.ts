@@ -66,6 +66,18 @@ describe("studio-scenes CLI refusals", () => {
     expect(r.stderr).toMatch(/--scale 0\.5 is refused: renders are byte-reproducible only at scale 1/);
   });
 
+  it("refuses an unknown --engine", () => {
+    const r = cli(...base, "--trace", S1_TRACE, "--engine", "motion-canvas", "--out", "/tmp/x.mp4");
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/--engine must be one of remotion, hyperframes/);
+  });
+
+  it("refuses any scale but 1 with --engine hyperframes, even with --allow-nondeterministic", () => {
+    const r = cli(...base, "--trace", S1_TRACE, "--engine", "hyperframes", "--scale", "0.5", "--allow-nondeterministic", "--out", "/tmp/x.mp4");
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/--engine hyperframes renders at scale 1 only/);
+  });
+
   it("refuses a scale that gives odd or fractional dimensions", () => {
     const r = cli(...base, "--trace", S1_TRACE, "--scale", "0.33", "--allow-nondeterministic", "--out", "/tmp/x.mp4");
     expect(r.status).toBe(2);

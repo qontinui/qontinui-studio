@@ -4,6 +4,7 @@
  *   studio-scenes render <scene> (--trace <file> | --build-record <export>)
  *                        --format mp4|webm|gif|png --aspect 16:9|9:16|1:1 --out <path>
  *                        [--frame <n>] [--scale <s> --allow-nondeterministic] [--force]
+ *                        [--engine remotion|hyperframes]
  *   studio-scenes validate <trace-file> [--scene <scene>]
  *   studio-scenes list
  *
@@ -21,7 +22,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
-import { OUTPUT_FORMATS, type OutputFormat } from "../api/engine";
+import { OUTPUT_FORMATS, type EngineAdapter, type OutputFormat } from "../api/engine";
 import { ASPECTS, STUDIO_FPS, isAspect, scaleProblem } from "../api/layout";
 import { missingRequirements } from "../api/scene";
 import { fromBuildRecord, type BuildRecordExport } from "../api/trace/from-build-record";
@@ -29,10 +30,14 @@ import { renderRefusal } from "../api/trace/provenance";
 import { validateTrace, type SceneTrace } from "../api/trace/schema";
 import { getScene, scenes } from "../scenes";
 
+const ENGINES = ["remotion", "hyperframes"] as const;
+type Engine = (typeof ENGINES)[number];
+
 const USAGE = `usage:
   studio-scenes render <scene> (--trace <file> | --build-record <export>)
                        --format ${OUTPUT_FORMATS.join("|")} --aspect ${ASPECTS.join("|")} --out <path>
                        [--frame <n>] [--scale <s> --allow-nondeterministic] [--force]
+                       [--engine ${ENGINES.join("|")}]
   studio-scenes validate <trace-file> [--scene <scene>]
   studio-scenes list
 
@@ -40,7 +45,9 @@ png: with --frame, one still at --out (file); without it, a PNG frame sequence i
 --force replaces an existing output file, or a previous element-*.png sequence; nothing else.
 --scale other than 1 needs --allow-nondeterministic (only scale 1 is byte-reproducible),
 and must give even pixel dimensions for every aspect (e.g. 0.25, 0.5, 2).
-A --trace file must be illustrative; replays come only from --build-record (plan D2).`;
+A --trace file must be illustrative; replays come only from --build-record (plan D2).
+--engine defaults to remotion; hyperframes renders in its pinned Docker image
+(build it once with \`pnpm hyperframes:image\`) and supports scale 1 only.`;
 
 class UsageError extends Error {}
 
@@ -82,6 +89,16 @@ function intOption(name: string, value: string | undefined): number | undefined 
   return Number(value);
 }
 
+/** The adapter for `engine`, loaded only when used (lint: dynamic import only). */
+async function loadAdapter(engine: Engine): Promise<EngineAdapter> {
+  if (engine === "hyperframes") {
+    const { HyperFramesAdapter } = await import("../adapters/hyperframes/render");
+    return new HyperFramesAdapter();
+  }
+  const { RemotionAdapter } = await import("../adapters/remotion/render");
+  return new RemotionAdapter();
+}
+
 async function render(args: string[]) {
   const { values, positionals } = parse({
     args,
@@ -96,8 +113,16 @@ async function render(args: string[]) {
       scale: { type: "string" },
       force: { type: "boolean", default: false },
       "allow-nondeterministic": { type: "boolean", default: false },
+      engine: { type: "string", default: "remotion" },
     },
   });
+  const engine = values.engine as string;
+  if (!(ENGINES as readonly string[]).includes(engine)) {
+    throw new UsageError(`render: --engine must be one of ${ENGINES.join(", ")}`);
+  }
+  if (engine === "hyperframes" && values.scale !== undefined && Number(values.scale) !== 1) {
+    throw new UsageError("render: --engine hyperframes renders at scale 1 only");
+  }
   const [sceneId, ...extra] = positionals;
   if (!sceneId) throw new UsageError("render: missing <scene>");
   if (extra.length) throw new UsageError(`render: unexpected argument "${extra[0]}"`);
@@ -151,8 +176,7 @@ async function render(args: string[]) {
     if (frame >= duration) throw new UsageError(`render: --frame ${frame} is outside 0..${duration - 1} for this trace`);
   }
 
-  const { RemotionAdapter } = await import("../adapters/remotion/render");
-  const adapter = new RemotionAdapter();
+  const adapter = await loadAdapter(engine as Engine);
   const outPath = path.resolve(out);
   let lastPct = -1;
   try {
