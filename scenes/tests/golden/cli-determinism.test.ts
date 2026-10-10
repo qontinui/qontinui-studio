@@ -54,7 +54,7 @@ beforeAll(async () => {
   await render("png", path.join(OUT, "seq-2"));
   await render("mp4", path.join(OUT, "s1-1.mp4"));
   await render("mp4", path.join(OUT, "s1-2.mp4"));
-}, 3_600_000);
+}, 40 * 60_000); // four full renders; sized for a 4-core CI runner
 
 describe("CLI render path is reproducible (16:9, scale 1)", () => {
   it("two png sequence runs are byte-identical, frame by frame", () => {

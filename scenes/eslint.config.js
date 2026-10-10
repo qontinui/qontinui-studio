@@ -106,6 +106,19 @@ const ENGINE_SYNTAX = [
     selector: "MemberExpression[property.name='getBuiltinModule']",
     message: "process.getBuiltinModule outside src/adapters bypasses the engine seam (plan D7).",
   },
+  // Computed access on process (process["getBuiltin" + "Module"]), also
+  // through globalThis.process and through TypeScript casts.
+  ...[
+    "MemberExpression[computed=true][object.name='process']",
+    "MemberExpression[computed=true][object.property.name='process']",
+    "MemberExpression[computed=true][object.expression.name='process']",
+    "MemberExpression[computed=true][object.expression.property.name='process']",
+    "MemberExpression[computed=true][object.expression.expression.name='process']",
+    "MemberExpression[computed=true][object.expression.expression.property.name='process']",
+  ].map((selector) => ({
+    selector,
+    message: "Computed access on process outside src/adapters can reach getBuiltinModule (plan D7).",
+  })),
 ];
 
 const ADAPTER_DYNAMIC_SYNTAX = [
@@ -188,6 +201,21 @@ const PURITY_SYNTAX = [
       "Property[key.name=/^(Webkit|Moz)?[bB]oxShadow$/]:not([value.type='CallExpression'][value.callee.name='solidRings'])",
     message: "boxShadow in scenes must be solidRings(...) (zero blur): blurred paint depends on render history.",
   },
+  // The boxShadow rule trusts the NAME solidRings, so the name must be the
+  // studio's: imported from src/api (glow or index), never bound locally.
+  ...[
+    "VariableDeclarator > Identifier.id[name='solidRings']",
+    "FunctionDeclaration > Identifier.id[name='solidRings']",
+    ":function > Identifier.params[name='solidRings']",
+    "ObjectPattern > Property > Identifier.value[name='solidRings']",
+    "ImportDefaultSpecifier[local.name='solidRings']",
+    "ImportNamespaceSpecifier[local.name='solidRings']",
+    "ImportSpecifier[local.name='solidRings'][imported.name!='solidRings']",
+    "ImportDeclaration:not([source.value=/[.][.].api(.glow)?$/]) > ImportSpecifier[local.name='solidRings']",
+  ].map((selector) => ({
+    selector,
+    message: "solidRings must be the one imported from src/api/glow (or src/api); a local solidRings could blur.",
+  })),
   {
     selector: "Literal[value=/blur\\(|drop-shadow\\(/i]",
     message: "No blur()/drop-shadow() in scenes: blurred paint depends on render history.",

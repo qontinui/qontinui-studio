@@ -36,11 +36,22 @@ import {
 
 const UPDATE = process.env.UPDATE_GOLDENS === "1";
 
-/** Frames rendered alone, each in a fresh browser, for the order test. */
-const ALONE: readonly { caseIndex: number; frame: number }[] = (() => {
-  const c = GOLDEN_CASES[0] as GoldenCase;
-  return c.frames.map((frame) => ({ caseIndex: 0, frame }));
-})();
+/**
+ * Frames rendered alone, each in a fresh browser, for the order test: every
+ * 16:9 golden frame (case 0), plus one frame each at 9:16 (case 1) and 1:1
+ * (case 2).
+ */
+const ALONE: readonly { caseIndex: number; frame: number }[] = [
+  ...(GOLDEN_CASES[0] as GoldenCase).frames.map((frame) => ({ caseIndex: 0, frame })),
+  { caseIndex: 1, frame: (GOLDEN_CASES[1] as GoldenCase).frames[0] as number },
+  { caseIndex: 2, frame: (GOLDEN_CASES[2] as GoldenCase).frames[0] as number },
+];
+
+/**
+ * beforeAll renders 14 frames three times, 7 frames alone in fresh browsers,
+ * and one bundle: 93 s measured on a 48-core box. Sized for a 4-core CI runner.
+ */
+const RENDER_TIMEOUT_MS = 20 * 60_000;
 
 const sha256 = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
 
@@ -137,7 +148,7 @@ beforeAll(async () => {
     }
     process.stdout.write(`updated ${names.length} goldens (+ .sha256) in ${GOLDEN_DIR}\n`);
   }
-});
+}, RENDER_TIMEOUT_MS);
 
 describe("S1 golden frames", () => {
   it.each(names)("%s matches the committed golden exactly (full-size SHA-256)", (name) => {

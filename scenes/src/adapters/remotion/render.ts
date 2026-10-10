@@ -23,6 +23,7 @@
  * event; the free-licence eligibility is recorded in plan Phase 0. No cloud
  * or Lambda rendering is used.
  */
+import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -78,7 +79,30 @@ export interface RemotionAdapterOptions {
   logLevel?: LogLevel;
   /** Reuse an existing bundle (a serve URL or directory) instead of bundling. */
   serveUrl?: string;
+  /**
+   * Port for Remotion's local file server. Default: a free port picked per
+   * adapter, so concurrent renders (other processes, other adapters) do not
+   * contend for Remotion's default port range.
+   */
+  port?: number;
 }
+
+/** A port the OS reports free right now. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => (port ? resolve(port) : reject(new Error("could not find a free port"))));
+    });
+  });
+}
+
+/** The one failure retried: Remotion's server port lost to another process. */
+const PORT_CONTENTION = /but got no response/;
 
 /**
  * Remotion's `openBrowser` takes no environment option: it spawns Chrome with
@@ -103,10 +127,27 @@ export class RemotionAdapter implements EngineAdapter {
   private readonly logLevel: LogLevel;
   private serveUrl: Promise<string> | null;
   private browser: Promise<HeadlessBrowser> | null = null;
+  private port: Promise<number>;
 
   constructor(options: RemotionAdapterOptions = {}) {
     this.logLevel = options.logLevel ?? "error";
     this.serveUrl = options.serveUrl ? Promise.resolve(options.serveUrl) : null;
+    this.port = options.port !== undefined ? Promise.resolve(options.port) : freePort();
+  }
+
+  /**
+   * Run one Remotion call on this adapter's port. If the page got no response
+   * (another render took the port between our check and Remotion's bind),
+   * pick a fresh free port and retry once. Nothing else is retried.
+   */
+  private async onPort<T>(call: (port: number) => Promise<T>): Promise<T> {
+    try {
+      return await call(await this.port);
+    } catch (err) {
+      if (!(err instanceof Error) || !PORT_CONTENTION.test(err.message)) throw err;
+      this.port = freePort();
+      return call(await this.port);
+    }
   }
 
   /**
@@ -138,14 +179,15 @@ export class RemotionAdapter implements EngineAdapter {
     const inputProps: StudioCompositionProps = { sceneId, trace, aspect };
     const serveUrl = await this.getServeUrl();
     const puppeteerInstance = await this.getBrowser();
-    const composition = await selectComposition({
+    const composition = await this.onPort((port) => selectComposition({
+      port,
       serveUrl,
       id: sceneId,
       inputProps,
       puppeteerInstance,
       chromiumOptions: CHROMIUM_OPTIONS,
       logLevel: this.logLevel,
-    });
+    }));
     return { serveUrl, puppeteerInstance, composition, inputProps };
   }
 
@@ -182,13 +224,14 @@ export class RemotionAdapter implements EngineAdapter {
 
     return withStaging(outPath, async (staging) => {
       if (sequence) {
-        await renderFrames({
+        await this.onPort((port) => renderFrames({
           ...common,
+          port,
           outputDir: staging,
           imageFormat: "png",
           onStart: () => undefined,
           onFrameUpdate: (rendered) => request.onProgress?.(rendered / composition.durationInFrames),
-        });
+        }));
         return result(await publishSequence(staging, outPath, overwrite));
       }
 
@@ -196,16 +239,19 @@ export class RemotionAdapter implements EngineAdapter {
       if (request.format === "png") {
         const frame = request.frame as number;
         assertFrame(frame, composition.durationInFrames);
-        await renderStill({ ...common, output: staged, frame, imageFormat: "png" });
+        await this.onPort((port) => renderStill({ ...common, port, output: staged, frame, imageFormat: "png" }));
       } else {
-        await renderMedia({
+        const codec = CODECS[request.format];
+        const everyNthFrame = request.format === "gif" ? 2 : 1;
+        await this.onPort((port) => renderMedia({
           ...common,
-          codec: CODECS[request.format],
+          port,
+          codec,
           outputLocation: staged,
           // GIF at half rate keeps files sane; video keeps every frame.
-          everyNthFrame: request.format === "gif" ? 2 : 1,
+          everyNthFrame,
           onProgress: ({ progress }) => request.onProgress?.(progress),
-        });
+        }));
       }
       return result([await publishFile(staged, outPath, overwrite)]);
     });
@@ -228,7 +274,8 @@ export class RemotionAdapter implements EngineAdapter {
       const files: string[] = [];
       for (const frame of request.frames) {
         const staged = path.join(staging, `f${frame}.png`);
-        await renderStill({
+        await this.onPort((port) => renderStill({
+          port,
           serveUrl,
           composition,
           inputProps,
@@ -239,7 +286,7 @@ export class RemotionAdapter implements EngineAdapter {
           output: staged,
           frame,
           imageFormat: "png",
-        });
+        }));
         files.push(await publishFile(staged, target(frame), overwrite));
       }
       return files;

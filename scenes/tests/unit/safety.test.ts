@@ -208,3 +208,50 @@ describe("glyph table matches the bundled fonts", () => {
     }
   });
 });
+
+describe("Remotion adapter port handling", () => {
+  type OnPort = <T>(call: (port: number) => Promise<T>) => Promise<T>;
+  const onPortOf = async (port: number) => {
+    const { RemotionAdapter } = await import("../../src/adapters/remotion/render");
+    const adapter = new RemotionAdapter({ port });
+    return (adapter as unknown as { onPort: OnPort }).onPort.bind(adapter);
+  };
+
+  it("retries a no-response failure once, on a different port", async () => {
+    const onPort = await onPortOf(45678);
+    const ports: number[] = [];
+    const result = await onPort(async (port) => {
+      ports.push(port);
+      if (ports.length === 1) throw new Error('Visited "http://localhost:45678/index.html" but got no response.');
+      return "ok";
+    });
+    expect(result).toBe("ok");
+    expect(ports).toHaveLength(2);
+    expect(ports[0]).toBe(45678);
+    expect(ports[1]).not.toBe(45678);
+  });
+
+  it("retries at most once", async () => {
+    const onPort = await onPortOf(45679);
+    let calls = 0;
+    await expect(
+      onPort(async () => {
+        calls++;
+        throw new Error("Visited x but got no response.");
+      }),
+    ).rejects.toThrow(/got no response/);
+    expect(calls).toBe(2);
+  });
+
+  it("does not retry any other error", async () => {
+    const onPort = await onPortOf(45680);
+    let calls = 0;
+    await expect(
+      onPort(async () => {
+        calls++;
+        throw new Error("something else");
+      }),
+    ).rejects.toThrow("something else");
+    expect(calls).toBe(1);
+  });
+});

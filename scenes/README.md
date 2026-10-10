@@ -57,8 +57,8 @@ Two mechanisms enforce the seam.
   `src/adapters/**`, an engine (`remotion`, `@remotion/*`, Revideo, Motion
   Canvas, HyperFrames) cannot be loaded by a static import, `export … from`,
   `import()` or `require()`; `module`/`node:module` and `createRequire` are
-  refused, as is `process.getBuiltinModule`; and `import()` needs a literal
-  specifier. No file outside the
+  refused, as are `process.getBuiltinModule` and any computed access on
+  `process`; and `import()` needs a literal specifier. No file outside the
   adapters imports an adapter statically, and only `src/cli/**` may load one
   with `import()` (it does, `import("../adapters/remotion/render")`). Scenes
   and primitives additionally may not import wall-clock animation libraries
@@ -242,6 +242,11 @@ browsers, regardless of which frames were rendered before, and through the
 CLI's parallel `renderFrames`/`renderMedia` path (two png-sequence runs and two
 mp4 runs, compared by SHA-256). What it rests on:
 
+- **Own server port:** each adapter gives Remotion's local file server a port
+  the OS reports free, so concurrent renders do not contend for Remotion's
+  default port. If a page still gets no response (the port was taken in
+  between), that one call is retried once on a fresh port; nothing else is
+  retried.
 - **Pinned browser:** the browser is the Chrome Headless Shell build pinned by
   the exact `@remotion/renderer` version. Every dependency version is exact,
   and so is the lockfile.
@@ -266,8 +271,12 @@ mp4 runs, compared by SHA-256). What it rests on:
   glow). Removing only the blur made frame 196 identical in every order. Glows
   are now solid zero-blur rings (`solidRings`/`glowRings` in `src/api/glow.ts`),
   and lint refuses blur in scenes and primitives: `box-shadow` other than
-  `solidRings(...)`, `filter`, `backdrop-filter`, `text-shadow`, `blur()`/
-  `drop-shadow()` in strings, and SVG filter elements.
+  `solidRings(...)` (and `solidRings` must be the one imported from
+  `src/api`, never a local binding of that name), `filter`,
+  `backdrop-filter`, `text-shadow`, `blur()`/`drop-shadow()` in strings, and
+  SVG filter elements. Lint cannot see a style object assembled at run time
+  (for example with `Object.fromEntries`); that escape is left to the
+  order-independence tests, which would catch any blur it smuggled in.
 - **Pure scenes:** scenes are pure, as described under "Scene purity".
 
 ## Tests
@@ -294,8 +303,8 @@ and 1:1, one per aspect of a replay with the longest realistic source, and at
 - **Determinism:** every frame is rendered again with a fresh browser and must
   be byte-identical.
 - **Order independence:** every frame is rendered again in reversed order, and
-  the five 16:9 frames are each rendered alone in a fresh browser; all must be
-  byte-identical to the suite-order render.
+  the five 16:9 frames plus one 9:16 and one 1:1 frame are each rendered alone
+  in a fresh browser; all must be byte-identical to the suite-order render.
 - **CLI path** (`tests/golden/cli-determinism.test.ts`, 16:9 only to bound CI
   time): two full `render --format png` sequence runs (426 frames) must match
   frame by frame, and two `render --format mp4` runs must have the same
