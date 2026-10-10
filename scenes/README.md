@@ -165,8 +165,8 @@ pnpm test:golden     # golden frames + determinism (needs browser:ensure)
 
 The golden suite renders seven S1 frames at half scale: five in 16:9 and one
 each in 9:16 and 1:1. It compares them against `tests/golden/__goldens__/` using
-pixelmatch, with a per-pixel threshold of 0.1 and at most 0.1 % of pixels
-allowed to differ. Any change to a colour, the layout or a label fails it. The
+pixelmatch, with a per-pixel threshold of 0.02, anti-aliased pixels counted,
+and at most 0.01 % of pixels allowed to differ. Any change to a colour, the layout or a label fails it. The
 suite also renders the same frames a second time with a fresh bundle and a
 fresh browser, and requires the two renders to be byte-identical. When it
 fails, the actual and diff images are in `.golden-out/`, and CI uploads them as

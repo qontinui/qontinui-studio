@@ -75,6 +75,7 @@ describe("S1 golden frames", () => {
     const diff = new PNG({ width: golden.width, height: golden.height });
     const mismatched = pixelmatch(golden.data, actual.data, diff.data, golden.width, golden.height, {
       threshold: PIXEL_THRESHOLD,
+      includeAA: true,
     });
     const ratio = mismatched / (golden.width * golden.height);
     if (mismatched > 0) {

@@ -29,13 +29,22 @@ export const GOLDEN_SCALE = 0.5;
 
 /**
  * pixelmatch per-pixel colour threshold (0..1, YIQ distance) and the share of
- * pixels allowed to differ. Anti-aliased pixels are excluded by pixelmatch.
- * The ratio absorbs sub-pixel text rasterisation differences between
- * machines; any real change to a colour, layout or label exceeds it by
- * orders of magnitude.
+ * pixels allowed to differ. Anti-aliased pixels are COUNTED (`includeAA`):
+ * at golden scale most text pixels are anti-aliased edges, so excluding them
+ * let a label colour change (text.muted -> text.secondary) pass unseen.
+ *
+ * The threshold is deliberately tight: S1's state colours are translucent
+ * tints, and changing one stage from `attention` to `waiting` moves 1.97% of
+ * the frame at 0.02 but only 0.14% at pixelmatch's default 0.1, which is too
+ * close to the limit. The ratio is tight too (0.01%, ~50 pixels of a 960x540
+ * frame), because recolouring one small label moves only ~0.1-0.2%. That is
+ * affordable because the pinned browser + fontconfig give byte-identical
+ * frames across machines (verified Debian 13 host vs Ubuntu 24.04 container,
+ * both AVX2). If a CI CPU ever adds rasterisation noise, the diff artifact
+ * shows it; widen this only with that evidence.
  */
-export const PIXEL_THRESHOLD = 0.1;
-export const MAX_DIFF_RATIO = 0.001;
+export const PIXEL_THRESHOLD = 0.02;
+export const MAX_DIFF_RATIO = 0.0001;
 
 export interface GoldenCase {
   aspect: Aspect;
