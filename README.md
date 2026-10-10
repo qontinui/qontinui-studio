@@ -348,9 +348,15 @@ cross-checks the schema file against the validator so the two cannot drift.
 - Staged files are renamed into the raw store inside the database write
   transaction. On a refusal or a rollback, this import's staging directory
   and any raw file it created are deleted. A failure to write is reported as
-  a refusal that names the error code, never a local path. Staging
-  directories older than 24 hours, left by a killed import, are removed by
-  the next import while it holds the database write lock.
+  a refusal that names the error code, never a local path.
+- Staging directories older than 24 hours, left by a killed import, are
+  removed by the next import while it holds the database write lock. The
+  sweep removes only real directories (not symlinks) whose name is a 32-digit
+  hex run id, and works through a descriptor on `.staging` itself. If
+  `.staging` is a symlink, a junction or not a directory, imports refuse to
+  stage there and the sweep is skipped with a warning. Two studio roots
+  sharing one raw store do not share the database lock, so only the age
+  check protects one root's staging from the other's sweep.
 
 **Approval.** `studio library approve|reject <uid> --by <alias>` records the
 decision, the reviewer alias and today's UTC date on the row. Approval is

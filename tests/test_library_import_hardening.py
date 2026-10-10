@@ -557,7 +557,7 @@ def test_r13_an_import_never_removes_the_shared_staging_parent(
 
 def test_stale_staging_runs_are_swept(studio_root: Path, tmp_path: Path) -> None:
     parent = Workspace(studio_root).raw_dir / "imported" / ".staging"
-    stale, fresh = parent / "killed-import", parent / "live-import"
+    stale, fresh = parent / ("a" * 32), parent / ("b" * 32)
     for d in (stale, fresh):
         (d / "partial").parent.mkdir(parents=True)
         (d / "partial").write_bytes(b"x")
@@ -578,3 +578,119 @@ def test_file_paths_must_be_written_plainly(studio_root: Path, tmp_path: Path, n
     errors = _refused(studio_root, inbox)
     assert len(errors) == 1 and errors[0].startswith("entry 0: file: "), errors
     assert "separator" in errors[0] or "segment" in errors[0], errors
+
+
+# ---- fourth review: r14 the stale sweep never follows a link -------------------
+
+OLD_S = 2 * 86400
+
+
+def _age(path: Path) -> None:
+    old = time.time() - OLD_S
+    os.utime(path, (old, old), follow_symlinks=False)
+
+
+@pytest.fixture
+def precious(tmp_path: Path) -> Path:
+    """An unrelated folder with old data that no import may ever delete."""
+    p = tmp_path / "precious"
+    (p / "old-project").mkdir(parents=True)
+    (p / "old-project" / "data.txt").write_text("keep me")
+    _age(p / "old-project")
+    return p
+
+
+def _staging(studio_root: Path) -> Path:
+    return Workspace(studio_root).raw_dir / "imported" / ".staging"
+
+
+def _alive(precious: Path) -> bool:
+    return (precious / "old-project" / "data.txt").exists()
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["posix", "windows-fallback"])
+def test_r14_s1_symlinked_staging_is_refused_and_never_swept(
+    studio_root: Path,
+    tmp_path: Path,
+    precious: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: bool,
+) -> None:
+    if fallback:
+        _force_fallback(monkeypatch)
+    old_run = precious / ("c" * 32)  # run-shaped and old: the sweep's exact target
+    old_run.mkdir()
+    _age(old_run)
+    stg = _staging(studio_root)
+    stg.parent.mkdir(parents=True)
+    os.symlink(precious, stg)
+    errors = _refused(studio_root, make_inbox(tmp_path))
+    assert len(errors) == 1 and errors[0].startswith("staging: the staging directory is a"), errors
+    assert _alive(precious) and old_run.is_dir()
+
+
+def test_r14_s1_sweep_skips_a_staging_swapped_for_a_symlink(
+    studio_root: Path, tmp_path: Path, precious: Path
+) -> None:
+    """If .staging becomes a symlink after this import started, the sweep
+    warns and deletes nothing."""
+    old_run = precious / ("c" * 32)
+    old_run.mkdir()
+    _age(old_run)
+    ws = Workspace(studio_root)
+    staging = inbox_mod._Staging(ws)
+    staging.start()
+    stg = _staging(studio_root)
+    os.rename(stg, tmp_path / "real-staging")
+    os.symlink(precious, stg)
+    warnings: list[str] = []
+    staging.sweep_stale(time.time(), warnings)
+    assert warnings and "sweep skipped" in warnings[0], warnings
+    assert old_run.is_dir() and _alive(precious)
+
+
+def test_r14_s1b_imported_dir_linked_elsewhere_keeps_unrelated_data(
+    studio_root: Path, tmp_path: Path, precious: Path
+) -> None:
+    (Workspace(studio_root).raw_dir).mkdir(parents=True)
+    os.symlink(precious, Workspace(studio_root).raw_dir / "imported")
+    (precious / ".staging").mkdir()
+    os.symlink(precious, precious / ".staging" / "link-entry")
+    assert len(do_import(studio_root, make_inbox(tmp_path)).imported) == 1
+    assert _alive(precious)
+
+
+def test_r14_s2_old_symlink_entry_is_not_followed(
+    studio_root: Path, tmp_path: Path, precious: Path
+) -> None:
+    stg = _staging(studio_root)
+    stg.mkdir(parents=True)
+    link = stg / ("d" * 32)
+    os.symlink(precious / "old-project", link)
+    _age(link)
+    do_import(studio_root, make_inbox(tmp_path))
+    assert _alive(precious)
+
+
+def test_r14_s3_old_run_containing_a_symlink_out(
+    studio_root: Path, tmp_path: Path, precious: Path
+) -> None:
+    stg = _staging(studio_root)
+    run = stg / ("e" * 32)
+    run.mkdir(parents=True)
+    os.symlink(precious / "old-project", run / "x")
+    _age(run)
+    do_import(studio_root, make_inbox(tmp_path))
+    assert not run.exists() and _alive(precious)
+
+
+@pytest.mark.parametrize("name", ["operator-notes", "E" * 32, "f" * 31, "f" * 33])
+def test_r14_s4_old_dir_that_is_not_a_run_is_kept(
+    studio_root: Path, tmp_path: Path, name: str
+) -> None:
+    stg = _staging(studio_root)
+    (stg / name).mkdir(parents=True)
+    (stg / name / "n.txt").write_text("x")
+    _age(stg / name)
+    do_import(studio_root, make_inbox(tmp_path))
+    assert (stg / name / "n.txt").exists()

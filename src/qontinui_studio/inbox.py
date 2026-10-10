@@ -117,6 +117,7 @@ _IMPORTED_SUBDIR = "imported"
 _STAGING_SUBDIR = ".staging"
 STALE_STAGING_S = 24 * 3600
 _CHUNK = 1024 * 1024
+_RUN_NAME = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _SHOWN_CHARS = 80
 
 
@@ -360,17 +361,57 @@ class _Staging:
         self.dir = self.parent / uuid.uuid4().hex
         self.total = 0
 
+    def _open_parent(self) -> int | str | None:
+        """A descriptor on the real ``.staging`` directory (POSIX), None on the
+        Windows fallback when it is a real directory, or why it is not one. A
+        symlinked, junctioned or reparse-point ``.staging`` is never used:
+        following it would put staging, and the stale sweep, somewhere else."""
+        if _DIR_FD:
+            try:
+                return os.open(self.parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                    return "is a symlink or not a directory"
+                return f"cannot be opened ({_errno_name(e)})"
+        try:
+            if _is_link_like(self.parent) or not stat.S_ISDIR(self.parent.lstat().st_mode):
+                return "is a symlink, junction or reparse point, or not a directory"
+        except OSError as e:
+            return f"cannot be opened ({_errno_name(e)})"
+        return None
+
     def start(self) -> None:
-        """Create this run's directory. The shared parent is never removed by
-        an import, but tolerate it vanishing between the two mkdirs anyway."""
+        """Create this run's directory inside a REAL ``.staging`` directory.
+        The shared parent is never removed by an import, but tolerate it
+        vanishing between the two mkdirs anyway."""
         for _ in range(3):
             try:
-                self.dir.mkdir(parents=True)
+                self.parent.mkdir(parents=True, exist_ok=True)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                raise _staging_refused(e) from e
+            parent = self._open_parent()
+            if isinstance(parent, str):
+                if "ENOENT" in parent:
+                    continue
+                raise ImportRefused(
+                    "the import staging directory is not a real directory",
+                    [f"staging: the staging directory {parent}; refusing to use it"],
+                )
+            try:
+                if parent is None:
+                    self.dir.mkdir()
+                else:
+                    os.mkdir(self.dir.name, dir_fd=parent)
                 return
             except FileNotFoundError:
                 continue
             except OSError as e:
                 raise _staging_refused(e) from e
+            finally:
+                if parent is not None:
+                    os.close(parent)
         raise ImportRefused(
             "could not create the import staging directory",
             ["staging: could not create this import's staging directory (it kept vanishing)"],
@@ -429,20 +470,39 @@ class _Staging:
         concurrent import's mkdir under it can never lose its parent."""
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def sweep_stale(self, now: float) -> None:
-        """Delete run directories older than STALE_STAGING_S: left by an import
-        that was killed. Called under the database write lock, and no live
-        import takes a day to validate."""
-        try:
-            runs = list(self.parent.iterdir())
-        except OSError:
+    def sweep_stale(self, now: float, warnings: list[str]) -> None:
+        """Delete run directories older than STALE_STAGING_S, left by an import
+        that was killed. Only entries that look like a run (a 32-hex-digit
+        name), are real directories (not symlinks), and are old are removed,
+        through a descriptor on the real ``.staging`` directory; a symlinked
+        ``.staging`` is skipped with a warning. Two studio roots sharing one
+        raw store are protected from each other only by the age check."""
+        parent = self._open_parent()
+        if isinstance(parent, str):
+            if "ENOENT" not in parent:
+                warnings.append(f"stale staging sweep skipped: the staging directory {parent}")
             return
-        for run in runs:
-            if run == self.dir:
-                continue
-            with contextlib.suppress(OSError):
-                if now - run.lstat().st_mtime > STALE_STAGING_S:
-                    shutil.rmtree(run, ignore_errors=True)
+        if parent is None:  # Windows fallback: by name, after the lstat check above
+            entries = [(e.name, e) for e in os.scandir(self.parent)]
+        else:
+            entries = [(e.name, e) for e in os.scandir(parent)]
+        try:
+            for name, entry in entries:
+                if name == self.dir.name or not _RUN_NAME.fullmatch(name):
+                    continue
+                with contextlib.suppress(OSError):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if now - entry.stat(follow_symlinks=False).st_mtime <= STALE_STAGING_S:
+                        continue
+                    if parent is None:
+                        if not _is_link_like(self.parent / name):
+                            shutil.rmtree(self.parent / name)
+                    else:
+                        shutil.rmtree(name, dir_fd=parent)
+        finally:
+            if parent is not None:
+                os.close(parent)
 
 
 def _staging_refused(e: OSError) -> ImportRefused:
@@ -862,9 +922,11 @@ def _commit(
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # Under the write lock no other import is committing; a staging run
-        # older than a day belongs to an import that was killed.
-        staging.sweep_stale(time.time())
+        # Under the write lock no other import of THIS database is committing,
+        # and a staging run older than a day belongs to an import that was
+        # killed. Two studio roots that share one raw store do not share this
+        # lock: they are protected from each other only by the age check.
+        staging.sweep_stale(time.time(), outcome.warnings)
         # Checks against the library run under the write lock, so they hold
         # for the rows written below.
         library_ids = {r["asset_id"] for r in conn.execute("SELECT DISTINCT asset_id FROM assets")}
