@@ -20,12 +20,30 @@ uses:
 Third-party generator dependencies (API keys, provider terms) live here, so
 marketing churn never touches merge-critical factory code.
 
+## Tool and content: `--root` is the project
+
+This repository is the **tool**. A *project* is whatever directory `--root`
+points at (default: the current directory). It holds the project's content
+config, tracked in the project's own repo:
+
+- `providers.yaml`, `sites/*.yaml`, `briefs/*.yaml` (and style guides);
+
+and its local state in `<root>/.studio/`, which is gitignored and never
+committed: `studio.db`, raw downloads and imports, variants, notices and the
+review page.
+
+The `providers.yaml`, `sites/` and `briefs/` files in this repo are examples.
+They are kept at the repo root for now and are not moved to `examples/`,
+because the stacked launch-kit PR (studio#2) adds files beside them and its
+README and tests reference those paths. Moving them belongs after that PR
+lands.
+
 ## Design rules enforced as code
 
 | Rule | What it means here | Where |
 |---|---|---|
 | **D4** API first, GUI automation only where the terms allow it, one account per provider | An adapter is built only for a provider whose `providers.yaml` row has `tos_reviewed` set and `automation_allowed: "yes"`. `unknown` keeps it off. A duplicate provider row is a load error. | `providers.py` (`adapter_gate`), `adapters/__init__.py` |
-| **D5** every asset carries provenance and licence | Each library row stores provider, model, prompt, brief id, date and SHA-256. It also snapshots the licence terms as reviewed, and the watermark. `ai_generated` is pinned true by a SQL `CHECK`. An unreviewed licence is refused for every site; a non-commercial licence is refused for a commercial site. | `store.py`, `library.py`, `gates.py` (`d5_licence`, `d5_provenance`) |
+| **D5** every asset carries provenance and licence | Each library row stores provider, model, prompt, brief id (or, for an imported asset, account alias, reference images and terms URL), date and SHA-256. It also snapshots the licence terms as reviewed, and the watermark. `ai_generated` is pinned true by a SQL `CHECK`. An unreviewed licence is refused for every site; a non-commercial licence is refused for a commercial site. | `store.py`, `library.py`, `gates.py` (`d5_licence`, `d5_provenance`) |
 | **D6** AI imagery is never presented as the real thing | Refuses AI imagery in any `product_screenshot` slot, and in `food`/`premises` slots on a `real_business` site. Demo sites must carry an illustrative label. The label is written to the site's `studio-manifest.json` for the site build to render. | `gates.py` (`d6_not_the_real_thing`), `publish.py` |
 | **D7** automated gates decide; the operator is notified, not asked | A batch publishes only when every gate passes, including UI Bridge page health on a preview of the batch, which runs before anything goes live. Page health is **required, with no waiver**. The operator gets a notice carrying a one-step `studio --root <abs path> unpublish --batch <id>`. The review page is not an approval queue. | `publish.py`, `notify.py`, `review.py` |
 
@@ -230,6 +248,10 @@ poetry run studio brief validate briefs/example-hero.yaml
 poetry run studio brief run briefs/example-hero.yaml     # generate -> crop -> gate -> publish
 poetry run studio jobs run                               # resume batches deferred by quota/backoff
 poetry run studio library list [--json] [--batch ID]
+poetry run studio library import INBOX_DIR               # images made elsewhere -> library (never published)
+poetry run studio library approve UID --by ALIAS         # consumer-facing approval (D5: commercial_use yes only)
+poetry run studio library reject UID --by ALIAS
+poetry run studio library export --out library.yaml      # deterministic manifest of every asset
 poetry run studio publish --batch ID                     # re-run the gates and publish
 poetry run studio unpublish --batch ID                   # one-step unpublish
 poetry run studio review build                           # .studio/review/index.html
@@ -243,6 +265,78 @@ spaces still pastes correctly.
 
 Exit codes: `0` ok, `1` config error, `2` publication refused by a gate,
 `3` generation deferred or failed.
+
+### The library: import, approval, export
+
+**Import.** `studio --root <project> library import <inbox-dir>` brings in
+images made outside the studio (for example by hand in a provider's web UI)
+with the same D5 provenance a generated asset carries. The inbox holds the
+image files and a `manifest.yaml` listing one entry per file. **The contract is
+[`schemas/import-manifest.schema.json`](schemas/import-manifest.schema.json)**;
+the studio validates manifests by hand against the same rules, and a test
+cross-checks the schema file against the validator so the two cannot drift.
+
+```yaml
+- file: hero-1.png                  # relative to the inbox; no '..', no absolute path, no symlink
+  asset_id: cafe-hero               # ^[a-z0-9][a-z0-9-]*$; several files may share one
+  provider: midjourney
+  model: v7
+  account: studio-mj                # an ALIAS (^[A-Za-z0-9._-]+$), never an e-mail address
+  prompt: An empty cafe interior in warm light
+  reference_images:                 # an asset_id in this library, or {url, licence}
+    - cafe-base-look
+    - {url: https://example.com/ref.jpg, licence: CC-BY-4.0}
+  generated_on: 2026-10-01          # ISO date or RFC 3339 timestamp
+  licence_terms_url: https://example.com/terms
+  tos_reviewed: 2026-10-02          # optional; commercial_use: yes needs it
+  commercial_use: yes               # yes | no | unknown
+  watermark: none                   # none | invisible | visible | unknown
+  ai_generated: true                # must be true
+  status: approved                  # candidate (default) | approved | rejected
+  approved_by: josh                 # alias; approved/rejected need approved_by and approved_on
+  approved_on: 2026-10-03
+```
+
+- The **whole** manifest is validated first. If any entry is invalid nothing is
+  imported, and every problem is reported with its entry index.
+- Width, height, SHA-256 and MIME type are **measured**: Pillow must decode the
+  file as PNG, JPEG or WebP, whatever its extension says. The manifest cannot
+  supply them (unknown fields are refused).
+- `commercial_use: yes` without `tos_reviewed` is recorded as `unknown`, and
+  `approved`/`rejected` without both `approved_by` and `approved_on` is recorded
+  as `candidate`. Both print a warning. `approved` with a recorded
+  `commercial_use` other than `yes` is refused (D5).
+- Each file is copied into `.studio/raw/imported/<sha[:2]>/<sha256>.<ext>`. The
+  inbox is never referenced again and can be deleted.
+- Re-importing the same bytes under the same `asset_id` is a no-op. The same
+  name with different bytes is a new row.
+- Rows go in batch `import:<inbox basename>` (basename `^[a-z0-9][a-z0-9._-]*$`)
+  with status `imported`. **An import is never published.** `publish`,
+  `jobs run` and crash recovery all skip it, and a SQL `CHECK` refuses to move
+  an `imported` batch to any other status.
+- An interrupted import can leave a copied file in the raw store with no row.
+  Files there are content-addressed, so the next import reuses it.
+
+**Approval.** `studio library approve|reject <uid> --by <alias>` records the
+decision, the reviewer alias and today's UTC date on the row. Approval is
+refused unless the asset's licence is `commercial_use: yes` (D5, also a SQL
+`CHECK`); rejection is always allowed. Approval is **library metadata for
+consumers, not a publish gate**: generated batches still publish on the
+automated D5/D6/D7 gates alone, with the operator notified rather than asked
+(D7). Generated assets start as `candidate`.
+
+**Export.** `studio library export --out <path>` writes every asset as YAML:
+uid, asset_id, origin, batch, provider, model, account, prompt, reference images,
+dates, SHA-256, size, MIME type, licence, watermark, `ai_generated`, approval,
+and variants (id, site/slot/campaign, format, size, SHA-256). The SHA-256 is
+the content-addressed pointer. The export contains no binaries and no local
+paths. Keys are sorted and assets ordered by (asset_id, created_at, uid), so the
+same library always exports to the same bytes.
+
+**Schema versions.** `studio.db` carries `PRAGMA user_version`. Every database,
+fresh or old, starts from the original (v0) tables and is migrated forward in
+one transaction per version, so a database created before versioning is
+upgraded in place the first time any command opens it.
 
 ### Configuring keys and quotas
 
@@ -284,8 +378,9 @@ state is kept in `.studio/studio.db`.
 - `briefs/*.yaml`: the asset id, purpose, targets (`{site, slot}` or
   `{campaign}`), aspect ratio, prompt, style guide, reference images, provider
   preference and number of variants.
-- `.studio/` (gitignored): the SQLite library and scheduler state, raw downloads,
-  variants, notices and the review page.
+- `schemas/import-manifest.schema.json`: the `library import` manifest contract.
+- `.studio/` (gitignored): the SQLite library and scheduler state, raw downloads
+  and imports, variants, notices and the review page.
 
 ## Development
 
