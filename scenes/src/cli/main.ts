@@ -1,30 +1,45 @@
 /**
  * studio-scenes — render and validate studio scenes.
  *
- *   studio-scenes render <scene> --trace <file> --format mp4|webm|gif|png
- *                        --aspect 16:9|9:16|1:1 --out <path> [--frame <n>] [--scale <s>]
+ *   studio-scenes render <scene> (--trace <file> | --build-record <export>)
+ *                        --format mp4|webm|gif|png --aspect 16:9|9:16|1:1 --out <path>
+ *                        [--frame <n>] [--scale <s>] [--force]
  *   studio-scenes validate <trace-file> [--scene <scene>]
  *   studio-scenes list
  *
  * png: with --frame, a single still written to --out (a file); without it, the
  * whole scene as a PNG frame sequence written into --out (a directory).
+ *
+ * Replays (plan D2): a `--trace` file must be illustrative. A replay renders
+ * only from `--build-record <export>` through `fromBuildRecord`, which needs
+ * the sibling plan's export (Phase 3) — until then every replay is refused.
+ *
+ * The CLI reaches the engine adapter only through a dynamic import (lint
+ * forbids static imports of src/adapters from here).
  */
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { OUTPUT_FORMATS, type OutputFormat } from "../api/engine";
-import { ASPECTS, isAspect } from "../api/layout";
+import { ASPECTS, STUDIO_FPS, isAspect, scaleProblem } from "../api/layout";
 import { missingRequirements } from "../api/scene";
+import { fromBuildRecord, type BuildRecordExport } from "../api/trace/from-build-record";
+import { renderRefusal } from "../api/trace/provenance";
 import { validateTrace, type SceneTrace } from "../api/trace/schema";
 import { getScene, scenes } from "../scenes";
 
 const USAGE = `usage:
-  studio-scenes render <scene> --trace <file> --format ${OUTPUT_FORMATS.join("|")} --aspect ${ASPECTS.join("|")} --out <path> [--frame <n>] [--scale <s>]
+  studio-scenes render <scene> (--trace <file> | --build-record <export>)
+                       --format ${OUTPUT_FORMATS.join("|")} --aspect ${ASPECTS.join("|")} --out <path>
+                       [--frame <n>] [--scale <s>] [--force]
   studio-scenes validate <trace-file> [--scene <scene>]
   studio-scenes list
 
-png: with --frame, one still at --out (file); without it, a PNG frame sequence in --out (directory).`;
+png: with --frame, one still at --out (file); without it, a PNG frame sequence in --out (directory).
+--force replaces an existing output file, or a previous element-*.png sequence; nothing else.
+--scale must give even pixel dimensions for every aspect (e.g. 0.25, 0.5, 1, 2).
+A --trace file must be illustrative; replays come only from --build-record (plan D2).`;
 
 class UsageError extends Error {}
 
@@ -35,18 +50,29 @@ function requireScene(id: string) {
   return getScene(id);
 }
 
-async function loadTrace(file: string): Promise<SceneTrace> {
-  let json: unknown;
+async function readJson(file: string, what: string): Promise<unknown> {
   try {
-    json = JSON.parse(await readFile(file, "utf8"));
+    return JSON.parse(await readFile(file, "utf8"));
   } catch (err) {
-    throw new UsageError(`cannot read trace ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new UsageError(`cannot read ${what} ${file}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  const result = validateTrace(json);
+}
+
+async function loadTrace(file: string): Promise<SceneTrace> {
+  const result = validateTrace(await readJson(file, "trace"));
   if (!result.ok) {
     throw new UsageError(`invalid trace ${file}:\n  ${result.errors.join("\n  ")}`);
   }
   return result.trace;
+}
+
+/** parseArgs with its errors (unknown option, missing value) as usage errors. */
+function parse<T extends Parameters<typeof parseArgs>[0]>(config: T) {
+  try {
+    return parseArgs(config);
+  } catch (err) {
+    throw new UsageError(err instanceof Error ? err.message : String(err));
+  }
 }
 
 function intOption(name: string, value: string | undefined): number | undefined {
@@ -56,38 +82,69 @@ function intOption(name: string, value: string | undefined): number | undefined 
 }
 
 async function render(args: string[]) {
-  const { values, positionals } = parseArgs({
+  const { values, positionals } = parse({
     args,
     allowPositionals: true,
     options: {
       trace: { type: "string" },
+      "build-record": { type: "string" },
       format: { type: "string" },
       aspect: { type: "string" },
       out: { type: "string" },
       frame: { type: "string" },
       scale: { type: "string" },
+      force: { type: "boolean", default: false },
     },
   });
-  const [sceneId] = positionals;
+  const [sceneId, ...extra] = positionals;
   if (!sceneId) throw new UsageError("render: missing <scene>");
-  if (!values.trace) throw new UsageError("render: missing --trace");
-  if (!values.out) throw new UsageError("render: missing --out");
-  const format = values.format ?? "";
+  if (extra.length) throw new UsageError(`render: unexpected argument "${extra[0]}"`);
+  const traceFile = values.trace as string | undefined;
+  const buildRecordFile = values["build-record"] as string | undefined;
+  if ((traceFile === undefined) === (buildRecordFile === undefined)) {
+    throw new UsageError("render: give exactly one of --trace or --build-record");
+  }
+  const out = values.out as string | undefined;
+  if (!out) throw new UsageError("render: missing --out");
+  const format = (values.format as string | undefined) ?? "";
   if (!(OUTPUT_FORMATS as readonly string[]).includes(format)) {
     throw new UsageError(`render: --format must be one of ${OUTPUT_FORMATS.join(", ")}`);
   }
-  const aspect = values.aspect ?? "";
+  const aspect = (values.aspect as string | undefined) ?? "";
   if (!isAspect(aspect)) throw new UsageError(`render: --aspect must be one of ${ASPECTS.join(", ")}`);
-  const frame = intOption("frame", values.frame);
+  const frame = intOption("frame", values.frame as string | undefined);
   if (frame !== undefined && format !== "png") throw new UsageError("render: --frame is only valid with --format png");
-  const scale = values.scale === undefined ? undefined : Number(values.scale);
-  if (scale !== undefined && !(scale > 0 && scale <= 4)) throw new UsageError("render: --scale must be in (0, 4]");
+  const scaleText = values.scale as string | undefined;
+  const scale = scaleText === undefined ? undefined : Number(scaleText);
+  if (scale !== undefined) {
+    const problem = scaleProblem(scale);
+    if (problem) throw new UsageError(`render: ${problem}`);
+  }
 
-  requireScene(sceneId);
-  const trace = await loadTrace(values.trace);
+  const scene = requireScene(sceneId);
+  let trace: SceneTrace;
+  if (buildRecordFile !== undefined) {
+    const record = (await readJson(buildRecordFile, "build-record export")) as BuildRecordExport;
+    try {
+      trace = fromBuildRecord(record, { sourceRef: buildRecordFile, title: scene.title });
+    } catch (err) {
+      throw new UsageError(`render: --build-record: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else {
+    trace = await loadTrace(traceFile as string);
+  }
+  const refusal = renderRefusal(trace);
+  if (refusal) throw new UsageError(`render: ${refusal}`);
+  const problems = missingRequirements(scene, trace);
+  if (problems.length) throw new UsageError(`render: trace cannot drive ${sceneId}; it needs: ${problems.join("; ")}`);
+  if (frame !== undefined) {
+    const duration = scene.timeline(trace, STUDIO_FPS).durationInFrames;
+    if (frame >= duration) throw new UsageError(`render: --frame ${frame} is outside 0..${duration - 1} for this trace`);
+  }
+
   const { RemotionAdapter } = await import("../adapters/remotion/render");
   const adapter = new RemotionAdapter();
-  const outPath = path.resolve(values.out);
+  const outPath = path.resolve(out);
   let lastPct = -1;
   try {
     const result = await adapter.render({
@@ -98,6 +155,7 @@ async function render(args: string[]) {
       outPath,
       frame,
       scale,
+      overwrite: values.force === true,
       onProgress: (fraction) => {
         const pct = Math.floor(fraction * 100);
         if (pct >= lastPct + 10) {
@@ -110,13 +168,16 @@ async function render(args: string[]) {
       `${result.files.length === 1 ? result.files[0] : `${result.files.length} frames in ${outPath}`}\n` +
         `  ${result.width}x${result.height} @ ${result.fps} fps, ${result.durationInFrames} frames (${trace.meta.mode})\n`,
     );
+  } catch (err) {
+    if (err instanceof Error && err.name === "OutputRefused") throw new UsageError(`render: ${err.message}`);
+    throw err;
   } finally {
     await adapter.close();
   }
 }
 
 async function validate(args: string[]) {
-  const { values, positionals } = parseArgs({
+  const { values, positionals } = parse({
     args,
     allowPositionals: true,
     options: { scene: { type: "string" } },
@@ -124,11 +185,15 @@ async function validate(args: string[]) {
   const [file] = positionals;
   if (!file) throw new UsageError("validate: missing <trace-file>");
   const trace = await loadTrace(file);
-  if (values.scene) {
-    const missing = missingRequirements(requireScene(values.scene), trace);
-    if (missing.length) throw new UsageError(`trace cannot drive ${values.scene}; missing: ${missing.join(", ")}`);
+  const sceneId = values.scene as string | undefined;
+  if (sceneId) {
+    const problems = missingRequirements(requireScene(sceneId), trace);
+    if (problems.length) throw new UsageError(`trace cannot drive ${sceneId}; it needs: ${problems.join("; ")}`);
   }
-  process.stdout.write(`ok: ${file} (trace_version ${trace.trace_version}, ${trace.meta.mode}, ${trace.events.length} events)\n`);
+  const note = renderRefusal(trace) ? " — valid shape, but NOT renderable: replays render only via --build-record" : "";
+  process.stdout.write(
+    `ok: ${file} (trace_version ${trace.trace_version}, ${trace.meta.mode}, ${trace.events.length} events)${note}\n`,
+  );
 }
 
 async function main(argv: string[]) {

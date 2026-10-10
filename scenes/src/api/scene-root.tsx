@@ -1,8 +1,9 @@
 /**
  * The one component every adapter renders. It owns what a scene must not be
  * able to skip: the canvas, the layout, the timeline, and the plan-D2 mode
- * label — drawn here, after (above) the scene, from the trace's own metadata.
- * A scene therefore cannot omit or restyle the label.
+ * label — drawn here, in a layer above the scene's isolated stacking context,
+ * from the trace's own metadata. A scene therefore cannot omit, restyle or
+ * cover the label.
  */
 import { useMemo } from "react";
 
@@ -37,8 +38,14 @@ export function SceneRoot({ scene, trace, frame, aspect }: SceneRootProps) {
         fontFamily: fontStack,
       }}
     >
-      <Scene trace={trace} frame={frame} layout={layout} timeline={timeline} />
-      <ModeLabel meta={trace.meta} layout={layout} />
+      {/* The scene gets its own stacking context, so no z-index inside it can
+          rise above the mode label. */}
+      <div style={{ position: "absolute", inset: 0, isolation: "isolate", zIndex: 0 }}>
+        <Scene trace={trace} frame={frame} layout={layout} timeline={timeline} />
+      </div>
+      <div style={{ position: "absolute", inset: 0, zIndex: 1, pointerEvents: "none" }}>
+        <ModeLabel meta={trace.meta} layout={layout} />
+      </div>
     </div>
   );
 }

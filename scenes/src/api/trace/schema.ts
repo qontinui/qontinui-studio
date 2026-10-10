@@ -11,6 +11,8 @@
  */
 import { z } from "zod";
 
+import { describeCharacter, uncoveredCharacters } from "../text-coverage";
+
 export const TRACE_VERSION = 1 as const;
 
 const isoTimestamp = z
@@ -125,19 +127,26 @@ export const EVENT_KINDS = [
 // date range and source; a synthetic trace is never presented as real)
 // ---------------------------------------------------------------------------
 
+/**
+ * Capped so the on-screen mode line (date range + source) fits in at most
+ * three wrapped lines at the narrowest aspect (9:16); see ModeLabel.
+ */
+export const SOURCE_REF_MAX = 120;
+const sourceRef = z.string().min(1).max(SOURCE_REF_MAX);
+
 export const traceSource = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("hand-authored"),
-      /** Who/what authored it, e.g. a file path. Shown on screen. */
-      ref: z.string().min(1).max(200),
+      /** Who/what authored it, e.g. a file path. */
+      ref: sourceRef,
     })
     .strict(),
   z
     .object({
       kind: z.literal("build-record"),
-      /** The export this replay was built from, e.g. a repo set or URL. */
-      ref: z.string().min(1).max(200),
+      /** The export this replay was built from, e.g. a repo set or URL. Shown on screen. */
+      ref: sourceRef,
       /** The build-record export version `fromBuildRecord` was pinned to. */
       export_version: z.string().min(1).max(40),
     })
@@ -175,8 +184,30 @@ const traceShape = z
   })
   .strict();
 
+/** Every string value in `value`, with its path. */
+function* strings(value: unknown, path: (string | number)[] = []): Generator<[(string | number)[], string]> {
+  if (typeof value === "string") yield [path, value];
+  else if (Array.isArray(value)) for (const [i, v] of value.entries()) yield* strings(v, [...path, i]);
+  else if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) yield* strings(v, [...path, k]);
+  }
+}
+
 export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   const { meta } = trace;
+
+  // Every character must have a glyph in the bundled fonts (no tofu, no
+  // machine-dependent fallback font).
+  for (const [path, value] of strings(trace)) {
+    const missing = uncoveredCharacters(value);
+    if (missing.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path,
+        message: `characters the bundled fonts cannot draw: ${missing.map(describeCharacter).join(", ")}`,
+      });
+    }
+  }
 
   if (meta.mode === "replay") {
     if (!meta.date_range) {

@@ -56,3 +56,18 @@ export function layoutFor(aspect: Aspect): Layout {
     safe: { x: margin, y: margin, width: width - 2 * margin, height: height - 2 * margin },
   };
 }
+
+/** A scale must give whole, even pixel dimensions at every aspect (H.264/VP8 need even sizes). */
+export function scaleProblem(scale: number): string | null {
+  if (!(scale > 0 && scale <= 4)) return "--scale must be in (0, 4]";
+  for (const aspect of ASPECTS) {
+    const { width, height } = ASPECT_SIZES[aspect];
+    for (const size of [width * scale, height * scale]) {
+      const rounded = Math.round(size);
+      if (Math.abs(size - rounded) > 1e-9 || rounded % 2 !== 0) {
+        return `--scale ${scale} gives ${width * scale}x${height * scale} at ${aspect}; it must give even whole pixels at every aspect (e.g. 0.25, 0.5, 1, 2)`;
+      }
+    }
+  }
+  return null;
+}

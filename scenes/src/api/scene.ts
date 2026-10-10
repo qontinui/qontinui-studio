@@ -32,6 +32,8 @@ export interface SceneDefinition {
   title: string;
   /** The trace fields this scene reads (plan Phase 2: scenes declare them). */
   requires: SceneRequirements;
+  /** Scene-specific shape checks (e.g. "exactly one plan"); empty when fine. */
+  check?: (trace: SceneTrace) => string[];
   /** Trace → timeline; determines the render's duration. */
   timeline: (trace: SceneTrace, fps: number) => Timeline;
   Component: ComponentType<SceneProps>;
@@ -54,5 +56,6 @@ export function missingRequirements(scene: SceneDefinition, trace: SceneTrace): 
   for (const entity of scene.requires.entities) {
     if (trace.entities[entity].length === 0) missing.push(`entities.${entity}`);
   }
+  if (scene.check) missing.push(...scene.check(trace));
   return missing;
 }

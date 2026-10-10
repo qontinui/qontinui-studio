@@ -19,8 +19,9 @@
     "lint": "eslint .",
     "test": "vitest run --config vitest.config.ts",
     "test:golden": "vitest run --config vitest.golden.config.ts",
-    "goldens:update": "tsx scripts/update-goldens.ts",
-    "browser:ensure": "tsx scripts/ensure-browser.ts"
+    "goldens:update": "UPDATE_GOLDENS=1 vitest run --config vitest.golden.config.ts",
+    "browser:ensure": "tsx scripts/ensure-browser.ts",
+    "lint:selftest": "tsx scripts/lint-selftest.ts"
   },
   "dependencies": {
     "react": "19.2.8",

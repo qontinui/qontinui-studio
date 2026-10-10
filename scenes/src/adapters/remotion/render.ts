@@ -8,15 +8,21 @@
  * - a fixed frame rate (`STUDIO_FPS`) and frame-seeked rendering;
  * - fonts bundled from `assets/fonts/`, never fetched from the web, and the
  *   browser started under the studio's own fontconfig (`fontconfig/fonts.conf`:
- *   no system fonts, fixed antialiasing/hinting), so the machine's font setup
- *   cannot change how text rasterises;
+ *   no system fonts, fixed antialiasing/hinting) instead of the machine's.
+ *   Frames were byte-identical on the Debian dev host and a local ubuntu:24.04
+ *   container; CI is the authority beyond those two;
  * - scenes are pure functions of `(trace, frame)` (enforced by lint).
+ *
+ * Output safety: see ../output.ts — nothing is deleted that this adapter did
+ * not write, and nothing recursively.
+ *
+ * Replays: every entry point refuses a replay trace without build-record
+ * provenance (../../api/trace/provenance.ts, plan D2).
  *
  * Licensing/telemetry: no `licenseKey` is passed, so Remotion sends no usage
  * event; the free-licence eligibility is recorded in plan Phase 0. No cloud
  * or Lambda rendering is used.
  */
-import { mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,9 +48,17 @@ import type {
   StillsRequest,
 } from "../../api/engine";
 import type { Aspect } from "../../api/layout";
-import { getScene } from "../../scenes";
 import { missingRequirements } from "../../api/scene";
+import { assertRenderable } from "../../api/trace/provenance";
 import type { SceneTrace } from "../../api/trace/schema";
+import { getScene } from "../../scenes";
+import {
+  checkFileTarget,
+  checkSequenceTarget,
+  publishFile,
+  publishSequence,
+  withStaging,
+} from "../output";
 import type { StudioCompositionProps } from "./StudioComposition";
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -66,6 +80,24 @@ export interface RemotionAdapterOptions {
   serveUrl?: string;
 }
 
+/**
+ * Remotion's `openBrowser` takes no environment option: it spawns Chrome with
+ * `process.env` as it is at that moment. So the studio fontconfig is set only
+ * for the duration of the launch and the previous value is restored in
+ * `finally`; Chrome keeps the environment it was started with.
+ */
+async function launchBrowser(logLevel: LogLevel): Promise<HeadlessBrowser> {
+  await ensureBrowser({ logLevel });
+  const previous = process.env.FONTCONFIG_FILE;
+  process.env.FONTCONFIG_FILE = FONTCONFIG_FILE;
+  try {
+    return await openBrowser("chrome", { chromiumOptions: CHROMIUM_OPTIONS, logLevel });
+  } finally {
+    if (previous === undefined) delete process.env.FONTCONFIG_FILE;
+    else process.env.FONTCONFIG_FILE = previous;
+  }
+}
+
 export class RemotionAdapter implements EngineAdapter {
   readonly name = "remotion";
   private readonly logLevel: LogLevel;
@@ -84,19 +116,16 @@ export class RemotionAdapter implements EngineAdapter {
   }
 
   private getBrowser(): Promise<HeadlessBrowser> {
-    // The browser inherits this process's environment; pin its fontconfig.
-    process.env.FONTCONFIG_FILE = FONTCONFIG_FILE;
-    this.browser ??= ensureBrowser({ logLevel: this.logLevel }).then(() =>
-      openBrowser("chrome", { chromiumOptions: CHROMIUM_OPTIONS, logLevel: this.logLevel }),
-    );
+    this.browser ??= launchBrowser(this.logLevel);
     return this.browser;
   }
 
   private async composition(sceneId: string, trace: SceneTrace, aspect: Aspect) {
+    assertRenderable(trace);
     const scene = getScene(sceneId);
-    const missing = missingRequirements(scene, trace);
-    if (missing.length) {
-      throw new Error(`trace cannot drive scene "${sceneId}"; missing: ${missing.join(", ")}`);
+    const problems = missingRequirements(scene, trace);
+    if (problems.length) {
+      throw new Error(`trace cannot drive scene "${sceneId}"; it needs: ${problems.join("; ")}`);
     }
     const inputProps: StudioCompositionProps = { sceneId, trace, aspect };
     const serveUrl = await this.getServeUrl();
@@ -113,6 +142,13 @@ export class RemotionAdapter implements EngineAdapter {
   }
 
   async render(request: RenderRequest): Promise<RenderResult> {
+    const overwrite = request.overwrite ?? false;
+    const outPath = path.resolve(request.outPath);
+    const sequence = request.format === "png" && request.frame === undefined;
+    // Refuse before any work if the target is unsafe; re-checked at publish.
+    if (sequence) await checkSequenceTarget(outPath, overwrite);
+    else await checkFileTarget(outPath, overwrite);
+
     const { serveUrl, puppeteerInstance, composition, inputProps } = await this.composition(
       request.scene,
       request.trace,
@@ -136,75 +172,70 @@ export class RemotionAdapter implements EngineAdapter {
       durationInFrames: composition.durationInFrames,
     });
 
-    if (request.format === "png") {
-      if (request.frame !== undefined) {
-        assertFrame(request.frame, composition.durationInFrames);
-        await mkdir(path.dirname(request.outPath), { recursive: true });
-        await renderStill({
+    return withStaging(outPath, async (staging) => {
+      if (sequence) {
+        await renderFrames({
           ...common,
-          output: request.outPath,
-          frame: request.frame,
+          outputDir: staging,
           imageFormat: "png",
-          overwrite: true,
+          onStart: () => undefined,
+          onFrameUpdate: (rendered) => request.onProgress?.(rendered / composition.durationInFrames),
         });
-        return result([request.outPath]);
+        return result(await publishSequence(staging, outPath, overwrite));
       }
-      await rm(request.outPath, { recursive: true, force: true });
-      await mkdir(request.outPath, { recursive: true });
-      await renderFrames({
-        ...common,
-        outputDir: request.outPath,
-        imageFormat: "png",
-        onStart: () => undefined,
-        onFrameUpdate: (rendered) => request.onProgress?.(rendered / composition.durationInFrames),
-      });
-      const files = (await readdir(request.outPath))
-        .filter((f) => f.endsWith(".png"))
-        .sort()
-        .map((f) => path.join(request.outPath, f));
-      return result(files);
-    }
 
-    await mkdir(path.dirname(request.outPath), { recursive: true });
-    await renderMedia({
-      ...common,
-      codec: CODECS[request.format],
-      outputLocation: request.outPath,
-      overwrite: true,
-      // GIF at half rate keeps files sane; video keeps every frame.
-      everyNthFrame: request.format === "gif" ? 2 : 1,
-      onProgress: ({ progress }) => request.onProgress?.(progress),
+      const staged = path.join(staging, `output.${request.format}`);
+      if (request.format === "png") {
+        const frame = request.frame as number;
+        assertFrame(frame, composition.durationInFrames);
+        await renderStill({ ...common, output: staged, frame, imageFormat: "png" });
+      } else {
+        await renderMedia({
+          ...common,
+          codec: CODECS[request.format],
+          outputLocation: staged,
+          // GIF at half rate keeps files sane; video keeps every frame.
+          everyNthFrame: request.format === "gif" ? 2 : 1,
+          onProgress: ({ progress }) => request.onProgress?.(progress),
+        });
+      }
+      return result([await publishFile(staged, outPath, overwrite)]);
     });
-    return result([request.outPath]);
   }
 
   async renderStills(request: StillsRequest): Promise<string[]> {
+    const overwrite = request.overwrite ?? false;
+    const target = (frame: number) =>
+      path.resolve(request.outDir, `${request.prefix ?? ""}f${String(frame).padStart(4, "0")}.png`);
+    for (const frame of request.frames) await checkFileTarget(target(frame), overwrite);
+
     const { serveUrl, puppeteerInstance, composition, inputProps } = await this.composition(
       request.scene,
       request.trace,
       request.aspect,
     );
-    await mkdir(request.outDir, { recursive: true });
-    const files: string[] = [];
-    for (const frame of request.frames) {
-      assertFrame(frame, composition.durationInFrames);
-      const output = path.join(request.outDir, `${request.prefix ?? ""}f${String(frame).padStart(4, "0")}.png`);
-      await renderStill({
-        serveUrl,
-        composition,
-        inputProps,
-        puppeteerInstance,
-        chromiumOptions: CHROMIUM_OPTIONS,
-        logLevel: this.logLevel,
-        scale: request.scale ?? 1,
-        output,
-        frame,
-        imageFormat: "png",
-        overwrite: true,
-      });
-      files.push(output);
-    }
-    return files;
+    for (const frame of request.frames) assertFrame(frame, composition.durationInFrames);
+
+    return withStaging(target(0), async (staging) => {
+      const files: string[] = [];
+      for (const frame of request.frames) {
+        const staged = path.join(staging, `f${frame}.png`);
+        await renderStill({
+          serveUrl,
+          composition,
+          inputProps,
+          puppeteerInstance,
+          chromiumOptions: CHROMIUM_OPTIONS,
+          logLevel: this.logLevel,
+          scale: request.scale ?? 1,
+          output: staged,
+          frame,
+          imageFormat: "png",
+        });
+        files.push(await publishFile(staged, target(frame), overwrite));
+      }
+      return files;
+    });
   }
 
   async close(): Promise<void> {

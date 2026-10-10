@@ -137,6 +137,8 @@ export interface EdgeState {
 }
 
 export interface LaneState {
+  /** Session id — the React key; labels need not be unique. */
+  id: string;
   label: string;
   start: number;
   end: number;
@@ -257,9 +259,10 @@ export function s1State(trace: SceneTrace, timeline: Timeline, frame: number): S
     const endEv = trace.events.find((e) => e.kind === "session.ended" && e.session === session.id);
     const startMs = startEv ? eventTimeMs(startEv) : Number.POSITIVE_INFINITY;
     const endMs = endEv ? eventTimeMs(endEv) : Number.POSITIVE_INFINITY;
-    if (nowMs < startMs) return { label: session.label, start: 0, end: 0, level: "inert" };
+    if (nowMs < startMs) return { id: session.id, label: session.label, start: 0, end: 0, level: "inert" };
     const ended = nowMs >= endMs;
     return {
+      id: session.id,
       label: session.label,
       start: axis(startMs),
       end: axis(Math.min(nowMs, endMs)),

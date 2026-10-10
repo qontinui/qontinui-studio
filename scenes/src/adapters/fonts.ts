@@ -5,11 +5,17 @@
  */
 import { FONT_FAMILY, fontFiles } from "../api/typography";
 
-let loading: Promise<void> | null = null;
+/** One load per font source (a page may embed players with different asset bases). */
+const loading = new Map<string, Promise<void>>();
 
-export function loadStudioFonts(urlFor: (file: string) => string): Promise<void> {
-  if (loading) return loading;
-  loading = Promise.all(
+/**
+ * @param sourceKey identifies where the files come from (e.g. the asset base
+ *   URL); loads are cached per key, and a failed load is not cached.
+ */
+export function loadStudioFonts(sourceKey: string, urlFor: (file: string) => string): Promise<void> {
+  const cached = loading.get(sourceKey);
+  if (cached) return cached;
+  const promise = Promise.all(
     fontFiles.map(async ({ weight, file }) => {
       const face = new FontFace(FONT_FAMILY, `url("${urlFor(file)}") format("woff2")`, {
         weight: String(weight),
@@ -20,5 +26,7 @@ export function loadStudioFonts(urlFor: (file: string) => string): Promise<void>
       document.fonts.add(face);
     }),
   ).then(() => undefined);
-  return loading;
+  loading.set(sourceKey, promise);
+  promise.catch(() => loading.delete(sourceKey));
+  return promise;
 }

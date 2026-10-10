@@ -8,7 +8,9 @@
  *   196 CI failed: attention colour, gate closed, PR card "CI failed"
  *   290 merge train: landing colour, gate open
  *   425 last frame: every stage done
- * plus one mid-scene frame for each of the other two aspects.
+ * plus one mid-scene frame for each of the other two aspects, and one
+ * frame per aspect of a replay with the longest allowed source (the mode
+ * label must wrap, not clip, and must not collide with the header).
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -16,6 +18,7 @@ import { fileURLToPath } from "node:url";
 
 import type { Aspect } from "../../src/api/layout";
 import { parseTrace, type SceneTrace } from "../../src/api/trace/schema";
+import { attestReplayForTests } from "../../src/api/trace/testing";
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 export const GOLDEN_DIR = path.join(PACKAGE_ROOT, "tests/golden/__goldens__");
@@ -28,43 +31,61 @@ export const TRACE_FILE = path.join(PACKAGE_ROOT, "traces/illustrative/s1-plan-l
 export const GOLDEN_SCALE = 0.5;
 
 /**
- * pixelmatch per-pixel colour threshold (0..1, YIQ distance) and the share of
- * pixels allowed to differ. Anti-aliased pixels are COUNTED (`includeAA`):
- * at golden scale most text pixels are anti-aliased edges, so excluding them
- * let a label colour change (text.muted -> text.secondary) pass unseen.
+ * Goldens must match EXACTLY: zero differing pixels at pixelmatch threshold 0
+ * (anti-aliased pixels counted). pixelmatch is used only to count and to draw
+ * the diff image. A looser tolerance let real changes through: a header
+ * recolour, and a one-digit PR number change (412 -> 413, 29 px).
  *
- * The threshold is deliberately tight: S1's state colours are translucent
- * tints, and changing one stage from `attention` to `waiting` moves 1.97% of
- * the frame at 0.02 but only 0.14% at pixelmatch's default 0.1, which is too
- * close to the limit. The ratio is tight too (0.01%, ~50 pixels of a 960x540
- * frame), because recolouring one small label moves only ~0.1-0.2%. That is
- * affordable because the pinned browser + fontconfig give byte-identical
- * frames across machines (verified Debian 13 host vs Ubuntu 24.04 container,
- * both AVX2). If a CI CPU ever adds rasterisation noise, the diff artifact
- * shows it; widen this only with that evidence.
+ * Exactness is affordable because renders have been byte-identical across
+ * the machines tried so far: the Debian 13 development host and a local
+ * ubuntu:24.04 container (both AVX2). That is not proof for every machine;
+ * CI (ubuntu-24.04) is the authority. If it ever shows rasterisation noise,
+ * the uploaded diff images are the evidence to decide on.
  */
-export const PIXEL_THRESHOLD = 0.02;
-export const MAX_DIFF_RATIO = 0.0001;
+export const PIXEL_THRESHOLD = 0;
 
 export interface GoldenCase {
+  /** File-name prefix for this case's goldens. */
+  id: string;
   aspect: Aspect;
   frames: readonly number[];
+  /** Builds the trace; may attest a test-only replay. */
+  trace: () => SceneTrace;
 }
 
-export const GOLDEN_CASES: readonly GoldenCase[] = [
-  { aspect: "16:9", frames: [0, 48, 196, 290, 425] },
-  { aspect: "9:16", frames: [250] },
-  { aspect: "1:1", frames: [250] },
-];
-
-export function casePrefix(aspect: Aspect): string {
-  return `${SCENE_ID}-${aspect.replace(":", "x")}-`;
-}
-
-export function goldenName(aspect: Aspect, frame: number): string {
-  return `${casePrefix(aspect)}f${String(frame).padStart(4, "0")}.png`;
-}
+/** 120 characters: SOURCE_REF_MAX, the longest source the schema accepts. */
+export const LONG_SOURCE_REF =
+  "build-record export of qontinui/qontinui-design-tokens, qontinui/qontinui-studio and qontinui/qontinui-web, last 30 days";
 
 export function loadS1Trace(): SceneTrace {
   return parseTrace(JSON.parse(readFileSync(TRACE_FILE, "utf8")));
+}
+
+/**
+ * The S1 events as a REPLAY with the longest allowed source, attested through
+ * the test-only hook (the CLI refuses hand-written replays). Checks that the
+ * mode label wraps instead of clipping at the narrowest aspect.
+ */
+export function longSourceReplayTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(TRACE_FILE, "utf8"));
+  json.meta = {
+    mode: "replay",
+    title: json.meta.title,
+    source: { kind: "build-record", ref: LONG_SOURCE_REF, export_version: "1" },
+    date_range: { from: "2026-09-14T00:00:00Z", to: "2026-09-15T23:59:59Z" },
+  };
+  return attestReplayForTests(parseTrace(json));
+}
+
+export const GOLDEN_CASES: readonly GoldenCase[] = [
+  { id: `${SCENE_ID}-16x9`, aspect: "16:9", frames: [0, 48, 196, 290, 425], trace: loadS1Trace },
+  { id: `${SCENE_ID}-9x16`, aspect: "9:16", frames: [250], trace: loadS1Trace },
+  { id: `${SCENE_ID}-1x1`, aspect: "1:1", frames: [250], trace: loadS1Trace },
+  { id: `${SCENE_ID}-16x9-replay-long-source`, aspect: "16:9", frames: [250], trace: longSourceReplayTrace },
+  { id: `${SCENE_ID}-9x16-replay-long-source`, aspect: "9:16", frames: [250], trace: longSourceReplayTrace },
+  { id: `${SCENE_ID}-1x1-replay-long-source`, aspect: "1:1", frames: [250], trace: longSourceReplayTrace },
+];
+
+export function goldenName(c: GoldenCase, frame: number): string {
+  return `${c.id}-f${String(frame).padStart(4, "0")}.png`;
 }

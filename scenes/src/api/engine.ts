@@ -25,6 +25,11 @@ export interface RenderRequest {
   frame?: number;
   /** Output scale factor (1 = native 1920x1080 / 1080x1920 / 1080x1080). */
   scale?: number;
+  /**
+   * Replace an existing output file, or a previous `element-*.png` sequence.
+   * Without it an existing target is refused. Nothing else is ever deleted.
+   */
+  overwrite?: boolean;
   onProgress?: (fraction: number) => void;
 }
 
@@ -46,6 +51,8 @@ export interface StillsRequest {
   outDir: string;
   prefix?: string;
   scale?: number;
+  /** Replace existing files of the same names (default: refuse). */
+  overwrite?: boolean;
 }
 
 export interface EngineAdapter {
@@ -60,7 +67,8 @@ export interface EngineAdapter {
 /** Props of an adapter's embeddable web player. */
 export interface PlayerEmbedProps {
   scene: string;
-  trace: SceneTrace;
+  /** Untrusted input: the player validates it and refuses an unproven replay. */
+  trace: unknown;
   aspect: Aspect;
   /** Base URL the bundled fonts are served from (contains `fonts/`). */
   assetBaseUrl: string;

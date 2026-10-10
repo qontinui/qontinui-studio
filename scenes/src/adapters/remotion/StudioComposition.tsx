@@ -32,7 +32,7 @@ export function StudioComposition({ sceneId, trace, aspect, assetBaseUrl }: Stud
   const frame = useCurrentFrame();
   const [fontHandle] = useState(() => delayRender("Loading the studio fonts"));
   useEffect(() => {
-    loadStudioFonts(fontUrl(assetBaseUrl))
+    loadStudioFonts(assetBaseUrl ?? "remotion-static", fontUrl(assetBaseUrl))
       .then(() => continueRender(fontHandle))
       .catch((err: unknown) => cancelRender(err instanceof Error ? err : new Error(String(err))));
   }, [assetBaseUrl, fontHandle]);

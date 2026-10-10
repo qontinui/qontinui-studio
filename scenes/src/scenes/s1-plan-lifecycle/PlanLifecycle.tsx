@@ -14,7 +14,11 @@ interface Placement {
   axis: { x: number; y: number; width: number };
 }
 
-/** Where everything goes, per orientation. Pure function of the layout. */
+/**
+ * Where everything goes, per orientation. Pure function of the layout. The
+ * header starts below the room the mode label needs at its longest (three
+ * wrapped lines with a 120-character source).
+ */
 function place(layout: Layout): Placement {
   const { safe, unit: u } = layout;
   const right = safe.x + safe.width;
@@ -22,7 +26,7 @@ function place(layout: Layout): Placement {
   if (layout.orientation === "landscape") {
     const step = safe.width / STAGES.length;
     return {
-      header: { x: safe.x, y: 120 * u, width: safe.width },
+      header: { x: safe.x, y: 140 * u, width: safe.width },
       nodes: STAGES.map((_, i) => ({ x: safe.x + step * (i + 0.5), y: 330 * u })),
       node: { width: step - 30 * u, height: 104 * u },
       caption: { x: safe.x, y: 480 * u, width: 860 * u },
@@ -41,7 +45,7 @@ function place(layout: Layout): Placement {
     const rightX = safe.x + colWidth + 48 * u;
     const rightW = right - rightX;
     return {
-      header: { x: safe.x, y: 130 * u, width: safe.width },
+      header: { x: safe.x, y: 170 * u, width: safe.width },
       nodes: STAGES.map((_, i) => ({ x: safe.x + colWidth / 2, y: top + step * i })),
       node: { width: colWidth, height: 92 * u },
       caption: { x: rightX, y: top - 40 * u, width: rightW },
@@ -59,19 +63,19 @@ function place(layout: Layout): Placement {
   const cardWidth = 620 * u;
   const sideX = safe.x + 300 * u;
   return {
-    header: { x: safe.x, y: 110 * u, width: safe.width },
+    header: { x: safe.x, y: 150 * u, width: safe.width },
     nodes: STAGES.map((_, i) => {
       const row = Math.floor(i / perRow);
       const col = row === 0 ? i : perRow - 1 - (i - perRow);
-      return { x: safe.x + step * (col + 0.5), y: (262 + row * 124) * u };
+      return { x: safe.x + step * (col + 0.5), y: (300 + row * 124) * u };
     }),
     node: { width: step - 26 * u, height: 84 * u },
-    caption: { x: safe.x, y: 460 * u, width: safe.width },
-    pr: { x: safe.x, y: 590 * u, width: cardWidth },
-    gate: { x: safe.x + cardWidth + (safe.width - cardWidth) / 2, y: 625 * u, size: 80 * u },
-    counter: { x: safe.x, y: 760 * u },
-    lanes: { x: sideX, y: 750 * u, width: right - sideX, step: 58 * u },
-    axis: { x: safe.x, y: 920 * u, width: safe.width },
+    caption: { x: safe.x, y: 498 * u, width: safe.width },
+    pr: { x: safe.x, y: 622 * u, width: cardWidth },
+    gate: { x: safe.x + cardWidth + (safe.width - cardWidth) / 2, y: 657 * u, size: 80 * u },
+    counter: { x: safe.x, y: 786 * u },
+    lanes: { x: sideX, y: 778 * u, width: right - sideX, step: 58 * u },
+    axis: { x: safe.x, y: 950 * u, width: safe.width },
   };
 }
 
@@ -190,7 +194,7 @@ export function PlanLifecycle({ trace, frame, layout, timeline }: SceneProps) {
 
       {state.lanes.map((lane, i) => (
         <SessionLane
-          key={lane.label}
+          key={lane.id}
           x={p.lanes.x}
           y={p.lanes.y + i * p.lanes.step}
           width={p.lanes.width}

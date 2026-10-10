@@ -10,6 +10,10 @@
  * The real mapping lands in Phase 3, once that export exists. Until then the
  * interface is fixed here so scenes, the CLI and tests can be written against
  * it, and calling it fails loudly rather than fabricating a replay.
+ *
+ * The real implementation MUST return its trace through
+ * `recordReplayProvenance` (./provenance): that is the only way a replay
+ * becomes renderable (plan D2).
  */
 import type { SceneTrace } from "./schema";
 

@@ -2,9 +2,11 @@
 import type { SceneDefinition } from "../api";
 import { s1PlanLifecycle } from "./s1-plan-lifecycle";
 
-export const scenes: Readonly<Record<string, SceneDefinition>> = {
-  [s1PlanLifecycle.id]: s1PlanLifecycle,
-};
+const ALL: readonly SceneDefinition[] = [s1PlanLifecycle];
+
+export const scenes: Readonly<Record<string, SceneDefinition>> = Object.fromEntries(
+  ALL.map((scene) => [scene.id, scene]),
+);
 
 export function getScene(id: string): SceneDefinition {
   const scene = scenes[id];

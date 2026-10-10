@@ -2,7 +2,8 @@
  * Typography for scenes. Studio-local until Phase 1 moves a typography scale
  * into `@qontinui/design-tokens` (plan D4); then this becomes an import.
  *
- * The family is the bundled Inter (SIL OFL 1.1, `assets/fonts/`), loaded by
+ * The family is the bundled Inter 4.1, full character set (SIL OFL 1.1,
+ * `assets/fonts/`, from `inter-ui@4.1.1`), loaded by
  * the engine adapter before the first frame. No web font is fetched at render
  * time, so text rasterises identically on every run.
  */
@@ -15,9 +16,9 @@ export const fontStack = `"${FONT_FAMILY}", sans-serif`;
 
 /** Font files bundled under `assets/fonts/`, keyed by weight. */
 export const fontFiles = [
-  { weight: 400, file: "fonts/inter-latin-400-normal.woff2" },
-  { weight: 600, file: "fonts/inter-latin-600-normal.woff2" },
-  { weight: 700, file: "fonts/inter-latin-700-normal.woff2" },
+  { weight: 400, file: "fonts/Inter-Regular.woff2" },
+  { weight: 600, file: "fonts/Inter-SemiBold.woff2" },
+  { weight: 700, file: "fonts/Inter-Bold.woff2" },
 ] as const;
 
 /**

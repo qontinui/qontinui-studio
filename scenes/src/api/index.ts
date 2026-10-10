@@ -13,3 +13,5 @@ export * from "./tokens";
 export * from "./typography";
 export * from "./trace/schema";
 export * from "./trace/from-build-record";
+export { assertRenderable, renderRefusal, REPLAY_REFUSAL } from "./trace/provenance";
+export * from "./text-coverage";
