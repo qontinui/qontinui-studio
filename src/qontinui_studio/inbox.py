@@ -3,20 +3,30 @@
 provenance a generated asset carries.
 
 The contract is ``<inbox-dir>/manifest.yaml``, described by
-``schemas/import-manifest.schema.json``. This module validates it by hand
-(``jsonschema`` is not a dependency); ``tests/test_library_import.py``
-cross-checks the constants below against that schema file, so the two cannot
-drift.
+``schemas/import-manifest.schema.json``. This module validates it by hand;
+``tests/test_library_import.py`` cross-checks the constants below against that
+schema file and runs both over the same inputs, so the two cannot drift.
 
 Rules:
 
 * The WHOLE manifest is validated before anything is written. One bad entry
   refuses the import, and every problem is reported with its entry index.
-* Width, height, SHA-256 and MIME type are MEASURED by decoding the bytes with
-  Pillow (PNG, JPEG or WebP); the file extension is never trusted.
-* Each file is copied into the content-addressed raw store
-  (``.studio/raw/imported/<sha[:2]>/<sha>.<ext>``); the inbox is never
-  referenced again.
+* The manifest is plain data: at most :data:`MAX_MANIFEST_BYTES`, at most
+  :data:`MAX_ENTRIES` entries, no YAML anchors, aliases, merge keys or
+  duplicate keys. A manifest value never appears in a message unless it is a
+  (truncated) string.
+* Each file is opened ONCE, from a descriptor on the inbox, walking every path
+  component with ``O_NOFOLLOW`` (POSIX), and must be a regular file with one
+  link. Its bytes are streamed into a private staging file under ``.studio/``
+  while being hashed; the size, SHA-256, format and dimensions all come from
+  that one read, and the inbox is never touched again.
+* Width, height, SHA-256 and MIME type are MEASURED by decoding the staged
+  bytes with Pillow (PNG, JPEG or WebP); the extension is never trusted. The
+  pixel count is checked from the header before any pixel is decoded.
+* Staged files are renamed into the content-addressed raw store
+  (``.studio/raw/imported/<sha[:2]>/<sha>.<ext>``) inside the database write
+  transaction; on refusal or rollback every staged file, and every raw file
+  this import created, is deleted.
 * Re-importing the same bytes under the same asset id is a no-op.
 * Imported rows go in batch ``import:<inbox basename>``, whose status is
   ``imported`` — a status the database refuses to move, so an import is never
@@ -25,15 +35,18 @@ Rules:
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
-import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
+import uuid
 import warnings as py_warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -44,19 +57,29 @@ import yaml
 from PIL import Image
 
 from qontinui_studio.errors import ImportRefused
-from qontinui_studio.library import ALIAS_PATTERN, APPROVAL_STATUSES, MIMES, is_alias
+from qontinui_studio.library import APPROVAL_STATUSES, END_OF_STRING, MIMES, is_alias
 from qontinui_studio.postprocess import sha256_file
-from qontinui_studio.publish import atomic_write
 from qontinui_studio.workspace import Workspace
 
 MANIFEST_NAME = "manifest.yaml"
-ASSET_ID_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
-INBOX_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+# Every pattern is written so Python ``re`` (with re.ASCII), the jsonschema
+# package and ECMA-262 read it the same way: explicit [0-9] rather than \d, an
+# explicit ASCII whitespace class rather than \s/\S, and END_OF_STRING rather
+# than $ (see library.py). The schema file carries the same strings.
+NON_EMPTY_PATTERN = r"[^\t\n\v\f\r ]"
+ASSET_ID_PATTERN = r"^[a-z0-9][a-z0-9-]*" + END_OF_STRING
+INBOX_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*" + END_OF_STRING
+HTTPS_URL_PATTERN = r"^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?([/?#][!-~]*)?" + END_OF_STRING
+DATE_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}" + END_OF_STRING
+# Seconds are 00-59: a leap second (:60) is refused by both the schema and the
+# code (Python's datetime cannot represent it).
+RFC3339_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]+)?"
+    r"([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])" + END_OF_STRING
+)
 COMMERCIAL_USE = ("yes", "no", "unknown")
 WATERMARKS = ("none", "invisible", "visible", "unknown")
-HTTPS_URL_PATTERN = r"^https://[A-Za-z0-9][A-Za-z0-9.-]*(:\d+)?([/?#][^\s]*)?$"
-DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
-RFC3339_PATTERN = r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$"
+ALIAS_RULE = "letters, digits, '.', '_' or '-' only — never an e-mail address, no whitespace"
 
 REQUIRED_FIELDS = (
     "file",
@@ -72,19 +95,79 @@ REQUIRED_FIELDS = (
     "ai_generated",
 )
 OPTIONAL_FIELDS = ("reference_images", "tos_reviewed", "status", "approved_by", "approved_on")
-# Import size caps. A file over MAX_FILE_BYTES is refused before it is read; an
+
+# Import caps. A file over MAX_FILE_BYTES is refused before it is read; an
 # image whose header declares more than MAX_PIXELS pixels is refused before
-# its pixel data is decoded (a decompression bomb never expands).
+# its pixel data is decoded (a decompression bomb never expands). The manifest
+# itself, its entry count and the bytes one import may read are bounded too.
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_PIXELS = 100_000_000
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_ENTRIES = 1000
+MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+
 EXTENSIONS = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}
 _IMPORTED_SUBDIR = "imported"
+_STAGING_SUBDIR = "import-staging"
+_CHUNK = 1024 * 1024
+_SHOWN_CHARS = 80
+
+
+def _match(pattern: str, value: object) -> bool:
+    return isinstance(value, str) and re.match(pattern, value, re.ASCII) is not None
+
+
+def _non_empty(value: object) -> bool:
+    return isinstance(value, str) and re.search(NON_EMPTY_PATTERN, value, re.ASCII) is not None
+
+
+def _show(value: object) -> str:
+    """A manifest value for a message: a string, quoted and truncated, or
+    otherwise only its type name — never the value itself, so an expanded
+    structure can never be rendered into an error."""
+    if isinstance(value, str):
+        cut = value[:_SHOWN_CHARS]
+        return repr(cut) + ("…" if len(value) > _SHOWN_CHARS else "")
+    return f"a value of type {type(value).__name__}"
+
+
+# ---- the manifest loader ----------------------------------------------------
 
 
 class _ManifestLoader(yaml.SafeLoader):
-    """YAML 1.2-style scalars: only ``true``/``false`` are booleans (so
-    ``commercial_use: yes`` is the string 'yes', not True) and dates stay
-    strings (validated here, not coerced by the parser)."""
+    """Plain data only. YAML 1.2-style scalars: only ``true``/``false`` are
+    booleans (so ``commercial_use: yes`` is the string 'yes', not True) and
+    dates stay strings (validated here, not coerced by the parser). Anchors,
+    aliases, merge keys and duplicate keys are refused."""
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        event = self.peek_event()  # type: ignore[no-untyped-call]
+        if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
+            raise yaml.composer.ComposerError(
+                None, None, "YAML anchors and aliases are not allowed", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> Any:
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                raise yaml.constructor.ConstructorError(
+                    None, None, "YAML merge keys are not allowed", key_node.start_mark
+                )
+            key = self.construct_object(key_node, deep=True)
+            try:
+                duplicate = key in seen
+            except TypeError:
+                raise yaml.constructor.ConstructorError(
+                    None, None, "a mapping key must be a plain scalar", key_node.start_mark
+                ) from None
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate key {_show(key)}", key_node.start_mark
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 _ManifestLoader.yaml_implicit_resolvers = {
@@ -102,8 +185,210 @@ _ManifestLoader.add_implicit_resolver(
 )
 
 
+# ---- opening files inside the inbox -------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Opened:
+    fd: int
+    size: int
+
+
+def _split(raw: str) -> list[str] | str:
+    """Path components of a manifest ``file``, or why it is refused."""
+    if "\x00" in raw:
+        return "contains a NUL byte"
+    if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
+        return "is absolute; files must be relative to the inbox"
+    parts = [p for p in re.split(r"[\\/]", raw) if p not in ("", ".")]
+    if not parts:
+        return "must name a file"
+    if ".." in parts:
+        return "escapes the inbox ('..')"
+    return parts
+
+
+def _check_opened(fd: int, max_bytes: int, cap: str) -> _Opened | str:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a regular file"
+    if st.st_nlink > 1:
+        return "has more than one hard link; refused (it may live outside the inbox)"
+    if st.st_size > max_bytes:
+        return f"is {st.st_size} bytes, over the {max_bytes}-byte ({cap}) cap"
+    return _Opened(fd, st.st_size)
+
+
+def _open_error(e: OSError, component: str, final: bool) -> str:
+    if e.errno == errno.ENOENT:
+        return "does not exist in the inbox"
+    if e.errno in (errno.ELOOP, errno.EMLINK) or (e.errno == errno.ENOTDIR and not final):
+        where = "is a symlink" if final else f"goes through a symlink ({component})"
+        return f"{where}, or a non-directory; symlinks are refused"
+    return f"cannot be read ({type(e).__name__})"
+
+
+_DIR_FD = os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW")
+
+
+def _open_inside(
+    inbox: Path,
+    inbox_fd: int | None,
+    parts: list[str],
+    max_bytes: int | None = None,
+    cap: str = "50 MiB",
+) -> _Opened | str:
+    """Open ``parts`` under the inbox for reading, refusing any symlink.
+
+    On POSIX every component is opened relative to the previous directory's
+    descriptor with ``O_NOFOLLOW`` (directories with ``O_DIRECTORY``), and the
+    file with ``O_NONBLOCK`` so a FIFO cannot hang the import: a path component
+    swapped for a symlink at any moment is refused, because nothing is ever
+    re-resolved by name. Every check is then made on the opened descriptor.
+    Without ``dir_fd`` support (Windows) it falls back to an ``lstat`` walk and
+    an identity check of the opened file — best effort, not race-free."""
+    if _DIR_FD and inbox_fd is not None:
+        held: list[int] = []
+        try:
+            current = inbox_fd
+            for comp in parts[:-1]:
+                try:
+                    current = os.open(
+                        comp, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=current
+                    )
+                except OSError as e:
+                    return _open_error(e, comp, final=False)
+                held.append(current)
+            try:
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=current)
+            except OSError as e:
+                return _open_error(e, parts[-1], final=True)
+        finally:
+            for h in held:
+                os.close(h)
+    else:  # pragma: no cover - exercised on Windows only
+        path = inbox
+        for comp in parts:
+            path = path / comp
+            if path.is_symlink():
+                return f"goes through a symlink ({comp}); symlinks are refused"
+        try:
+            before = path.lstat()
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except OSError as e:
+            return _open_error(e, parts[-1], final=True)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            os.close(fd)
+            return "changed while being imported; refused"
+    checked = _check_opened(fd, MAX_FILE_BYTES if max_bytes is None else max_bytes, cap)
+    if isinstance(checked, str):
+        os.close(fd)
+    return checked
+
+
+@contextlib.contextmanager
+def _inbox_dir_fd(inbox: Path) -> Iterator[int | None]:
+    if not _DIR_FD:  # pragma: no cover - Windows
+        yield None
+        return
+    fd = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+# ---- staging: one streamed read per file ---------------------------------------
+
+
+class _Staging:
+    """Private copies of the inbox files under ``.studio/import-staging/<run>/``,
+    named by SHA-256. Bytes are hashed while they are copied, so each inbox
+    file is read exactly once and never held in memory whole."""
+
+    def __init__(self, ws: Workspace) -> None:
+        self.dir = ws.state_dir / _STAGING_SUBDIR / uuid.uuid4().hex
+        self.total = 0
+
+    def stage(self, opened: _Opened) -> tuple[str, int, Path] | str:
+        if self.total + opened.size > MAX_TOTAL_BYTES:
+            return f"would take this import past its {MAX_TOTAL_BYTES}-byte (2 GiB) total cap"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.dir / f".partial-{uuid.uuid4().hex}"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with os.fdopen(opened.fd, "rb", closefd=False) as src, tmp.open("wb") as dst:
+                while chunk := src.read(_CHUNK):
+                    size += len(chunk)
+                    self.total += len(chunk)
+                    if size > MAX_FILE_BYTES:
+                        return f"is over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
+                    if self.total > MAX_TOTAL_BYTES:
+                        return (
+                            f"would take this import past its {MAX_TOTAL_BYTES}-byte "
+                            "(2 GiB) total cap"
+                        )
+                    digest.update(chunk)
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except OSError as e:
+            return f"cannot be read ({type(e).__name__})"
+        # (A refused partial copy is removed with the whole run by discard().)
+        sha = digest.hexdigest()
+        staged = self.dir / sha
+        if staged.exists():
+            tmp.unlink()
+        else:
+            os.replace(tmp, staged)
+        return sha, size, staged
+
+    def discard(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            self.dir.parent.rmdir()  # only when no other import is staging
+
+
+def _decode(path: Path) -> tuple[str, int, int] | str:
+    """(Pillow format, width, height) of a fully decodable PNG/JPEG/WebP, or
+    the reason it is not one."""
+    too_big = f"is over the {MAX_PIXELS}-pixel (100 megapixel) cap"
+    try:
+        with py_warnings.catch_warnings():
+            # The cap below is the decision; Pillow's own bomb warning is noise.
+            py_warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(path) as img:
+                fmt = img.format or ""
+                if fmt not in MIMES:
+                    return f"is {fmt or 'an unknown format'}, not PNG/JPEG/WebP"
+                # Header dimensions only: checked BEFORE any pixel data is decoded,
+                # so a decompression bomb is refused without being expanded.
+                header_w, header_h = img.size
+                if header_w * header_h > MAX_PIXELS:
+                    return f"{too_big} ({header_w}x{header_h} in its header)"
+                img.verify()
+            with Image.open(path) as img:
+                img.load()
+                width, height = img.size
+    except Image.DecompressionBombError:
+        # Pillow refuses at open (before we can read the header) beyond 2x its
+        # own limit; that is far over our cap too.
+        return too_big
+    except Exception as e:
+        return f"is not a decodable PNG/JPEG/WebP image ({type(e).__name__})"
+    return fmt, width, height
+
+
+# ---- validation ------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class _Entry:
+    """A validated entry. It holds the staged copy's path and what was
+    measured from it — never the file's bytes."""
+
     index: int
     asset_id: str
     provider: str
@@ -119,8 +404,9 @@ class _Entry:
     status: str
     approved_by: str | None
     approved_on: str | None
-    data: bytes
+    staged: Path
     sha256: str
+    size: int
     width: int
     height: int
     image_format: str
@@ -135,18 +421,18 @@ class ImportOutcome:
 
 
 def _is_https_url(value: object) -> bool:
-    if not isinstance(value, str) or re.fullmatch(HTTPS_URL_PATTERN, value) is None:
+    if not _match(HTTPS_URL_PATTERN, value):
         return False
-    parts = urlsplit(value)
+    parts = urlsplit(str(value))
     return parts.scheme == "https" and bool(parts.hostname)
 
 
 def _iso_date(value: object) -> str | None:
     """``YYYY-MM-DD`` that is a real date, else None."""
-    if not isinstance(value, str) or re.fullmatch(DATE_PATTERN, value) is None:
+    if not _match(DATE_PATTERN, value):
         return None
     try:
-        return date.fromisoformat(value).isoformat()
+        return date.fromisoformat(str(value)).isoformat()
     except ValueError:
         return None
 
@@ -156,110 +442,24 @@ def _date_or_rfc3339(value: object) -> str | None:
     as_date = _iso_date(value)
     if as_date is not None:
         return as_date
-    if not isinstance(value, str) or re.fullmatch(RFC3339_PATTERN, value) is None:
+    if not _match(RFC3339_PATTERN, value):
         return None
+    text = str(value)
     try:
-        datetime.fromisoformat(value.replace("z", "Z").replace("t", "T"))
+        datetime.fromisoformat(text.replace("z", "Z").replace("t", "T"))
     except ValueError:
         return None
-    return value
-
-
-def _inbox_file(inbox: Path, raw: object) -> tuple[Path | None, str | None]:
-    """Resolve an entry's ``file`` inside the inbox, or say why not. Refuses an
-    absolute path, any ``..`` component, a symlink anywhere along the path, and
-    anything that is not a regular file inside the inbox."""
-    if not isinstance(raw, str) or not raw.strip():
-        return None, "must be a non-empty relative path"
-    if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
-        return None, f"'{raw}' is absolute; files must be relative to the inbox"
-    parts = [p for p in re.split(r"[\\/]", raw) if p not in ("", ".")]
-    if not parts:
-        return None, "must name a file"
-    if ".." in parts:
-        return None, f"'{raw}' escapes the inbox ('..')"
-    current = inbox
-    for part in parts:
-        current = current / part
-        if current.is_symlink():
-            return None, f"'{raw}' goes through a symlink ({part}); symlinks are refused"
-    if not current.exists():
-        return None, f"'{raw}' does not exist in the inbox"
-    resolved = current.resolve(strict=True)
-    if not resolved.is_relative_to(inbox):
-        return None, f"'{raw}' resolves outside the inbox"
-    if not resolved.is_file():
-        return None, f"'{raw}' is not a regular file"
-    return resolved, None
-
-
-def _read_inside(inbox: Path, path: Path) -> bytes | str:
-    """The file's bytes, read through a descriptor opened without following a
-    final symlink and re-checked to be the file that was validated (same
-    device and inode), so a path swapped after the check is refused. Returns
-    the reason as a string when it cannot be read."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    try:
-        expected = path.stat()
-        fd = os.open(path, flags)
-    except OSError as e:
-        return f"cannot be read ({type(e).__name__})"
-    try:
-        actual = os.fstat(fd)
-        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino) or not (
-            stat.S_ISREG(actual.st_mode)
-        ):
-            return "changed while being imported; refused"
-        if actual.st_nlink > 1:
-            return "has more than one hard link; refused (it may live outside the inbox)"
-        if actual.st_size > MAX_FILE_BYTES:
-            return f"is {actual.st_size} bytes, over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
-        with os.fdopen(fd, "rb", closefd=False) as f:
-            # Read at most one byte past the cap: a file grown since fstat is refused too.
-            data = f.read(MAX_FILE_BYTES + 1)
-        if len(data) > MAX_FILE_BYTES:
-            return f"is over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
-    except OSError as e:
-        return f"cannot be read ({type(e).__name__})"
-    finally:
-        os.close(fd)
-    if not path.resolve(strict=True).is_relative_to(inbox):
-        return "resolves outside the inbox"
-    return data
-
-
-def _decode(data: bytes) -> tuple[str, int, int] | str:
-    """(Pillow format, width, height) of a fully decodable PNG/JPEG/WebP, or
-    the reason it is not one."""
-    too_big = f"is over the {MAX_PIXELS}-pixel (100 megapixel) cap"
-    try:
-        with py_warnings.catch_warnings():
-            # The cap below is the decision; Pillow's own bomb warning is noise.
-            py_warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as img:
-                fmt = img.format or ""
-                if fmt not in MIMES:
-                    return f"is {fmt or 'an unknown format'}, not PNG/JPEG/WebP"
-                # Header dimensions only: checked BEFORE any pixel data is decoded,
-                # so a decompression bomb is refused without being expanded.
-                header_w, header_h = img.size
-                if header_w * header_h > MAX_PIXELS:
-                    return f"{too_big} ({header_w}x{header_h} in its header)"
-                img.verify()
-            with Image.open(io.BytesIO(data)) as img:
-                img.load()
-                width, height = img.size
-    except Image.DecompressionBombError:
-        # Pillow refuses at open (before we can read the header) beyond 2x its
-        # own limit; that is far over our cap too.
-        return too_big
-    except Exception as e:
-        return f"is not a decodable PNG/JPEG/WebP image ({type(e).__name__})"
-    return fmt, width, height
+    return text
 
 
 def _validate_entry(
-    inbox: Path, index: int, raw: object, errors: list[str], warnings: list[str]
+    inbox: Path,
+    inbox_fd: int | None,
+    staging: _Staging,
+    index: int,
+    raw: object,
+    errors: list[str],
+    warnings: list[str],
 ) -> _Entry | None:
     """Every structural and file-level rule for one entry. Problems are
     appended to ``errors`` (all of them, not just the first)."""
@@ -268,48 +468,44 @@ def _validate_entry(
         errors.append(f"entry {index}: {name}: {message}")
 
     if not isinstance(raw, dict):
-        errors.append(f"entry {index}: must be a mapping")
+        errors.append(f"entry {index}: must be a mapping, not {_show(raw)}")
         return None
     start = len(errors)
     known = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
-    for key in sorted(str(k) for k in raw if str(k) not in known):
-        err(key, "unknown field")
+    for key in sorted((k for k in raw if k not in known), key=_show):
+        err(_show(key) if not isinstance(key, str) else key[:_SHOWN_CHARS], "unknown field")
     for name in REQUIRED_FIELDS:
         if name not in raw:
             err(name, "required")
 
     def text(name: str) -> str:
         value = raw.get(name)
-        if name in raw and (not isinstance(value, str) or not value.strip()):
-            err(name, "must be a non-empty string")
+        if name in raw and not _non_empty(value):
+            err(name, f"must be a non-empty string, not {_show(value)}")
             return ""
         return value if isinstance(value, str) else ""
 
     asset_id = text("asset_id")
-    if asset_id and re.fullmatch(ASSET_ID_PATTERN, asset_id) is None:
-        err("asset_id", f"'{asset_id}' must match {ASSET_ID_PATTERN}")
+    if asset_id and not _match(ASSET_ID_PATTERN, asset_id):
+        err("asset_id", f"{_show(asset_id)} must be lowercase letters, digits and '-'")
     provider = text("provider")
     model = text("model")
     prompt = text("prompt")
     account = text("account")
     if account and not is_alias(account):
-        err(
-            "account",
-            f"'{account}' must be an alias matching {ALIAS_PATTERN} "
-            "(never an e-mail address, no whitespace)",
-        )
+        err("account", f"{_show(account)} must be an alias ({ALIAS_RULE})")
 
     references: list[Any] = []
     refs = raw.get("reference_images", [])
     if not isinstance(refs, list):
-        err("reference_images", "must be a list")
+        err("reference_images", f"must be a list, not {_show(refs)}")
     else:
         for n, ref in enumerate(refs):
             if isinstance(ref, str):
-                if re.fullmatch(ASSET_ID_PATTERN, ref) is None:
+                if not _match(ASSET_ID_PATTERN, ref):
                     err(
                         f"reference_images[{n}]",
-                        f"'{ref}' is not an asset id; local paths are refused — name an "
+                        f"{_show(ref)} is not an asset id; local paths are refused — name an "
                         "asset_id in this library or give {url, licence}",
                     )
                 elif ref == asset_id:
@@ -320,12 +516,15 @@ def _validate_entry(
                     err(f"reference_images[{n}]", "a mapping must have exactly url and licence")
                 elif not _is_https_url(ref["url"]):
                     err(f"reference_images[{n}].url", "must be an https URL")
-                elif not isinstance(ref["licence"], str) or not ref["licence"].strip():
+                elif not _non_empty(ref["licence"]):
                     err(f"reference_images[{n}].licence", "must be a non-empty string")
                 else:
                     references.append({"url": ref["url"], "licence": ref["licence"]})
             else:
-                err(f"reference_images[{n}]", "must be an asset_id or {url, licence}")
+                err(
+                    f"reference_images[{n}]",
+                    f"must be an asset_id or {{url, licence}}, not {_show(ref)}",
+                )
 
     generated_on = _date_or_rfc3339(raw.get("generated_on"))
     if "generated_on" in raw and generated_on is None:
@@ -355,33 +554,39 @@ def _validate_entry(
         err("status", f"must be one of {'|'.join(APPROVAL_STATUSES)}")
     approved_by = raw.get("approved_by")
     if "approved_by" in raw and not is_alias(approved_by):
-        err(
-            "approved_by",
-            f"'{approved_by}' must be an alias matching {ALIAS_PATTERN} "
-            "(never an e-mail address, no whitespace)",
-        )
+        err("approved_by", f"{_show(approved_by)} must be an alias ({ALIAS_RULE})")
     approved_on: str | None = None
     if "approved_on" in raw:
         approved_on = _iso_date(raw["approved_on"])
         if approved_on is None:
             err("approved_on", "must be an ISO date (YYYY-MM-DD)")
 
-    path, why = _inbox_file(inbox, raw.get("file")) if "file" in raw else (None, None)
-    decoded: tuple[str, int, int] | str | None = None
-    data = b""
-    if why is not None:
-        err("file", why)
-    elif path is not None:
-        read = _read_inside(inbox, path)
-        if isinstance(read, str):
-            err("file", f"'{raw['file']}' {read}")
+    measured: tuple[str, int, Path, str, int, int] | None = None
+    if "file" in raw:
+        name = raw["file"]
+        if not _non_empty(name):
+            err("file", "must be a non-empty relative path")
         else:
-            data = read
-            decoded = _decode(data)
-            if isinstance(decoded, str):
-                err("file", f"'{raw['file']}' {decoded}")
+            parts = _split(name)
+            opened = parts if isinstance(parts, str) else _open_inside(inbox, inbox_fd, parts)
+            if isinstance(opened, str):
+                err("file", f"{_show(name)} {opened}")
+            else:
+                try:
+                    staged = staging.stage(opened)
+                finally:
+                    os.close(opened.fd)
+                if isinstance(staged, str):
+                    err("file", f"{_show(name)} {staged}")
+                else:
+                    sha, size, path = staged
+                    decoded = _decode(path)
+                    if isinstance(decoded, str):
+                        err("file", f"{_show(name)} {decoded}")
+                    else:
+                        measured = (sha, size, path, *decoded)
 
-    if len(errors) > start or not isinstance(decoded, tuple):
+    if len(errors) > start or measured is None:
         return None
 
     # Normalisation (warnings, not refusals).
@@ -406,7 +611,7 @@ def _validate_entry(
         )
         return None
 
-    fmt, width, height = decoded
+    sha, size, path, fmt, width, height = measured
     return _Entry(
         index=index,
         asset_id=asset_id,
@@ -423,39 +628,65 @@ def _validate_entry(
         status=str(status),
         approved_by=approved_by,
         approved_on=approved_on,
-        data=data,
-        sha256=hashlib.sha256(data).hexdigest(),
+        staged=path,
+        sha256=sha,
+        size=size,
         width=width,
         height=height,
         image_format=fmt,
     )
 
 
-def _load_manifest(inbox: Path) -> list[Any]:
-    path = inbox / MANIFEST_NAME
-    if path.is_symlink() or not path.is_file():
-        raise ImportRefused(
-            f"no {MANIFEST_NAME} in {inbox}", [f"{MANIFEST_NAME}: missing (or a symlink)"]
-        )
+def _refuse(message: str) -> ImportRefused:
+    return ImportRefused(message, [f"{MANIFEST_NAME}: {message}"])
+
+
+def _load_manifest(inbox: Path, inbox_fd: int | None) -> list[Any]:
+    """Read the manifest through the same symlink-refusing open as the images,
+    bounded to MAX_MANIFEST_BYTES, and parse it as plain data."""
+    opened = _open_inside(inbox, inbox_fd, [MANIFEST_NAME], MAX_MANIFEST_BYTES, "1 MiB")
+    if isinstance(opened, str):
+        if " cap" in opened:
+            raise _refuse(opened)
+        raise _refuse(f"missing or unusable ({opened})")
     try:
-        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=_ManifestLoader)
-    except (OSError, UnicodeDecodeError) as e:
-        raise ImportRefused(
-            f"{MANIFEST_NAME} is unreadable", [f"{MANIFEST_NAME}: unreadable ({e})"]
-        ) from e
+        with os.fdopen(opened.fd, "rb", closefd=False) as f:
+            data = f.read(MAX_MANIFEST_BYTES + 1)
+    except OSError as e:
+        raise _refuse(f"unreadable ({type(e).__name__})") from e
+    finally:
+        os.close(opened.fd)
+    if len(data) > MAX_MANIFEST_BYTES:
+        raise _refuse(f"is over the {MAX_MANIFEST_BYTES}-byte (1 MiB) cap")
+    try:
+        doc = yaml.load(data.decode("utf-8"), Loader=_ManifestLoader)
+    except UnicodeDecodeError as e:
+        raise _refuse("unreadable (not UTF-8)") from e
     except yaml.YAMLError as e:
-        raise ImportRefused(f"{MANIFEST_NAME} is not valid YAML", [f"{MANIFEST_NAME}: {e}"]) from e
+        raise _refuse(f"not valid YAML: {str(e)[:500]}") from e
+    except RecursionError as e:
+        raise _refuse("nested too deeply") from e
     if not isinstance(doc, list) or not doc:
-        raise ImportRefused(
-            f"{MANIFEST_NAME} must be a non-empty list of entries",
-            [f"{MANIFEST_NAME}: must be a non-empty list of entries"],
-        )
+        raise _refuse("must be a non-empty list of entries")
+    if len(doc) > MAX_ENTRIES:
+        raise _refuse(f"has {len(doc)} entries, over the {MAX_ENTRIES}-entry cap")
     return doc
 
 
 def _raw_store_path(ws: Workspace, entry: _Entry) -> Path:
     ext = EXTENSIONS[entry.image_format]
     return ws.raw_dir / _IMPORTED_SUBDIR / entry.sha256[:2] / f"{entry.sha256}.{ext}"
+
+
+def _install(staged: Path, raw_path: Path) -> bool:
+    """Move a staged file into the raw store. Returns True when this call
+    created the raw file (so a rollback must delete it)."""
+    if raw_path.is_file() and sha256_file(raw_path) == raw_path.stem:
+        return False
+    existed = raw_path.exists()
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staged, raw_path)  # same filesystem: both live under .studio/
+    return not existed
 
 
 def import_inbox(
@@ -470,21 +701,39 @@ def import_inbox(
     if not inbox_dir.is_dir():
         raise ImportRefused(f"{inbox_dir} is not a directory", [f"{inbox_dir}: not a directory"])
     inbox = inbox_dir.resolve(strict=True)
-    if re.fullmatch(INBOX_NAME_PATTERN, inbox.name) is None:
+    if not _match(INBOX_NAME_PATTERN, inbox.name):
         raise ImportRefused(
-            f"inbox name '{inbox.name}' is not a valid batch name",
-            [f"inbox name '{inbox.name}' must match {INBOX_NAME_PATTERN}"],
+            f"inbox name {_show(inbox.name)} is not a valid batch name",
+            [
+                f"inbox name {_show(inbox.name)} must match ^[a-z0-9][a-z0-9._-]*$ "
+                "(lowercase letters, digits, '.', '_', '-')"
+            ],
         )
     batch_id = f"import:{inbox.name}"
-    doc = _load_manifest(inbox)
+    staging = _Staging(ws)
+    try:
+        with _inbox_dir_fd(inbox) as inbox_fd:
+            doc = _load_manifest(inbox, inbox_fd)
+            errors: list[str] = []
+            outcome = ImportOutcome(batch_id=batch_id)
+            entries: list[_Entry] = []
+            for index, raw in enumerate(doc):
+                entry = _validate_entry(
+                    inbox, inbox_fd, staging, index, raw, errors, outcome.warnings
+                )
+                if entry is not None:
+                    entries.append(entry)
+        _check_duplicates(entries, errors)
+        manifest_ids = {
+            r["asset_id"] for r in doc if isinstance(r, dict) and isinstance(r.get("asset_id"), str)
+        }
+        _commit(conn, ws, batch_id, inbox, entries, manifest_ids, errors, outcome, clock)
+    finally:
+        staging.discard()
+    return outcome
 
-    errors: list[str] = []
-    outcome = ImportOutcome(batch_id=batch_id)
-    entries: list[_Entry] = []
-    for index, raw in enumerate(doc):
-        entry = _validate_entry(inbox, index, raw, errors, outcome.warnings)
-        if entry is not None:
-            entries.append(entry)
+
+def _check_duplicates(entries: list[_Entry], errors: list[str]) -> None:
     seen: dict[tuple[str, str], int] = {}
     for entry in entries:
         key = (entry.asset_id, entry.sha256)
@@ -493,10 +742,20 @@ def import_inbox(
                 f"entry {entry.index}: file: same bytes and asset_id as entry {seen[key]}"
             )
         seen.setdefault(key, entry.index)
-    manifest_ids = {
-        r["asset_id"] for r in doc if isinstance(r, dict) and isinstance(r.get("asset_id"), str)
-    }
 
+
+def _commit(
+    conn: sqlite3.Connection,
+    ws: Workspace,
+    batch_id: str,
+    inbox: Path,
+    entries: list[_Entry],
+    manifest_ids: set[str],
+    errors: list[str],
+    outcome: ImportOutcome,
+    clock: Callable[[], datetime],
+) -> None:
+    created: list[Path] = []
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -544,8 +803,8 @@ def import_inbox(
                 )
                 batch_exists = True
             raw_path = _raw_store_path(ws, entry)
-            if not raw_path.is_file() or sha256_file(raw_path) != entry.sha256:
-                atomic_write(raw_path, entry.data)
+            if _install(entry.staged, raw_path):
+                created.append(raw_path)
             uid = f"import-{entry.asset_id}-{entry.sha256[:16]}"
             conn.execute(
                 "INSERT INTO assets (uid, asset_id, origin, batch_id, provider, model, prompt, "
@@ -585,8 +844,11 @@ def import_inbox(
         conn.commit()
     except BaseException:
         conn.rollback()
+        # The rows are gone; so are the raw files this import put there.
+        for path in created:
+            with contextlib.suppress(OSError):
+                path.unlink()
         raise
-    return outcome
 
 
 def _drift(row: sqlite3.Row, entry: _Entry) -> list[str]:

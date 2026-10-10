@@ -57,7 +57,11 @@ class TermsSnapshot:
 
 
 # An operator alias (never an e-mail address): an account or a reviewer.
-ALIAS_PATTERN = r"^[A-Za-z0-9._-]+$"
+# Patterns end in ``(?![\s\S])`` (end of string) rather than ``$``: Python's
+# ``$`` also matches before a trailing newline, ECMA-262's does not, and the
+# same pattern strings appear in schemas/import-manifest.schema.json.
+END_OF_STRING = r"(?![\s\S])"
+ALIAS_PATTERN = r"^[A-Za-z0-9._-]+" + END_OF_STRING
 APPROVAL_STATUSES = ("candidate", "approved", "rejected")
 MIMES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 
@@ -346,7 +350,7 @@ class Library:
 def is_alias(value: object) -> bool:
     """An operator alias: ``^[A-Za-z0-9._-]+$`` — so never an e-mail address
     (no '@') and never contains whitespace."""
-    return isinstance(value, str) and re.fullmatch(ALIAS_PATTERN, value) is not None
+    return isinstance(value, str) and re.fullmatch(ALIAS_PATTERN, value, re.ASCII) is not None
 
 
 EXPORT_FORMAT = "qontinui-studio/library-export"

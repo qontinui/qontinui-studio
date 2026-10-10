@@ -12,6 +12,7 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import pytest
 from click.testing import CliRunner
 from PIL import Image
@@ -253,8 +254,14 @@ REFUSALS: list[Any] = [
     pytest.param({"file": "truncated.png"}, "not a decodable", id="file-truncated"),
     # asset_id
     pytest.param({"asset_id": DROP}, "asset_id: required", id="asset-id-missing"),
-    pytest.param({"asset_id": "Cafe_Hero"}, "asset_id: 'Cafe_Hero' must match", id="asset-id-case"),
-    pytest.param({"asset_id": "-hero"}, "asset_id: '-hero' must match", id="asset-id-leading-dash"),
+    pytest.param(
+        {"asset_id": "Cafe_Hero"},
+        "asset_id: 'Cafe_Hero' must be lowercase letters, digits and '-'",
+        id="asset-id-case",
+    ),
+    pytest.param(
+        {"asset_id": "-hero"}, "asset_id: '-hero' must be lowercase", id="asset-id-leading-dash"
+    ),
     pytest.param({"asset_id": 7}, "asset_id: must be a non-empty string", id="asset-id-not-string"),
     # provider / model / prompt
     pytest.param({"provider": DROP}, "provider: required", id="provider-missing"),
@@ -329,7 +336,9 @@ REFUSALS: list[Any] = [
         {"tos_reviewed": None}, "tos_reviewed: must be an ISO date", id="tos-reviewed-null"
     ),
     pytest.param(
-        {"approved_by": None}, "approved_by: 'None' must be an alias", id="approved-by-null"
+        {"approved_by": None},
+        "approved_by: a value of type NoneType must be an alias",
+        id="approved-by-null",
     ),
     # licence
     pytest.param(
@@ -576,7 +585,7 @@ def test_image_at_the_pixel_cap_is_judged_by_decoding(studio_root: Path, tmp_pat
 
 def test_refusal_entry_not_a_mapping(studio_root: Path, tmp_path: Path) -> None:
     errors = _refused(studio_root, make_inbox(tmp_path, [entry(), "hero.png"]))
-    assert "entry 1: must be a mapping" in errors
+    assert "entry 1: must be a mapping, not 'hero.png'" in errors
 
 
 def test_refusal_same_bytes_twice_in_one_manifest(studio_root: Path, tmp_path: Path) -> None:
@@ -663,22 +672,27 @@ def test_a_failure_while_writing_rolls_everything_back(
         [entry(file="a.png"), entry(file="b.png")],
         images={"a.png": (1, 1, 1), "b.png": (2, 2, 2)},
     )
-    real = inbox_mod.atomic_write
+    real = inbox_mod._install
     calls: list[Path] = []
 
-    def flaky(path: Path, data: bytes) -> None:
-        calls.append(path)
+    def flaky(staged: Path, raw_path: Path) -> bool:
+        calls.append(raw_path)
         if len(calls) == 2:
             raise OSError("disk full")
-        real(path, data)
+        return real(staged, raw_path)
 
-    monkeypatch.setattr(inbox_mod, "atomic_write", flaky)
+    monkeypatch.setattr(inbox_mod, "_install", flaky)
     with pytest.raises(OSError):
         do_import(studio_root, inbox)
     conn = connect(Workspace(studio_root).db_path)
     assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 0
-    monkeypatch.setattr(inbox_mod, "atomic_write", real)
+    # The raw file the first entry installed was removed with the rollback,
+    # and nothing is left staged.
+    assert not calls[0].exists()
+    _nothing_written(studio_root)
+    assert not (Workspace(studio_root).state_dir / "import-staging").exists()
+    monkeypatch.setattr(inbox_mod, "_install", real)
     assert len(do_import(studio_root, inbox).imported) == 2
 
 
@@ -798,12 +812,7 @@ def test_schema_file_matches_the_validator() -> None:
     assert refs[1]["required"] == ["url", "licence"] and refs[1]["additionalProperties"] is False
 
 
-def test_schema_validates_the_shipped_example_when_jsonschema_is_available(
-    tmp_path: Path,
-) -> None:
-    """When ``jsonschema`` happens to be installed, the schema itself must
-    accept a valid entry and reject the structural refusals."""
-    jsonschema = pytest.importorskip("jsonschema")
+def test_schema_accepts_valid_and_rejects_structural_refusals() -> None:
     validator = jsonschema.Draft202012Validator(_schema())
     assert not list(validator.iter_errors([entry()]))
     for bad in (

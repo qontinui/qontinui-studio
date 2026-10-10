@@ -2,39 +2,43 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/qontinui/qontinui-studio/blob/main/schemas/import-manifest.schema.json",
   "title": "qontinui-studio import manifest",
-  "description": "<inbox-dir>/manifest.yaml for `studio library import <inbox-dir>`. A list of entries, one per image file. The studio validates the WHOLE manifest before writing anything: one invalid entry refuses the import, and every problem is reported with its entry index. The YAML is read with YAML 1.2 scalars: only true/false are booleans (`yes`/`no` are strings) and dates are strings. Width, height, SHA-256 and MIME type are measured from the file, never read from the manifest. Rules this schema cannot express, enforced by the studio: `file` must resolve to a regular file inside the inbox (no symlinks) that Pillow decodes as PNG, JPEG or WebP; a string in `reference_images` must be an asset_id already in the library (or elsewhere in this manifest) and not the entry's own; `commercial_use: yes` without `tos_reviewed` is recorded as `unknown` (warning); `status: approved|rejected` without both `approved_by` and `approved_on` is recorded as `candidate` (warning); `status: approved` is refused unless the recorded commercial_use is `yes` (D5); the same file bytes twice under one asset_id in one manifest is refused. Dates must also be real calendar dates (2026-02-30 is refused even though `format` is only an annotation in draft 2020-12); a file with more than one hard link is refused; a file over 50 MiB, or an image whose header declares more than 100 megapixels, is refused (the pixel count is checked before decoding); re-importing the same bytes under the same asset_id is a no-op and never rewrites the recorded provenance (a differing manifest only warns); two inboxes with the same directory name import into the same batch, import:<name>.",
+  "description": "<inbox-dir>/manifest.yaml for `studio library import <inbox-dir>`. A list of entries, one per image file. The studio validates the WHOLE manifest before writing anything: one invalid entry refuses the import, and every problem is reported with its entry index. The YAML is read as plain data with YAML 1.2 scalars: only true/false are booleans (`yes`/`no` are strings), dates are strings, and anchors, aliases, merge keys and duplicate keys are refused. The manifest is at most 1 MiB and 1000 entries; one import reads at most 2 GiB of files. Patterns use explicit ASCII classes and end with (?![\\s\\S]) so ECMA-262 and Python's re read them identically. Width, height, SHA-256 and MIME type are measured from the file, never read from the manifest. Rules this schema cannot express, enforced by the studio: `file` must resolve to a regular file inside the inbox (no symlinks) that Pillow decodes as PNG, JPEG or WebP; a string in `reference_images` must be an asset_id already in the library (or elsewhere in this manifest) and not the entry's own; `commercial_use: yes` without `tos_reviewed` is recorded as `unknown` (warning); `status: approved|rejected` without both `approved_by` and `approved_on` is recorded as `candidate` (warning); `status: approved` is refused unless the recorded commercial_use is `yes` (D5); the same file bytes twice under one asset_id in one manifest is refused. Dates must also be real calendar dates (2026-02-30 is refused even though `format` is only an annotation in draft 2020-12); a file with more than one hard link is refused; a file over 50 MiB, or an image whose header declares more than 100 megapixels, is refused (the pixel count is checked before decoding); re-importing the same bytes under the same asset_id is a no-op and never rewrites the recorded provenance (a differing manifest only warns); two inboxes with the same directory name import into the same batch, import:<name>.",
   "type": "array",
   "minItems": 1,
-  "items": { "$ref": "#/$defs/entry" },
+  "items": {
+    "$ref": "#/$defs/entry"
+  },
   "$defs": {
     "alias": {
       "description": "An operator alias, never an e-mail address and never containing whitespace.",
       "type": "string",
-      "pattern": "^[A-Za-z0-9._-]+$"
+      "pattern": "^[A-Za-z0-9._-]+(?![\\s\\S])"
     },
     "isoDate": {
       "type": "string",
-      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(?![\\s\\S])",
       "format": "date"
     },
     "rfc3339": {
       "type": "string",
-      "pattern": "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([Zz]|[+-]\\d{2}:\\d{2})$",
-      "format": "date-time"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])(?![\\s\\S])",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp with an offset. Seconds 00-59: a leap second (:60) is refused."
     },
     "httpsUrl": {
       "type": "string",
-      "pattern": "^https://[A-Za-z0-9][A-Za-z0-9.-]*(:\\d+)?([/?#][^\\s]*)?$",
-      "format": "uri"
+      "pattern": "^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?([/?#][!-~]*)?(?![\\s\\S])",
+      "format": "uri",
+      "description": "https URL: a host, an optional port, then printable ASCII only (percent-encode anything else)."
     },
     "assetId": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]*$"
+      "pattern": "^[a-z0-9][a-z0-9-]*(?![\\s\\S])"
     },
     "nonEmptyString": {
       "type": "string",
       "minLength": 1,
-      "pattern": "\\S"
+      "pattern": "[^\\t\\n\\v\\f\\r ]"
     },
     "entry": {
       "type": "object",
@@ -61,13 +65,22 @@
           "description": "The library asset id. Several files may share one asset_id; each becomes its own row. Re-importing the same bytes under the same asset_id is a no-op.",
           "$ref": "#/$defs/assetId"
         },
-        "provider": { "description": "Which generator made the image.", "$ref": "#/$defs/nonEmptyString" },
-        "model": { "description": "The model used.", "$ref": "#/$defs/nonEmptyString" },
+        "provider": {
+          "description": "Which generator made the image.",
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "model": {
+          "description": "The model used.",
+          "$ref": "#/$defs/nonEmptyString"
+        },
         "account": {
           "description": "ALIAS of the provider account used (never the address).",
           "$ref": "#/$defs/alias"
         },
-        "prompt": { "description": "The exact prompt.", "$ref": "#/$defs/nonEmptyString" },
+        "prompt": {
+          "description": "The exact prompt.",
+          "$ref": "#/$defs/nonEmptyString"
+        },
         "reference_images": {
           "description": "Images the generation was conditioned on. Bare local paths are refused.",
           "type": "array",
@@ -81,10 +94,17 @@
               {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["url", "licence"],
+                "required": [
+                  "url",
+                  "licence"
+                ],
                 "properties": {
-                  "url": { "$ref": "#/$defs/httpsUrl" },
-                  "licence": { "$ref": "#/$defs/nonEmptyString" }
+                  "url": {
+                    "$ref": "#/$defs/httpsUrl"
+                  },
+                  "licence": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  }
                 }
               }
             ]
@@ -92,7 +112,14 @@
         },
         "generated_on": {
           "description": "When the image was generated.",
-          "anyOf": [{ "$ref": "#/$defs/isoDate" }, { "$ref": "#/$defs/rfc3339" }]
+          "anyOf": [
+            {
+              "$ref": "#/$defs/isoDate"
+            },
+            {
+              "$ref": "#/$defs/rfc3339"
+            }
+          ]
         },
         "licence_terms_url": {
           "description": "The provider's terms that govern this image.",
@@ -104,11 +131,20 @@
         },
         "commercial_use": {
           "description": "Whether the terms allow commercial use.",
-          "enum": ["yes", "no", "unknown"]
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ]
         },
         "watermark": {
           "description": "The watermark the provider applies.",
-          "enum": ["none", "invisible", "visible", "unknown"]
+          "enum": [
+            "none",
+            "invisible",
+            "visible",
+            "unknown"
+          ]
         },
         "ai_generated": {
           "description": "Must be true: the library holds AI-generated assets only.",
@@ -116,7 +152,11 @@
         },
         "status": {
           "description": "Approval state. Approval is library metadata for consumers, not a publish gate.",
-          "enum": ["candidate", "approved", "rejected"],
+          "enum": [
+            "candidate",
+            "approved",
+            "rejected"
+          ],
           "default": "candidate"
         },
         "approved_by": {
@@ -129,5 +169,6 @@
         }
       }
     }
-  }
+  },
+  "maxItems": 1000
 }

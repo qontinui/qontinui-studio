@@ -315,15 +315,30 @@ cross-checks the schema file against the validator so the two cannot drift.
   name with different bytes is a new row. A re-import never rewrites recorded
   provenance: if the manifest's details changed, it warns and names the fields.
   Use `library approve|reject` to change approval.
-- A file is read through a descriptor that does not follow symlinks and must be
-  the file that was validated. A file with more than one hard link is refused.
+- Each file is opened once. On POSIX the open starts from a descriptor on the
+  inbox and walks every path component with `O_NOFOLLOW`, so a symlink, or a
+  directory swapped for one mid-import, is refused. The file itself is opened
+  `O_NONBLOCK`, so a FIFO cannot hang the import. The descriptor must be a
+  regular file with one link and within the size cap. Its bytes are streamed
+  once into a private staging file under `.studio/import-staging/`, hashed
+  while they are copied. The size, SHA-256, format and dimensions all come
+  from that one read, and the inbox is not touched again. Windows has no
+  `dir_fd` support, so there the check falls back to an `lstat` walk plus an
+  identity check on the opened file. That fallback is best effort, not
+  race-free.
+- The manifest is plain data. It is read the same way, capped at 1 MiB and
+  1000 entries (`MAX_MANIFEST_BYTES`, `MAX_ENTRIES`). YAML anchors, aliases,
+  merge keys and duplicate keys are refused. A manifest value appears in an
+  error only as a truncated string, or else only as its type name. One import
+  reads at most 2 GiB of files (`MAX_TOTAL_BYTES`).
 - Two inboxes with the same directory name import into the same batch.
 - Rows go in batch `import:<inbox basename>` (basename `^[a-z0-9][a-z0-9._-]*$`)
   with status `imported`. **An import is never published.** `publish`,
   `jobs run` and crash recovery all skip it, and a SQL `CHECK` refuses to move
   an `imported` batch to any other status.
-- An interrupted import can leave a copied file in the raw store with no row.
-  Files there are content-addressed, so the next import reuses it.
+- Staged files are renamed into the raw store inside the database write
+  transaction. On a refusal or a rollback, the staged files and any raw file
+  this import created are deleted.
 
 **Approval.** `studio library approve|reject <uid> --by <alias>` records the
 decision, the reviewer alias and today's UTC date on the row. Approval is
