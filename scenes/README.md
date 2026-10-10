@@ -45,9 +45,10 @@ changes to any scene.
 Two mechanisms enforce the seam.
 
 - **The resolved module graph is the authority.** `pnpm test:graph`
-  (`tests/unit/engine-graph.test.ts`, also part of `pnpm test`) bundles
-  `src/api`, `src/primitives` and `src/scenes` with esbuild, externalising
-  only Node builtins, and fails if any module in the graph is under
+  (`tests/unit/engine-graph.test.ts`, also part of `pnpm test`) bundles every
+  `.ts`/`.tsx` file under `src/` except `src/adapters/**` and `src/cli/**`, one
+  entry point each, with esbuild, externalising only Node builtins, and fails
+  if any module in a graph is under
   `node_modules/remotion/`, `node_modules/@remotion/` or `src/adapters/`. That
   catches indirection lint cannot see, such as a re-export through a module
   outside `src/`. A control case checks that the adapter's own graph does reach
@@ -56,7 +57,8 @@ Two mechanisms enforce the seam.
   `src/adapters/**`, an engine (`remotion`, `@remotion/*`, Revideo, Motion
   Canvas, HyperFrames) cannot be loaded by a static import, `export … from`,
   `import()` or `require()`; `module`/`node:module` and `createRequire` are
-  refused; and `import()` needs a literal specifier. No file outside the
+  refused, as is `process.getBuiltinModule`; and `import()` needs a literal
+  specifier. No file outside the
   adapters imports an adapter statically, and only `src/cli/**` may load one
   with `import()` (it does, `import("../adapters/remotion/render")`). Scenes
   and primitives additionally may not import wall-clock animation libraries
@@ -95,7 +97,11 @@ forbids:
   (`STAGES`, captions). Lint cannot see a later mutation of one; the
   determinism test is the backstop for that;
 - `eval`, string `setTimeout`/`setInterval` and `new Function` (everywhere,
-  not only in scenes);
+  not only in scenes), and any `.constructor` access in scenes (the
+  `x.constructor.constructor` route to `Function`);
+- blur of any kind (see "Determinism"): `box-shadow` other than
+  `solidRings(...)`, `filter`, `backdrop-filter`, `text-shadow`, `blur()` or
+  `drop-shadow()` in strings, SVG filter elements;
 - `react-dom` (e.g. `createPortal`, which would escape the scene and its mode
   label);
 - media that plays on its own clock: `<video>`, `<audio>`, `<iframe>`,
@@ -172,8 +178,10 @@ replay is refused. The export is never reshaped to suit a scene (plan D6).
 Tests that must draw the REPLAY label use `attestReplayForTests`
 (`src/api/trace/testing.ts`), which refuses to run outside vitest. Lint keeps
 both doors narrow: `recordReplayProvenance` may appear only in
-`provenance.ts`, `from-build-record.ts` and `testing.ts`, and `trace/testing`
-may be imported only under `tests/**`.
+`provenance.ts`, `from-build-record.ts` and `testing.ts` (by name, as a string
+key, through `export * from` the provenance module, through a namespace import
+of it, or through `import()` of it), and `trace/testing` may be imported only
+under `tests/**`.
 
 **Phase 3 caveat.** The attestation lives on the object `fromBuildRecord`
 returned. Anything that re-parses or copies it (`parseTrace`, `validateTrace`,
@@ -191,16 +199,18 @@ pnpm browser:ensure        # downloads the pinned Chrome Headless Shell once
 pnpm studio-scenes render s1-plan-lifecycle \
   --trace traces/illustrative/s1-plan-lifecycle.json \
   --format mp4 --aspect 16:9 --out out/s1-16x9.mp4
-# --format mp4|webm|gif|png   --aspect 16:9|9:16|1:1   [--frame <n>] [--scale <s>] [--force]
+# --format mp4|webm|gif|png   --aspect 16:9|9:16|1:1   [--frame <n>] [--force]
+# [--scale <s> --allow-nondeterministic]
 ```
 
 - `--trace <file>` takes an illustrative trace; `--build-record <export>` is
   the only replay path (refused until Phase 3, see "Traces").
-- `--scale` must give even whole pixel sizes at every aspect (0.25, 0.3, 0.5,
-  1, 2 …); others are refused. Determinism is established at scale 1: at a
-  fractional scale an edge pixel was seen to differ by 1 in one channel in
-  about 1 frame in 40 across repeated renders (see "Tests"). `--frame` is checked against the scene's
-  duration before anything is bundled.
+- **Only scale 1 is reproducible, so any other `--scale` is refused** unless
+  `--allow-nondeterministic` is given. Measured after the blur fix: at
+  `--scale 0.5`, one edge pixel of the S1 gate differed by 1 in one channel in
+  3 of 60 frames over 6 repeated renders. A permitted scale must still give
+  even whole pixel sizes at every aspect (0.25, 0.3, 0.5, 2 …). `--frame` is
+  checked against the scene's duration before anything is bundled.
 - **Output safety.** A render writes into a fresh staging directory beside the
   target and then moves the result into place. It never deletes anything it
   did not write, and never recursively. An existing output file is refused
@@ -226,7 +236,11 @@ S1 with the illustrative trace runs 14.2 s (426 frames).
 
 ### Determinism
 
-The same trace always produces the same frames:
+What the tests prove (16:9 and the golden frames, at scale 1, on the machines
+named below): the same trace gives byte-identical frames across fresh
+browsers, regardless of which frames were rendered before, and through the
+CLI's parallel `renderFrames`/`renderMedia` path (two png-sequence runs and two
+mp4 runs, compared by SHA-256). What it rests on:
 
 - **Pinned browser:** the browser is the Chrome Headless Shell build pinned by
   the exact `@remotion/renderer` version. Every dependency version is exact,
@@ -244,6 +258,16 @@ The same trace always produces the same frames:
   and in a local `ubuntu:24.04` container (0.4–0.7 % of pixels). With it, the
   goldens were byte-identical on those two. That is two machines, not every
   machine: CI (`ubuntu-24.04`) is the authority.
+- **No blur:** Chrome caches blurred masks across paints. A `box-shadow` glow
+  with a blur radius made frame 196 of S1 hash one way when rendered alone or
+  after frame 0, and another way after frame 48 (9,179 px, up to 4 levels, all
+  inside the glow), and made frames differ between two CLI sequence runs (7 of
+  426 in the review's run, 47 of 426 when the CLI test was run against the old
+  glow). Removing only the blur made frame 196 identical in every order. Glows
+  are now solid zero-blur rings (`solidRings`/`glowRings` in `src/api/glow.ts`),
+  and lint refuses blur in scenes and primitives: `box-shadow` other than
+  `solidRings(...)`, `filter`, `backdrop-filter`, `text-shadow`, `blur()`/
+  `drop-shadow()` in strings, and SVG filter elements.
 - **Pure scenes:** scenes are pure, as described under "Scene purity".
 
 ## Tests
@@ -254,31 +278,37 @@ pnpm lint            # includes the engine-seam and purity rules
 pnpm lint:selftest   # proves those rules refuse (lint-fixtures/)
 pnpm test:graph      # the engine seam on the resolved module graph
 pnpm test            # unit: schema, motion, timeline, S1 model, safety, CLI refusals
-pnpm test:golden     # golden frames + determinism (needs browser:ensure)
+pnpm test:golden     # golden frames, determinism, order independence, CLI path (needs browser:ensure)
 ```
 
 The golden suite renders fourteen S1 frames: five in 16:9, one each in 9:16
 and 1:1, one per aspect of a replay with the longest realistic source, and at
 9:16 and 1:1 a replay whose source is 120 "W"s and a trace with a
-160-character title. Frames render at native size (scale 1) and are reduced
-2x2 by a deterministic box filter in JavaScript to keep the goldens small.
-Rendering at `--scale 0.5` directly was not deterministic: one edge pixel
-differed by 1 in one channel in about 1 frame in 40 across repeated renders,
-while the same frames at scale 1 were byte-identical over 6 runs. Each reduced
-frame must match its golden in `tests/golden/__goldens__/` **exactly**: zero
-differing pixels at pixelmatch threshold 0 with anti-aliased pixels counted.
-pixelmatch only counts and draws the diff image. Any visual change fails it,
-down to one digit of a PR number. The suite also renders every frame a second
-time at full size with a fresh bundle and a fresh browser, and requires the
-two renders to be byte-identical. When it
-fails, the actual and diff images are in `.golden-out/`, and CI uploads them as
-an artifact.
+160-character title, all at native size (scale 1).
+
+- **Golden gate (exact):** each full-size frame's SHA-256 must equal the
+  committed `__goldens__/<name>.png.sha256`. Beside it is a 2x2-reduced PNG
+  (deterministic box filter in JavaScript) for humans; on a mismatch the
+  reduced frames are diffed with pixelmatch only to draw the diff image. Any
+  visual change fails, down to one digit of a PR number.
+- **Determinism:** every frame is rendered again with a fresh browser and must
+  be byte-identical.
+- **Order independence:** every frame is rendered again in reversed order, and
+  the five 16:9 frames are each rendered alone in a fresh browser; all must be
+  byte-identical to the suite-order render.
+- **CLI path** (`tests/golden/cli-determinism.test.ts`, 16:9 only to bound CI
+  time): two full `render --format png` sequence runs (426 frames) must match
+  frame by frame, and two `render --format mp4` runs must have the same
+  SHA-256.
+
+When it fails, the actual and diff images are in `.golden-out/`, and CI uploads
+them as an artifact (without the CLI test's frame sequences).
 
 **Updating goldens** after an intended visual change:
 
 ```sh
-pnpm goldens:update   # the golden suite with UPDATE_GOLDENS=1: re-renders and replaces the PNGs
-# inspect the PNGs, then commit them with the change
+pnpm goldens:update   # golden.test.ts with UPDATE_GOLDENS=1: rewrites the reduced PNGs and .sha256 files
+# inspect the PNGs, then commit them (and the .sha256 files) with the change
 ```
 
 ## Design tokens

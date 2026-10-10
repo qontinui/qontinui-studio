@@ -102,6 +102,10 @@ const ENGINE_SYNTAX = [
     selector: "Identifier[name='createRequire']",
     message: "createRequire outside src/adapters bypasses the engine seam (plan D7).",
   },
+  {
+    selector: "MemberExpression[property.name='getBuiltinModule']",
+    message: "process.getBuiltinModule outside src/adapters bypasses the engine seam (plan D7).",
+  },
 ];
 
 const ADAPTER_DYNAMIC_SYNTAX = [
@@ -111,12 +115,16 @@ const ADAPTER_DYNAMIC_SYNTAX = [
   },
 ];
 
+const PROVENANCE_ONLY =
+  "recordReplayProvenance may be used only by fromBuildRecord (and the test-only hook): it is what makes a replay renderable (plan D2).";
 const PROVENANCE_SYNTAX = [
-  {
-    selector: "Identifier[name='recordReplayProvenance']",
-    message:
-      "recordReplayProvenance may be used only by fromBuildRecord (and the test-only hook): it is what makes a replay renderable (plan D2).",
-  },
+  { selector: "Identifier[name='recordReplayProvenance']", message: PROVENANCE_ONLY },
+  { selector: "Literal[value='recordReplayProvenance']", message: PROVENANCE_ONLY },
+  // No wholesale or namespace access to the provenance module, which would
+  // reach recordReplayProvenance without naming it.
+  { selector: "ExportAllDeclaration[source.value=/provenance/]", message: PROVENANCE_ONLY },
+  { selector: "ImportDeclaration[source.value=/provenance/] > ImportNamespaceSpecifier", message: PROVENANCE_ONLY },
+  { selector: "ImportExpression[source.value=/provenance/]", message: PROVENANCE_ONLY },
 ];
 
 const CSS_TIMED = "(transition|animation)";
@@ -163,6 +171,47 @@ const PURITY_SYNTAX = [
   {
     selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']",
     message: "No raw HTML in scenes: it can carry styles and scripts the purity rules cannot see.",
+  },
+  // Blur. Chrome caches blurred masks across paints, so a blurred glow came
+  // out differently depending on which frames were rendered before it (see
+  // src/api/glow.ts). Glows use solidRings(); nothing in a scene blurs.
+  {
+    selector: "Property > Identifier.key[name=/^(Webkit|Moz|ms)?([fF]ilter|[bB]ackdropFilter|[tT]extShadow)$/]",
+    message: "No blur or filter in scenes: blurred paint depends on render history. Use solidRings() from src/api/glow.",
+  },
+  {
+    selector: "Property > Literal.key[value=/^(-(webkit|moz|ms|o)-)?(filter|backdrop-filter|text-shadow|box-shadow)$/i]",
+    message: "No blur or filter in scenes: blurred paint depends on render history. Use solidRings() from src/api/glow.",
+  },
+  {
+    selector:
+      "Property[key.name=/^(Webkit|Moz)?[bB]oxShadow$/]:not([value.type='CallExpression'][value.callee.name='solidRings'])",
+    message: "boxShadow in scenes must be solidRings(...) (zero blur): blurred paint depends on render history.",
+  },
+  {
+    selector: "Literal[value=/blur\\(|drop-shadow\\(/i]",
+    message: "No blur()/drop-shadow() in scenes: blurred paint depends on render history.",
+  },
+  {
+    selector: "TemplateElement[value.raw=/blur\\(|drop-shadow\\(/i]",
+    message: "No blur()/drop-shadow() in scenes: blurred paint depends on render history.",
+  },
+  {
+    selector: "JSXOpeningElement[name.name=/^(filter|feGaussianBlur|feDropShadow|feMorphology|feConvolveMatrix)$/]",
+    message: "No SVG filters in scenes: blurred paint depends on render history.",
+  },
+  {
+    selector: "JSXAttribute[name.name=/^(filter|backdropFilter)$/]",
+    message: "No SVG/CSS filter attribute in scenes: blurred paint depends on render history.",
+  },
+  // No reaching Function through prototypes (x.constructor.constructor).
+  {
+    selector: "MemberExpression[property.name='constructor']",
+    message: "No .constructor access in scenes (x.constructor.constructor reaches Function, i.e. eval).",
+  },
+  {
+    selector: "MemberExpression[property.value='constructor']",
+    message: "No .constructor access in scenes (x.constructor.constructor reaches Function, i.e. eval).",
   },
   // Math is allowed only as `Math.<name>` with a static name.
   {

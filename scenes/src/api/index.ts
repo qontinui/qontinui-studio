@@ -5,6 +5,7 @@
  */
 export * from "./engine";
 export * from "./format";
+export * from "./glow";
 export * from "./layout";
 export * from "./motion";
 export * from "./scene";

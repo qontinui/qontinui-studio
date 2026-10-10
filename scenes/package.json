@@ -19,7 +19,7 @@
     "lint": "eslint .",
     "test": "vitest run --config vitest.config.ts",
     "test:golden": "vitest run --config vitest.golden.config.ts",
-    "goldens:update": "UPDATE_GOLDENS=1 vitest run --config vitest.golden.config.ts",
+    "goldens:update": "UPDATE_GOLDENS=1 vitest run --config vitest.golden.config.ts tests/golden/golden.test.ts",
     "browser:ensure": "tsx scripts/ensure-browser.ts",
     "lint:selftest": "tsx scripts/lint-selftest.ts",
     "test:graph": "vitest run --config vitest.config.ts tests/unit/engine-graph.test.ts"

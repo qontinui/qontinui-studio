@@ -60,8 +60,14 @@ describe("studio-scenes CLI refusals", () => {
     expect(r.stderr).toMatch(/--frame 426 is outside 0\.\.425/);
   });
 
+  it("refuses any scale but 1 unless --allow-nondeterministic", () => {
+    const r = cli(...base, "--trace", S1_TRACE, "--scale", "0.5", "--out", "/tmp/x.mp4");
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/--scale 0\.5 is refused: renders are byte-reproducible only at scale 1/);
+  });
+
   it("refuses a scale that gives odd or fractional dimensions", () => {
-    const r = cli(...base, "--trace", S1_TRACE, "--scale", "0.33", "--out", "/tmp/x.mp4");
+    const r = cli(...base, "--trace", S1_TRACE, "--scale", "0.33", "--allow-nondeterministic", "--out", "/tmp/x.mp4");
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/even whole pixels/);
   });

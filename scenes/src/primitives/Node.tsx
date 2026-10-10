@@ -1,3 +1,4 @@
+import { glowRings, solidRings } from "../api/glow";
 import { attention, surface, text, type AttentionLevel } from "../api/tokens";
 import { fontStack, fontWeights, typeScale } from "../api/typography";
 
@@ -55,10 +56,8 @@ export function Node({
         backgroundColor: surface.raised,
         backgroundImage: `linear-gradient(${palette.bg}, ${palette.bg})`,
         border: `${Math.max(1, Math.round(2 * unit))}px solid ${palette.border}`,
-        boxShadow:
-          emphasis > 0
-            ? `0 0 ${Math.round(28 * unit * emphasis)}px ${Math.round(4 * unit * emphasis)}px ${palette.border}`
-            : "none",
+        // Blur-free glow: solid rings (see src/api/glow.ts for why no blur).
+        boxShadow: solidRings(glowRings(18 * unit, emphasis, palette.bg, 5)),
         opacity: appear,
         transform: `translateY(${rise}px) scale(${scale})`,
         fontFamily: fontStack,

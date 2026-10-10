@@ -109,9 +109,17 @@ export class RemotionAdapter implements EngineAdapter {
     this.serveUrl = options.serveUrl ? Promise.resolve(options.serveUrl) : null;
   }
 
+  /**
+   * Bundle the scenes and return the serve URL, so several adapters (each
+   * with its own fresh browser) can share one bundle.
+   */
+  static bundle(): Promise<string> {
+    return bundle({ entryPoint: ENTRY_POINT, publicDir: PUBLIC_DIR });
+  }
+
   /** Bundle the scenes once per adapter instance. */
   private getServeUrl(): Promise<string> {
-    this.serveUrl ??= bundle({ entryPoint: ENTRY_POINT, publicDir: PUBLIC_DIR });
+    this.serveUrl ??= RemotionAdapter.bundle();
     return this.serveUrl;
   }
 

@@ -34,24 +34,22 @@ export const TRACE_FILE = path.join(PACKAGE_ROOT, "traces/illustrative/s1-plan-l
  * box filter in JavaScript, so they stay small in git.
  *
  * Why not render at --scale 0.5 directly: at a fractional device scale one
- * edge pixel of S1 came out ±1 in one channel in about 1 frame in 40 across
- * repeated renders of the same frame (Chrome rasterisation at half-pixel
- * geometry). At scale 1 the same frames were byte-identical over 6 runs. The
- * reduction is deterministic arithmetic, so the golden inherits that.
+ * edge pixel of the S1 gate came out ±1 in one channel in about 1 frame in 20
+ * to 40 across repeated renders, even after the blur fix (src/api/glow.ts).
+ * At scale 1 it does not. The CLI therefore refuses fractional scales unless
+ * --allow-nondeterministic is given.
  */
 export const GOLDEN_DOWNSAMPLE = 2;
 
 /**
- * Goldens must match EXACTLY: zero differing pixels at pixelmatch threshold 0
- * (anti-aliased pixels counted). pixelmatch is used only to count and to draw
- * the diff image. A looser tolerance let real changes through: a header
- * recolour, and a one-digit PR number change (412 -> 413, 29 px).
+ * The golden gate is the full-size frame's SHA-256 (exact). The reduced PNG
+ * beside it is for humans; on a mismatch it is diffed at pixelmatch
+ * threshold 0 (anti-aliased pixels counted) only to draw the diff image.
  *
- * Exactness is affordable because renders have been byte-identical across
- * the machines tried so far: the Debian 13 development host and a local
+ * Exactness is affordable because full-size renders have been byte-identical
+ * on the machines tried so far: the Debian 13 development host and a local
  * ubuntu:24.04 container (both AVX2). That is not proof for every machine;
- * CI (ubuntu-24.04) is the authority. If it ever shows rasterisation noise,
- * the uploaded diff images are the evidence to decide on.
+ * CI (ubuntu-24.04) is the authority.
  */
 export const PIXEL_THRESHOLD = 0;
 

@@ -1,6 +1,7 @@
 # Scene framework CI (plan 2026-10-09-qontinui-marketing-studio-animated-process-explainers, Phase 2).
 #
-# Arming gate: golden-frame fails on any visual change to S1 (exact match);
+# Arming gate: golden-frame fails on any visual change to S1 (exact full-size
+# SHA-256) and on any render-history or CLI-path nondeterminism;
 # import-lint runs the rules, a self-test proving they refuse, and the
 # resolved-module-graph test (the seam's authority); the
 # golden-frame job's determinism test requires two renders of one trace to be
@@ -78,6 +79,7 @@ jobs:
   golden-frame:
     name: golden-frame
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
@@ -103,11 +105,17 @@ jobs:
           path: scenes/node_modules/.remotion
           key: remotion-browser-${{ runner.os }}-${{ hashFiles('scenes/pnpm-lock.yaml') }}
       - run: pnpm browser:ensure
-      - name: Golden frames + determinism
+      # Golden frames (full-size SHA-256), fresh-browser determinism, order
+      # independence (alone / suite order / reversed), and the CLI path:
+      # two png-sequence runs and two mp4 runs of S1 at 16:9, byte-identical.
+      - name: Golden frames, determinism, order independence, CLI path
         run: pnpm test:golden
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: golden-out
-          path: scenes/.golden-out/
+          # The CLI test's two 426-frame sequences are left out (size).
+          path: |
+            scenes/.golden-out/
+            !scenes/.golden-out/cli/
           if-no-files-found: ignore

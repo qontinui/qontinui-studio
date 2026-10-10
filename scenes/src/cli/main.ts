@@ -3,7 +3,7 @@
  *
  *   studio-scenes render <scene> (--trace <file> | --build-record <export>)
  *                        --format mp4|webm|gif|png --aspect 16:9|9:16|1:1 --out <path>
- *                        [--frame <n>] [--scale <s>] [--force]
+ *                        [--frame <n>] [--scale <s> --allow-nondeterministic] [--force]
  *   studio-scenes validate <trace-file> [--scene <scene>]
  *   studio-scenes list
  *
@@ -32,13 +32,14 @@ import { getScene, scenes } from "../scenes";
 const USAGE = `usage:
   studio-scenes render <scene> (--trace <file> | --build-record <export>)
                        --format ${OUTPUT_FORMATS.join("|")} --aspect ${ASPECTS.join("|")} --out <path>
-                       [--frame <n>] [--scale <s>] [--force]
+                       [--frame <n>] [--scale <s> --allow-nondeterministic] [--force]
   studio-scenes validate <trace-file> [--scene <scene>]
   studio-scenes list
 
 png: with --frame, one still at --out (file); without it, a PNG frame sequence in --out (directory).
 --force replaces an existing output file, or a previous element-*.png sequence; nothing else.
---scale must give even pixel dimensions for every aspect (e.g. 0.25, 0.5, 1, 2).
+--scale other than 1 needs --allow-nondeterministic (only scale 1 is byte-reproducible),
+and must give even pixel dimensions for every aspect (e.g. 0.25, 0.5, 2).
 A --trace file must be illustrative; replays come only from --build-record (plan D2).`;
 
 class UsageError extends Error {}
@@ -94,6 +95,7 @@ async function render(args: string[]) {
       frame: { type: "string" },
       scale: { type: "string" },
       force: { type: "boolean", default: false },
+      "allow-nondeterministic": { type: "boolean", default: false },
     },
   });
   const [sceneId, ...extra] = positionals;
@@ -116,7 +118,14 @@ async function render(args: string[]) {
   if (frame !== undefined && format !== "png") throw new UsageError("render: --frame is only valid with --format png");
   const scaleText = values.scale as string | undefined;
   const scale = scaleText === undefined ? undefined : Number(scaleText);
-  if (scale !== undefined) {
+  if (scale !== undefined && scale !== 1) {
+    if (values["allow-nondeterministic"] !== true) {
+      throw new UsageError(
+        `render: --scale ${scaleText} is refused: renders are byte-reproducible only at scale 1 ` +
+          "(at a fractional scale an edge pixel was seen to vary by 1 between runs). " +
+          "Render at scale 1 and resize, or pass --allow-nondeterministic.",
+      );
+    }
     const problem = scaleProblem(scale);
     if (problem) throw new UsageError(`render: ${problem}`);
   }
