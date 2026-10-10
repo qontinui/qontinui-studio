@@ -300,10 +300,14 @@ with zero manual steps, and every library row carries full provenance.
 
 ## Licence
 
-The whole repository, including `scenes/`, is MIT-licensed (see `LICENSE`). MIT,
-not AGPL, is deliberate: the scene renderer takes Remotion (source-available) as
-a peer dependency, and Remotion's terms are further restrictions that AGPL-3.0
-§10 forbids. Decision recorded in plan
+The whole repository is MIT-licensed (see `LICENSE`), including the `scenes/`
+directory the sibling plan adds later. MIT, not AGPL, is deliberate: the planned
+scene renderer will take Remotion (source-available) as a peer dependency, and
+Remotion's terms are further restrictions that AGPL-3.0 §10 forbids. The
+decision is recorded in plan
 `2026-10-09-qontinui-marketing-studio-animated-process-explainers`, Phase 0
-("AGPL handling"). Remotion is never vendored here and stays under its own
-licence.
+result ("AGPL handling", recorded by session 4409f0d3). It is tied to keeping a
+Remotion adapter: that plan leaves open whether HyperFrames becomes the primary
+adapter, and if no Remotion adapter remains the reason for MIT over AGPL lapses
+(the choice itself stays valid). Remotion is never vendored here and stays under
+its own licence.
