@@ -32,6 +32,7 @@ import os
 import re
 import sqlite3
 import stat
+import warnings as py_warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -71,6 +72,11 @@ REQUIRED_FIELDS = (
     "ai_generated",
 )
 OPTIONAL_FIELDS = ("reference_images", "tos_reviewed", "status", "approved_by", "approved_on")
+# Import size caps. A file over MAX_FILE_BYTES is refused before it is read; an
+# image whose header declares more than MAX_PIXELS pixels is refused before
+# its pixel data is decoded (a decompression bomb never expands).
+MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_PIXELS = 100_000_000
 EXTENSIONS = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}
 _IMPORTED_SUBDIR = "imported"
 
@@ -206,8 +212,13 @@ def _read_inside(inbox: Path, path: Path) -> bytes | str:
             return "changed while being imported; refused"
         if actual.st_nlink > 1:
             return "has more than one hard link; refused (it may live outside the inbox)"
+        if actual.st_size > MAX_FILE_BYTES:
+            return f"is {actual.st_size} bytes, over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
         with os.fdopen(fd, "rb", closefd=False) as f:
-            data = f.read()
+            # Read at most one byte past the cap: a file grown since fstat is refused too.
+            data = f.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            return f"is over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
     except OSError as e:
         return f"cannot be read ({type(e).__name__})"
     finally:
@@ -220,15 +231,28 @@ def _read_inside(inbox: Path, path: Path) -> bytes | str:
 def _decode(data: bytes) -> tuple[str, int, int] | str:
     """(Pillow format, width, height) of a fully decodable PNG/JPEG/WebP, or
     the reason it is not one."""
+    too_big = f"is over the {MAX_PIXELS}-pixel (100 megapixel) cap"
     try:
-        with Image.open(io.BytesIO(data)) as img:
-            fmt = img.format or ""
-            if fmt not in MIMES:
-                return f"is {fmt or 'an unknown format'}, not PNG/JPEG/WebP"
-            img.verify()
-        with Image.open(io.BytesIO(data)) as img:
-            img.load()
-            width, height = img.size
+        with py_warnings.catch_warnings():
+            # The cap below is the decision; Pillow's own bomb warning is noise.
+            py_warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as img:
+                fmt = img.format or ""
+                if fmt not in MIMES:
+                    return f"is {fmt or 'an unknown format'}, not PNG/JPEG/WebP"
+                # Header dimensions only: checked BEFORE any pixel data is decoded,
+                # so a decompression bomb is refused without being expanded.
+                header_w, header_h = img.size
+                if header_w * header_h > MAX_PIXELS:
+                    return f"{too_big} ({header_w}x{header_h} in its header)"
+                img.verify()
+            with Image.open(io.BytesIO(data)) as img:
+                img.load()
+                width, height = img.size
+    except Image.DecompressionBombError:
+        # Pillow refuses at open (before we can read the header) beyond 2x its
+        # own limit; that is far over our cap too.
+        return too_big
     except Exception as e:
         return f"is not a decodable PNG/JPEG/WebP image ({type(e).__name__})"
     return fmt, width, height

@@ -7,11 +7,15 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
+import zlib
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from PIL import Image
+from PIL.PngImagePlugin import PngImageFile
 
 from qontinui_studio import inbox as inbox_mod
 from qontinui_studio.cli import main
@@ -476,6 +480,98 @@ def test_unreadable_file_is_reported_and_later_entries_still_checked(
         (inbox / "a.png").chmod(0o644)
     assert any(e.startswith("entry 0: file: 'a.png' cannot be read") for e in errors), errors
     assert any(e.startswith("entry 1: watermark:") for e in errors), errors
+
+
+def _png_header_only(path: Path, width: int, height: int) -> Path:
+    """A PNG whose IHDR declares ``width`` x ``height`` but carries one tiny
+    IDAT: decoding it fully would expand to the declared size."""
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(body))
+            + kind
+            + body
+            + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(b"\x00" * 64))
+        + chunk(b"IEND", b"")
+    )
+    return path
+
+
+def test_size_caps_are_the_documented_values() -> None:
+    assert inbox_mod.MAX_FILE_BYTES == 50 * 1024 * 1024
+    assert inbox_mod.MAX_PIXELS == 100_000_000
+
+
+def test_refusal_file_over_the_byte_cap(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox = make_inbox(
+        tmp_path,
+        [entry(file="small.png"), entry(file="big.png")],
+        images={"small.png": (1, 1, 1)},
+    )
+    write_image(inbox / "big.png", size=(400, 400))
+    cap = (inbox / "small.png").stat().st_size + 1
+    assert (inbox / "big.png").stat().st_size > cap
+    monkeypatch.setattr(inbox_mod, "MAX_FILE_BYTES", cap)
+    errors = _refused(studio_root, inbox)
+    assert errors == [
+        f"entry 1: file: 'big.png' is {(inbox / 'big.png').stat().st_size} bytes, over the {cap}-byte (50 MiB) cap"
+    ]
+    _nothing_written(studio_root)
+
+
+def test_refusal_real_file_over_50_mib(studio_root: Path, tmp_path: Path) -> None:
+    """At the real cap: a sparse 50 MiB + 1 byte file (no disk cost)."""
+    inbox = make_inbox(tmp_path, [entry(file="huge.png")], images={})
+    with (inbox / "huge.png").open("wb") as f:
+        f.truncate(50 * 1024 * 1024 + 1)
+    errors = _refused(studio_root, inbox)
+    assert any(e.startswith("entry 0: file: 'huge.png'") and "50 MiB" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(20_000, 5_001), (40_000, 40_000)],
+    ids=["just-over-cap", "past-pillow-bomb-limit"],
+)
+def test_refusal_pixel_cap_from_the_header_before_decoding(
+    studio_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    height: int,
+) -> None:
+    inbox = make_inbox(tmp_path, [entry(file="bomb.png")], images={})
+    _png_header_only(inbox / "bomb.png", width, height)
+
+    def no_decoding(self: object, *args: object, **kwargs: object) -> None:
+        raise AssertionError("pixel data decoded before the cap was checked")
+
+    monkeypatch.setattr(Image.Image, "load", no_decoding)
+    monkeypatch.setattr(PngImageFile, "verify", no_decoding)
+    monkeypatch.setattr(PngImageFile, "load", no_decoding)
+    errors = _refused(studio_root, inbox)
+    assert len(errors) == 1 and errors[0].startswith(
+        "entry 0: file: 'bomb.png' is over the 100000000-pixel (100 megapixel) cap"
+    ), errors
+    _nothing_written(studio_root)
+
+
+def test_image_at_the_pixel_cap_is_judged_by_decoding(studio_root: Path, tmp_path: Path) -> None:
+    """Exactly 100 MP passes the header check and goes on to the full decode
+    (which this header-only file then fails, as a non-decodable image)."""
+    inbox = make_inbox(tmp_path, [entry(file="edge.png")], images={})
+    _png_header_only(inbox / "edge.png", 20_000, 5_000)
+    errors = _refused(studio_root, inbox)
+    assert len(errors) == 1 and "not a decodable" in errors[0], errors
 
 
 def test_refusal_entry_not_a_mapping(studio_root: Path, tmp_path: Path) -> None:

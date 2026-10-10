@@ -300,7 +300,10 @@ cross-checks the schema file against the validator so the two cannot drift.
 - The **whole** manifest is validated first. If any entry is invalid nothing is
   imported, and every problem is reported with its entry index.
 - Width, height, SHA-256 and MIME type are **measured**: Pillow must decode the
-  file as PNG, JPEG or WebP, whatever its extension says. The manifest cannot
+  file as PNG, JPEG or WebP, whatever its extension says. A file over 50 MiB
+  (`MAX_FILE_BYTES`) is refused before it is read. An image whose header
+  declares more than 100 megapixels (`MAX_PIXELS`) is refused before its pixels
+  are decoded, so a decompression bomb never expands. The manifest cannot
   supply them (unknown fields are refused).
 - `commercial_use: yes` without `tos_reviewed` is recorded as `unknown`, and
   `approved`/`rejected` without both `approved_by` and `approved_on` is recorded
