@@ -682,8 +682,12 @@ def test_a_failure_while_writing_rolls_everything_back(
         return real(staged, raw_path)
 
     monkeypatch.setattr(inbox_mod, "_install", flaky)
-    with pytest.raises(OSError):
+    with pytest.raises(ImportRefused) as info:
         do_import(studio_root, inbox)
+    assert info.value.errors == [
+        "write: could not install the files into the raw store (OSError); nothing imported"
+    ]
+    assert str(tmp_path) not in str(info.value) + "".join(info.value.errors)
     conn = connect(Workspace(studio_root).db_path)
     assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 0
@@ -691,7 +695,8 @@ def test_a_failure_while_writing_rolls_everything_back(
     # and nothing is left staged.
     assert not calls[0].exists()
     _nothing_written(studio_root)
-    assert not (Workspace(studio_root).state_dir / "import-staging").exists()
+    staging = Workspace(studio_root).raw_dir / "imported" / ".staging"
+    assert not any(staging.iterdir())
     monkeypatch.setattr(inbox_mod, "_install", real)
     assert len(do_import(studio_root, inbox).imported) == 2
 

@@ -5,6 +5,7 @@ Each is ported from the reviewer's repro script."""
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -38,7 +39,8 @@ def _refused(studio_root: Path, inbox: Path) -> list[str]:
 
 
 def _no_staging_left(studio_root: Path) -> None:
-    assert not (Workspace(studio_root).state_dir / "import-staging").exists()
+    staging = Workspace(studio_root).raw_dir / "imported" / ".staging"
+    assert not staging.exists() or not any(staging.iterdir())
 
 
 @pytest.fixture
@@ -237,7 +239,8 @@ def test_r3_refusal_leaves_no_raw_or_staged_files(studio_root: Path, tmp_path: P
     inbox = make_inbox(tmp_path, [entry(), entry(file="hero.png", asset_id="b", account="a@b")])
     _refused(studio_root, inbox)
     _no_staging_left(studio_root)
-    assert not (Workspace(studio_root).raw_dir / "imported").exists()
+    imported = Workspace(studio_root).raw_dir / "imported"
+    assert not any(p.is_file() for p in imported.rglob("*"))
 
 
 # ---- r4: parent directory swapped for a symlink -----------------------------------
@@ -379,3 +382,199 @@ def test_raw_store_rows_survive_a_reopen(studio_root: Path, tmp_path: Path) -> N
     assert sha256_file(Path(raw)) == sha
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("UPDATE batches SET status = 'generated' WHERE id = 'import:inbox-1'")
+
+
+# ---- third review: r11 cross-filesystem, r12 junction fallback, r13 rmdir race ---
+
+
+def _other_filesystem(tmp_path: Path) -> Path:
+    shm = Path("/dev/shm")
+    if not shm.is_dir() or shm.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("no second filesystem (/dev/shm) here")
+    return shm
+
+
+@posix_only
+@pytest.mark.parametrize("layout", ["studio-elsewhere", "raw-elsewhere"])
+def test_r11_raw_store_on_another_filesystem(
+    studio_root: Path, tmp_path: Path, layout: str
+) -> None:
+    import shutil
+    import tempfile
+
+    target = Path(tempfile.mkdtemp(prefix="studio-test-", dir=_other_filesystem(tmp_path)))
+    try:
+        if layout == "studio-elsewhere":
+            os.symlink(target, studio_root / ".studio")
+        else:
+            (studio_root / ".studio").mkdir()
+            os.symlink(target, studio_root / ".studio" / "raw")
+        outcome = do_import(studio_root, make_inbox(tmp_path))
+        assert len(outcome.imported) == 1
+        _no_staging_left(studio_root)
+    finally:
+        shutil.rmtree(target, ignore_errors=True)
+
+
+def test_r11_install_error_is_a_refusal_without_paths(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_replace = os.replace
+
+    def exdev(src: Any, dst: Any) -> None:
+        if str(dst).endswith(".png"):  # the move into the raw store, not staging
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src), None, str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(inbox_mod.os, "replace", exdev)
+    with pytest.raises(ImportRefused) as info:
+        do_import(studio_root, make_inbox(tmp_path))
+    text = str(info.value) + "\n".join(info.value.errors)
+    assert "EXDEV" in text and str(tmp_path) not in text and "/" not in "".join(info.value.errors)
+    assert (
+        connect(Workspace(studio_root).db_path).execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+        == 0
+    )
+    _no_staging_left(studio_root)
+
+
+def test_staging_write_failure_is_reported_as_staging(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = Path.open
+
+    class Full:
+        def __init__(self, f: Any) -> None:
+            self.f = f
+
+        def write(self, _: bytes) -> int:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.f, name)
+
+        def __enter__(self) -> Full:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.f.close()
+
+    def opener(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        f = real_open(self, mode, *args, **kwargs)
+        return Full(f) if self.name.startswith(".partial-") else f
+
+    monkeypatch.setattr(Path, "open", opener)
+    errors = _refused(studio_root, make_inbox(tmp_path))
+    assert errors == ["entry 0: file: 'hero.png' could not be staged (ENOSPC)"]
+
+
+def _force_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(inbox_mod, "_DIR_FD", False)
+
+
+def test_r12_fallback_imports_a_plain_inbox(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_fallback(monkeypatch)
+    inbox = make_inbox(tmp_path, [entry(file="sub/a.png")], images={"sub/a.png": (1, 1, 1)})
+    assert len(do_import(studio_root, inbox).imported) == 1
+
+
+@posix_only
+def test_r12_junction_that_is_not_a_symlink_to_pathlib_is_refused(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's simulation: `sub` links outside, and is_symlink() says
+    False for it, as it does for a Windows junction."""
+    _force_fallback(monkeypatch)
+    inbox = make_inbox(tmp_path, [entry(file="sub/hero.png")], images={})
+    outside = tmp_path / "outside"
+    write_image(outside / "hero.png", (250, 0, 0), size=(33, 21))
+    os.symlink(outside, inbox / "sub")
+    real = Path.is_symlink
+    monkeypatch.setattr(
+        Path, "is_symlink", lambda self: False if self.name == "sub" else real(self)
+    )
+    errors = _refused(studio_root, inbox)
+    assert errors == [
+        "entry 0: file: 'sub/hero.png' goes through a symlink or junction (sub); links are refused"
+    ]
+
+
+def test_r12_junction_attribute_is_refused(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_fallback(monkeypatch)
+    inbox = make_inbox(tmp_path, [entry(file="sub/a.png")], images={"sub/a.png": (1, 1, 1)})
+    real = Path.is_junction
+    monkeypatch.setattr(Path, "is_junction", lambda self: self.name == "sub" or real(self))
+    assert any("symlink or junction (sub)" in e for e in _refused(studio_root, inbox))
+
+
+@posix_only
+def test_r12_resolve_check_catches_a_link_the_walk_missed(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even if every per-component check were fooled, the opened file must
+    resolve inside the inbox."""
+    _force_fallback(monkeypatch)
+    monkeypatch.setattr(inbox_mod, "_is_link_like", lambda path: False)
+    inbox = make_inbox(tmp_path, [entry(file="sub/hero.png")], images={})
+    write_image(tmp_path / "outside" / "hero.png", (250, 0, 0), size=(33, 21))
+    os.symlink(tmp_path / "outside", inbox / "sub")
+    errors = _refused(studio_root, inbox)
+    assert errors == ["entry 0: file: 'sub/hero.png' resolves outside the inbox; refused"]
+
+
+def test_r13_staging_parent_vanishing_is_a_refusal_not_a_crash(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's forced interleaving: the shared parent is removed right
+    after it is created, every time."""
+    inbox = make_inbox(tmp_path)
+    real_mkdir = os.mkdir
+
+    def mkdir(path: Any, *args: Any, **kwargs: Any) -> None:
+        real_mkdir(path, *args, **kwargs)
+        if str(path).endswith(".staging"):
+            os.rmdir(path)
+
+    monkeypatch.setattr(os, "mkdir", mkdir)
+    errors = _refused(studio_root, inbox)
+    assert len(errors) == 1 and errors[0].startswith("staging: "), errors
+
+
+def test_r13_an_import_never_removes_the_shared_staging_parent(
+    studio_root: Path, tmp_path: Path
+) -> None:
+    parent = Workspace(studio_root).raw_dir / "imported" / ".staging"
+    other_run = parent / "another-import-in-progress"
+    other_run.mkdir(parents=True)
+    do_import(studio_root, make_inbox(tmp_path))
+    _refused(studio_root, make_inbox(tmp_path, [entry(account="a@b")], name="bad"))
+    assert parent.is_dir() and other_run.is_dir()
+
+
+def test_stale_staging_runs_are_swept(studio_root: Path, tmp_path: Path) -> None:
+    parent = Workspace(studio_root).raw_dir / "imported" / ".staging"
+    stale, fresh = parent / "killed-import", parent / "live-import"
+    for d in (stale, fresh):
+        (d / "partial").parent.mkdir(parents=True)
+        (d / "partial").write_bytes(b"x")
+    old = time.time() - inbox_mod.STALE_STAGING_S - 60
+    os.utime(stale, (old, old))
+    do_import(studio_root, make_inbox(tmp_path))
+    assert not stale.exists() and fresh.is_dir()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["hero.png/", "sub//a.png", "./hero.png", "sub/./a.png", "sub\\\\a.png", "hero.png\\"],
+)
+def test_file_paths_must_be_written_plainly(studio_root: Path, tmp_path: Path, name: str) -> None:
+    inbox = make_inbox(
+        tmp_path, [entry(file=name)], images={"hero.png": (1, 1, 1), "sub/a.png": (2, 2, 2)}
+    )
+    errors = _refused(studio_root, inbox)
+    assert len(errors) == 1 and errors[0].startswith("entry 0: file: "), errors
+    assert "separator" in errors[0] or "segment" in errors[0], errors

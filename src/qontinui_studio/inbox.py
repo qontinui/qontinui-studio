@@ -16,8 +16,10 @@ Rules:
   duplicate keys. A manifest value never appears in a message unless it is a
   (truncated) string.
 * Each file is opened ONCE, from a descriptor on the inbox, walking every path
-  component with ``O_NOFOLLOW`` (POSIX), and must be a regular file with one
-  link. Its bytes are streamed into a private staging file under ``.studio/``
+  component with ``O_NOFOLLOW`` (POSIX; Windows gets a weaker, documented
+  fallback — see :func:`_open_inside`), and must be a regular file with one
+  link. Its bytes are streamed into a private staging file in the raw store
+  (``.studio/raw/imported/.staging/<run>/``)
   while being hashed; the size, SHA-256, format and dimensions all come from
   that one read, and the inbox is never touched again.
 * Width, height, SHA-256 and MIME type are MEASURED by decoding the staged
@@ -44,6 +46,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import time
 import uuid
 import warnings as py_warnings
 from collections.abc import Callable, Iterator
@@ -108,7 +111,11 @@ MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 
 EXTENSIONS = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}
 _IMPORTED_SUBDIR = "imported"
-_STAGING_SUBDIR = "import-staging"
+# Staging lives INSIDE the raw store's directory, so moving a staged file into
+# the store is a rename on one filesystem even when .studio/raw is a mount or a
+# link to another disk.
+_STAGING_SUBDIR = ".staging"
+STALE_STAGING_S = 24 * 3600
 _CHUNK = 1024 * 1024
 _SHOWN_CHARS = 80
 
@@ -195,16 +202,20 @@ class _Opened:
 
 
 def _split(raw: str) -> list[str] | str:
-    """Path components of a manifest ``file``, or why it is refused."""
+    """Path components of a manifest ``file``, or why it is refused. A path is
+    written plainly: no absolute form, no ``..``, and no empty (``//``),
+    ``.`` or trailing-separator segments."""
     if "\x00" in raw:
         return "contains a NUL byte"
     if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
         return "is absolute; files must be relative to the inbox"
-    parts = [p for p in re.split(r"[\\/]", raw) if p not in ("", ".")]
-    if not parts:
-        return "must name a file"
+    parts = re.split(r"[\\/]", raw)
     if ".." in parts:
         return "escapes the inbox ('..')"
+    if raw.endswith(("/", "\\")):
+        return "ends with a separator; name a file"
+    if "" in parts or "." in parts:
+        return "has an empty or '.' segment; write the path plainly (a/b.png)"
     return parts
 
 
@@ -245,8 +256,13 @@ def _open_inside(
     file with ``O_NONBLOCK`` so a FIFO cannot hang the import: a path component
     swapped for a symlink at any moment is refused, because nothing is ever
     re-resolved by name. Every check is then made on the opened descriptor.
-    Without ``dir_fd`` support (Windows) it falls back to an ``lstat`` walk and
-    an identity check of the opened file — best effort, not race-free."""
+    Without ``dir_fd`` support (Windows) it falls back to a name-based walk
+    that refuses every component that is a symlink, a junction or any other
+    reparse point, opens the file by name, then requires the opened file to be
+    the one walked to (same identity) and its resolved path to lie inside the
+    inbox. That fallback refuses every link that exists when it looks, but it
+    is NOT race-free: a component swapped between the walk and the open can
+    still be followed, and only the post-open resolve check stands in the way."""
     if _DIR_FD and inbox_fd is not None:
         held: list[int] = []
         try:
@@ -266,12 +282,16 @@ def _open_inside(
         finally:
             for h in held:
                 os.close(h)
-    else:  # pragma: no cover - exercised on Windows only
+    else:  # the Windows fallback (tests force it on POSIX too)
         path = inbox
-        for comp in parts:
+        for n, comp in enumerate(parts):
             path = path / comp
-            if path.is_symlink():
-                return f"goes through a symlink ({comp}); symlinks are refused"
+            try:
+                linked = _is_link_like(path)
+            except OSError as e:
+                return _open_error(e, comp, final=n == len(parts) - 1)
+            if linked:
+                return f"goes through a symlink or junction ({comp}); links are refused"
         try:
             before = path.lstat()
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
@@ -281,18 +301,40 @@ def _open_inside(
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             os.close(fd)
             return "changed while being imported; refused"
+        try:
+            inside = path.resolve(strict=True).is_relative_to(inbox.resolve(strict=True))
+        except OSError:
+            inside = False
+        if not inside:
+            os.close(fd)
+            return "resolves outside the inbox; refused"
     checked = _check_opened(fd, MAX_FILE_BYTES if max_bytes is None else max_bytes, cap)
     if isinstance(checked, str):
         os.close(fd)
     return checked
 
 
+def _is_link_like(path: Path) -> bool:
+    """A symlink, a Windows junction, or any other reparse point. The junction
+    and reparse-point checks are no-ops where the platform has no such thing."""
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode) or path.is_junction():
+        return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(getattr(st, "st_file_attributes", 0) & reparse)
+
+
 @contextlib.contextmanager
 def _inbox_dir_fd(inbox: Path) -> Iterator[int | None]:
-    if not _DIR_FD:  # pragma: no cover - Windows
+    if not _DIR_FD:
         yield None
         return
-    fd = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        raise ImportRefused(
+            "the inbox cannot be opened", [f"inbox: cannot be opened ({_errno_name(e)})"]
+        ) from e
     try:
         yield fd
     finally:
@@ -302,53 +344,112 @@ def _inbox_dir_fd(inbox: Path) -> Iterator[int | None]:
 # ---- staging: one streamed read per file ---------------------------------------
 
 
+def _errno_name(e: OSError) -> str:
+    """An OSError named without its message (which carries absolute paths)."""
+    return errno.errorcode.get(e.errno or 0, type(e).__name__)
+
+
 class _Staging:
-    """Private copies of the inbox files under ``.studio/import-staging/<run>/``,
-    named by SHA-256. Bytes are hashed while they are copied, so each inbox
-    file is read exactly once and never held in memory whole."""
+    """Private copies of the inbox files under
+    ``.studio/raw/imported/.staging/<run>/``, named by SHA-256. Bytes are hashed
+    while they are copied, so each inbox file is read exactly once and never
+    held in memory whole."""
 
     def __init__(self, ws: Workspace) -> None:
-        self.dir = ws.state_dir / _STAGING_SUBDIR / uuid.uuid4().hex
+        self.parent = ws.raw_dir / _IMPORTED_SUBDIR / _STAGING_SUBDIR
+        self.dir = self.parent / uuid.uuid4().hex
         self.total = 0
+
+    def start(self) -> None:
+        """Create this run's directory. The shared parent is never removed by
+        an import, but tolerate it vanishing between the two mkdirs anyway."""
+        for _ in range(3):
+            try:
+                self.dir.mkdir(parents=True)
+                return
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                raise _staging_refused(e) from e
+        raise ImportRefused(
+            "could not create the import staging directory",
+            ["staging: could not create this import's staging directory (it kept vanishing)"],
+        )
 
     def stage(self, opened: _Opened) -> tuple[str, int, Path] | str:
         if self.total + opened.size > MAX_TOTAL_BYTES:
             return f"would take this import past its {MAX_TOTAL_BYTES}-byte (2 GiB) total cap"
-        self.dir.mkdir(parents=True, exist_ok=True)
         tmp = self.dir / f".partial-{uuid.uuid4().hex}"
         digest = hashlib.sha256()
         size = 0
         try:
-            with os.fdopen(opened.fd, "rb", closefd=False) as src, tmp.open("wb") as dst:
-                while chunk := src.read(_CHUNK):
-                    size += len(chunk)
-                    self.total += len(chunk)
-                    if size > MAX_FILE_BYTES:
-                        return f"is over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
-                    if self.total > MAX_TOTAL_BYTES:
-                        return (
-                            f"would take this import past its {MAX_TOTAL_BYTES}-byte "
-                            "(2 GiB) total cap"
-                        )
-                    digest.update(chunk)
+            dst = tmp.open("wb")
+        except OSError as e:
+            return f"could not be staged ({_errno_name(e)})"
+        with dst, os.fdopen(opened.fd, "rb", closefd=False) as src:
+            while True:
+                try:
+                    chunk = src.read(_CHUNK)
+                except OSError as e:
+                    return f"cannot be read ({_errno_name(e)})"
+                if not chunk:
+                    break
+                size += len(chunk)
+                self.total += len(chunk)
+                if size > MAX_FILE_BYTES:
+                    return f"is over the {MAX_FILE_BYTES}-byte (50 MiB) cap"
+                if self.total > MAX_TOTAL_BYTES:
+                    return (
+                        f"would take this import past its {MAX_TOTAL_BYTES}-byte (2 GiB) total cap"
+                    )
+                digest.update(chunk)
+                try:
                     dst.write(chunk)
+                except OSError as e:
+                    return f"could not be staged ({_errno_name(e)})"
+            try:
                 dst.flush()
                 os.fsync(dst.fileno())
-        except OSError as e:
-            return f"cannot be read ({type(e).__name__})"
+            except OSError as e:
+                return f"could not be staged ({_errno_name(e)})"
         # (A refused partial copy is removed with the whole run by discard().)
         sha = digest.hexdigest()
         staged = self.dir / sha
-        if staged.exists():
-            tmp.unlink()
-        else:
-            os.replace(tmp, staged)
+        try:
+            if staged.exists():
+                tmp.unlink()
+            else:
+                os.replace(tmp, staged)
+        except OSError as e:
+            return f"could not be staged ({_errno_name(e)})"
         return sha, size, staged
 
     def discard(self) -> None:
+        """Remove this run's directory only; the shared parent stays, so a
+        concurrent import's mkdir under it can never lose its parent."""
         shutil.rmtree(self.dir, ignore_errors=True)
-        with contextlib.suppress(OSError):
-            self.dir.parent.rmdir()  # only when no other import is staging
+
+    def sweep_stale(self, now: float) -> None:
+        """Delete run directories older than STALE_STAGING_S: left by an import
+        that was killed. Called under the database write lock, and no live
+        import takes a day to validate."""
+        try:
+            runs = list(self.parent.iterdir())
+        except OSError:
+            return
+        for run in runs:
+            if run == self.dir:
+                continue
+            with contextlib.suppress(OSError):
+                if now - run.lstat().st_mtime > STALE_STAGING_S:
+                    shutil.rmtree(run, ignore_errors=True)
+
+
+def _staging_refused(e: OSError) -> ImportRefused:
+    return ImportRefused(
+        "the import could not use its staging directory",
+        [f"staging: could not use this import's staging directory ({_errno_name(e)})"],
+    )
 
 
 def _decode(path: Path) -> tuple[str, int, int] | str:
@@ -685,7 +786,7 @@ def _install(staged: Path, raw_path: Path) -> bool:
         return False
     existed = raw_path.exists()
     raw_path.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staged, raw_path)  # same filesystem: both live under .studio/
+    os.replace(staged, raw_path)  # same filesystem: staging is inside the raw store's dir
     return not existed
 
 
@@ -712,6 +813,7 @@ def import_inbox(
     batch_id = f"import:{inbox.name}"
     staging = _Staging(ws)
     try:
+        staging.start()
         with _inbox_dir_fd(inbox) as inbox_fd:
             doc = _load_manifest(inbox, inbox_fd)
             errors: list[str] = []
@@ -727,7 +829,7 @@ def import_inbox(
         manifest_ids = {
             r["asset_id"] for r in doc if isinstance(r, dict) and isinstance(r.get("asset_id"), str)
         }
-        _commit(conn, ws, batch_id, inbox, entries, manifest_ids, errors, outcome, clock)
+        _commit(conn, ws, staging, batch_id, inbox, entries, manifest_ids, errors, outcome, clock)
     finally:
         staging.discard()
     return outcome
@@ -747,6 +849,7 @@ def _check_duplicates(entries: list[_Entry], errors: list[str]) -> None:
 def _commit(
     conn: sqlite3.Connection,
     ws: Workspace,
+    staging: _Staging,
     batch_id: str,
     inbox: Path,
     entries: list[_Entry],
@@ -759,6 +862,9 @@ def _commit(
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Under the write lock no other import is committing; a staging run
+        # older than a day belongs to an import that was killed.
+        staging.sweep_stale(time.time())
         # Checks against the library run under the write lock, so they hold
         # for the rows written below.
         library_ids = {r["asset_id"] for r in conn.execute("SELECT DISTINCT asset_id FROM assets")}
@@ -842,12 +948,21 @@ def _commit(
             )
             outcome.imported.append(uid)
         conn.commit()
-    except BaseException:
+    except BaseException as e:
         conn.rollback()
         # The rows are gone; so are the raw files this import put there.
         for path in created:
             with contextlib.suppress(OSError):
                 path.unlink()
+        if isinstance(e, OSError):
+            # Never relay the OSError text: it carries absolute local paths.
+            raise ImportRefused(
+                "the import failed while writing to the library; nothing imported",
+                [
+                    "write: could not install the files into the raw store "
+                    f"({_errno_name(e)}); nothing imported"
+                ],
+            ) from e
         raise
 
 

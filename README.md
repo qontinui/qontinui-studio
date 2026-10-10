@@ -320,12 +320,21 @@ cross-checks the schema file against the validator so the two cannot drift.
   directory swapped for one mid-import, is refused. The file itself is opened
   `O_NONBLOCK`, so a FIFO cannot hang the import. The descriptor must be a
   regular file with one link and within the size cap. Its bytes are streamed
-  once into a private staging file under `.studio/import-staging/`, hashed
-  while they are copied. The size, SHA-256, format and dimensions all come
-  from that one read, and the inbox is not touched again. Windows has no
-  `dir_fd` support, so there the check falls back to an `lstat` walk plus an
-  identity check on the opened file. That fallback is best effort, not
-  race-free.
+  once into a private staging file in
+  `.studio/raw/imported/.staging/<run>/`, hashed while they are copied.
+  Staging sits inside the raw store's directory, so moving a file into the
+  store is a rename on one filesystem even when `.studio/raw` is on another
+  disk. The size, SHA-256, format and dimensions all come from that one
+  read, and the inbox is not touched again.
+- On Windows, which has no `dir_fd`, the open falls back to a name-based
+  walk. It refuses any component that is a symlink, a junction or another
+  reparse point, opens the file by name, and then requires two things: the
+  opened file is the one it walked to, and its resolved path lies inside the
+  inbox. That refuses every link present when it looks. It is not race-free:
+  a component swapped between the walk and the open is caught only by the
+  resolve check after opening.
+- `file` must be written plainly: no trailing separator and no empty (`//`)
+  or `.` segments.
 - The manifest is plain data. It is read the same way, capped at 1 MiB and
   1000 entries (`MAX_MANIFEST_BYTES`, `MAX_ENTRIES`). YAML anchors, aliases,
   merge keys and duplicate keys are refused. A manifest value appears in an
@@ -337,8 +346,11 @@ cross-checks the schema file against the validator so the two cannot drift.
   `jobs run` and crash recovery all skip it, and a SQL `CHECK` refuses to move
   an `imported` batch to any other status.
 - Staged files are renamed into the raw store inside the database write
-  transaction. On a refusal or a rollback, the staged files and any raw file
-  this import created are deleted.
+  transaction. On a refusal or a rollback, this import's staging directory
+  and any raw file it created are deleted. A failure to write is reported as
+  a refusal that names the error code, never a local path. Staging
+  directories older than 24 hours, left by a killed import, are removed by
+  the next import while it holds the database write lock.
 
 **Approval.** `studio library approve|reject <uid> --by <alias>` records the
 decision, the reviewer alias and today's UTC date on the row. Approval is
