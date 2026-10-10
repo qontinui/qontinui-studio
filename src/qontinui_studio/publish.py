@@ -629,7 +629,7 @@ def _select_slot_variants(
     variant index). Later variants stay in the library for the review page."""
 
     def order(p: tuple[AssetRecord, VariantRecord]) -> tuple[int, str]:
-        job = p[0].job_id
+        job = p[0].job_id or ""  # only generated assets have variants to publish
         idx = job.rsplit("-v", 1)[-1]
         return (int(idx) if idx.isdigit() else 0, p[0].uid)
 

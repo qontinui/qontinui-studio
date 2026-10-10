@@ -57,9 +57,17 @@ def build_review_page(
         parts.append("<p>No batches yet.</p>")
     for b in batches:
         parts.append(f"<section class='batch'><h2>{_e(b['id'])} — {_e(b['status'])}</h2>")
-        parts.append(f"<dl><dt>brief</dt><dd>{_e(b['brief_path'])}</dd></dl>")
-        parts.append("<p>Regenerate:</p>")
-        parts.append(f"<code>{_e(studio_command(['brief', 'run', b['brief_path']], root))}</code>")
+        if b["origin"] == "imported":
+            parts.append(
+                "<p>Imported with <code>studio library import</code>; an import is never "
+                "published.</p>"
+            )
+        else:
+            parts.append(f"<dl><dt>brief</dt><dd>{_e(b['brief_path'])}</dd></dl>")
+            parts.append("<p>Regenerate:</p>")
+            parts.append(
+                f"<code>{_e(studio_command(['brief', 'run', b['brief_path']], root))}</code>"
+            )
         if b["status"] == "published":
             parts.append("<p>Unpublish:</p>")
             parts.append(f"<code>{_e(unpublish_command(b['id'], root))}</code>")
@@ -80,8 +88,11 @@ def build_review_page(
             variants = library.variants(asset.uid)
             preview = next((v for v in variants if v.format in ("webp", "png", "jpeg")), None)
             parts.append("<div class='asset'>")
-            if preview is not None:
-                rel = os.path.relpath(preview.path, out_dir)
+            shown = preview.path if preview is not None else None
+            if shown is None and asset.origin == "imported":
+                shown = asset.raw_path  # an import has no variants; show the stored original
+            if shown is not None:
+                rel = os.path.relpath(shown, out_dir)
                 parts.append(
                     f"<img src='{_e(rel)}' alt='{_e(asset.asset_id)} preview' loading='lazy'>"
                 )
@@ -93,7 +104,13 @@ def build_review_page(
             parts.append("<dl>")
             for k, v in (
                 ("asset", asset.uid),
-                ("provider", f"{asset.provider_name} ({asset.provider})"),
+                (
+                    "provider",
+                    f"{asset.provider_name} ({asset.provider})"
+                    if asset.provider_name
+                    else asset.provider,
+                ),
+                ("account", asset.account or "—"),
                 ("model", asset.model),
                 ("created", asset.created_at),
                 ("ai_generated", "true" if asset.ai_generated else "false"),
@@ -101,6 +118,15 @@ def build_review_page(
                 ("terms reviewed", asset.licence_tos_reviewed or "UNREVIEWED"),
                 ("terms source", asset.licence_source),
                 ("watermark", asset.watermark),
+                (
+                    "approval",
+                    asset.approval_status
+                    + (
+                        f" by {asset.approval_by} on {asset.approval_on}"
+                        if asset.approval_by
+                        else ""
+                    ),
+                ),
                 ("prompt", asset.prompt),
                 (
                     "variants",

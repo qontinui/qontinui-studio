@@ -80,3 +80,18 @@ class JournalError(StudioError):
 class LeaseLost(StudioError):
     """This process no longer holds the batch lease (it expired and another
     driver may have taken over); it must stop driving the batch."""
+
+
+class ImportRefused(StudioError):
+    """``studio library import`` refused an inbox manifest. Nothing was imported;
+    ``errors`` names every problem found, each prefixed with its entry index."""
+
+    def __init__(self, message: str, errors: list[str]) -> None:
+        super().__init__(message)
+        self.errors = errors
+
+
+class ApprovalRefused(StudioError):
+    """``studio library approve``/``reject`` refused: unknown asset, a reviewer
+    alias that is not an alias, or (D5) approving an asset whose licence does
+    not allow commercial use."""
