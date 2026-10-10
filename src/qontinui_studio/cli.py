@@ -16,12 +16,13 @@ import click
 from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.briefs import load_brief, validate_brief
-from qontinui_studio.errors import PublicationRefused, StudioError
-from qontinui_studio.library import Library
+from qontinui_studio.errors import ImportRefused, PublicationRefused, StudioError
+from qontinui_studio.inbox import import_inbox
+from qontinui_studio.library import Library, export_yaml
 from qontinui_studio.notify import CoordFindingNotifier, FileNotifier
 from qontinui_studio.pipeline import BatchOutcome, Context, resume_all, run_brief
 from qontinui_studio.providers import load_providers
-from qontinui_studio.publish import publish_batch, unpublish_batch
+from qontinui_studio.publish import atomic_write, publish_batch, unpublish_batch
 from qontinui_studio.review import build_review_page
 from qontinui_studio.scheduler import utc_now
 from qontinui_studio.sites import load_sites
@@ -230,10 +231,77 @@ def library_list(obj: Obj, batch_id: str | None, as_json: bool) -> None:
         return
     for a in assets:
         click.echo(
-            f"{a.uid}  {a.provider}/{a.model}  commercial={a.licence_commercial_use} "
+            f"{a.uid}  {a.origin}  {a.provider}/{a.model}  commercial={a.licence_commercial_use} "
             f"reviewed={a.licence_tos_reviewed or 'UNREVIEWED'}  watermark={a.watermark}  "
-            f"ai_generated={a.ai_generated}  variants={len(lib.variants(a.uid))}"
+            f"ai_generated={a.ai_generated}  approval={a.approval_status}  "
+            f"variants={len(lib.variants(a.uid))}"
         )
+
+
+@library.command("import")
+@click.argument("inbox", type=click.Path(file_okay=False, path_type=Path))
+@click.pass_obj
+def library_import(obj: Obj, inbox: Path) -> None:
+    """Import an inbox of externally made images described by <inbox>/manifest.yaml
+    (contract: schemas/import-manifest.schema.json). All or nothing; never publishes."""
+    ws = Workspace(obj.root)
+    try:
+        outcome = import_inbox(connect(ws.db_path), ws, inbox, utc_now)
+    except ImportRefused as e:
+        click.echo(f"refused: {e}", err=True)
+        for line in e.errors:
+            click.echo(f"  {line}", err=True)
+        sys.exit(1)
+    for line in outcome.warnings:
+        click.echo(f"warning: {line}", err=True)
+    for uid in outcome.imported:
+        click.echo(f"imported {uid}")
+    for uid in outcome.skipped:
+        click.echo(f"unchanged {uid} (already imported)")
+    click.echo(
+        f"batch {outcome.batch_id}: {len(outcome.imported)} imported, "
+        f"{len(outcome.skipped)} already present"
+    )
+
+
+def _decide(obj: Obj, uid: str, by: str, decision: str) -> None:
+    lib = Library(connect(Workspace(obj.root).db_path))
+    try:
+        asset, changed = lib.decide(uid, decision, by, utc_now().date())
+    except StudioError as e:
+        raise click.ClickException(str(e)) from e
+    verb = decision if changed else f"already {decision}"
+    click.echo(f"{asset.uid}: {verb} by {asset.approval_by} on {asset.approval_on}")
+
+
+@library.command("approve")
+@click.argument("uid")
+@click.option("--by", "by", required=True, help="Reviewer alias (never an e-mail address).")
+@click.pass_obj
+def library_approve(obj: Obj, uid: str, by: str) -> None:
+    """Approve an asset for use by consumers. Refused unless its licence allows
+    commercial use (D5). Not a publish gate: the automated gates publish (D7)."""
+    _decide(obj, uid, by, "approved")
+
+
+@library.command("reject")
+@click.argument("uid")
+@click.option("--by", "by", required=True, help="Reviewer alias (never an e-mail address).")
+@click.pass_obj
+def library_reject(obj: Obj, uid: str, by: str) -> None:
+    """Reject an asset: consumers must not use it."""
+    _decide(obj, uid, by, "rejected")
+
+
+@library.command("export")
+@click.option("--out", "out", required=True, type=click.Path(dir_okay=False, path_type=Path))
+@click.pass_obj
+def library_export(obj: Obj, out: Path) -> None:
+    """Write a deterministic YAML manifest of every asset (provenance, licence,
+    approval, variants by SHA-256). No binaries, no local paths."""
+    data = export_yaml(connect(Workspace(obj.root).db_path))
+    atomic_write(out, data)
+    click.echo(str(out))
 
 
 @main.group()

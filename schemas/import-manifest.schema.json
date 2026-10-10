@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qontinui/qontinui-studio/blob/main/schemas/import-manifest.schema.json",
+  "title": "qontinui-studio import manifest",
+  "description": "<inbox-dir>/manifest.yaml for `studio library import <inbox-dir>`. A list of entries, one per image file. The studio validates the WHOLE manifest before writing anything: one invalid entry refuses the import, and every problem is reported with its entry index. The YAML is read with YAML 1.2 scalars: only true/false are booleans (`yes`/`no` are strings) and dates are strings. Width, height, SHA-256 and MIME type are measured from the file, never read from the manifest. Rules this schema cannot express, enforced by the studio: `file` must resolve to a regular file inside the inbox (no symlinks) that Pillow decodes as PNG, JPEG or WebP; a string in `reference_images` must be an asset_id already in the library (or elsewhere in this manifest) and not the entry's own; `commercial_use: yes` without `tos_reviewed` is recorded as `unknown` (warning); `status: approved|rejected` without both `approved_by` and `approved_on` is recorded as `candidate` (warning); `status: approved` is refused unless the recorded commercial_use is `yes` (D5); the same file bytes twice under one asset_id in one manifest is refused.",
+  "type": "array",
+  "minItems": 1,
+  "items": { "$ref": "#/$defs/entry" },
+  "$defs": {
+    "alias": {
+      "description": "An operator alias, never an e-mail address and never containing whitespace.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "isoDate": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "format": "date"
+    },
+    "rfc3339": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([Zz]|[+-]\\d{2}:\\d{2})$",
+      "format": "date-time"
+    },
+    "httpsUrl": {
+      "type": "string",
+      "pattern": "^https://[^\\s/?#]+[^\\s]*$",
+      "format": "uri"
+    },
+    "assetId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "asset_id",
+        "provider",
+        "model",
+        "account",
+        "prompt",
+        "generated_on",
+        "licence_terms_url",
+        "commercial_use",
+        "watermark",
+        "ai_generated"
+      ],
+      "properties": {
+        "file": {
+          "description": "Path of the image relative to the inbox directory. Absolute paths, '..' components and symlinks are refused. The file is copied into the library; the inbox is never referenced after import.",
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "asset_id": {
+          "description": "The library asset id. Several files may share one asset_id; each becomes its own row. Re-importing the same bytes under the same asset_id is a no-op.",
+          "$ref": "#/$defs/assetId"
+        },
+        "provider": { "description": "Which generator made the image.", "$ref": "#/$defs/nonEmptyString" },
+        "model": { "description": "The model used.", "$ref": "#/$defs/nonEmptyString" },
+        "account": {
+          "description": "ALIAS of the provider account used (never the address).",
+          "$ref": "#/$defs/alias"
+        },
+        "prompt": { "description": "The exact prompt.", "$ref": "#/$defs/nonEmptyString" },
+        "reference_images": {
+          "description": "Images the generation was conditioned on. Bare local paths are refused.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "oneOf": [
+              {
+                "description": "An asset_id already in this library.",
+                "$ref": "#/$defs/assetId"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url", "licence"],
+                "properties": {
+                  "url": { "$ref": "#/$defs/httpsUrl" },
+                  "licence": { "$ref": "#/$defs/nonEmptyString" }
+                }
+              }
+            ]
+          }
+        },
+        "generated_on": {
+          "description": "When the image was generated.",
+          "anyOf": [{ "$ref": "#/$defs/isoDate" }, { "$ref": "#/$defs/rfc3339" }]
+        },
+        "licence_terms_url": {
+          "description": "The provider's terms that govern this image.",
+          "$ref": "#/$defs/httpsUrl"
+        },
+        "tos_reviewed": {
+          "description": "The date those terms were reviewed. Required for commercial_use: yes to be recorded as yes.",
+          "$ref": "#/$defs/isoDate"
+        },
+        "commercial_use": {
+          "description": "Whether the terms allow commercial use.",
+          "enum": ["yes", "no", "unknown"]
+        },
+        "watermark": {
+          "description": "The watermark the provider applies.",
+          "enum": ["none", "invisible", "visible", "unknown"]
+        },
+        "ai_generated": {
+          "description": "Must be true: the library holds AI-generated assets only.",
+          "const": true
+        },
+        "status": {
+          "description": "Approval state. Approval is library metadata for consumers, not a publish gate.",
+          "enum": ["candidate", "approved", "rejected"],
+          "default": "candidate"
+        },
+        "approved_by": {
+          "description": "Alias of who approved (or rejected) the image.",
+          "$ref": "#/$defs/alias"
+        },
+        "approved_on": {
+          "description": "Date of the approval (or rejection).",
+          "$ref": "#/$defs/isoDate"
+        }
+      }
+    }
+  }
+}
