@@ -3,7 +3,7 @@ name = "qontinui-studio"
 version = "0.1.0"
 description = "Asset pipeline for products shipped by the Qontinui software factory (a client of the factory, not part of it)"
 authors = ["Joshua Spinak <jspinak@alum.mit.edu>"]
-license = "AGPL-3.0-or-later"
+license = "MIT"
 readme = "README.md"
 repository = "https://github.com/qontinui/qontinui-studio"
 packages = [{include = "qontinui_studio", from = "src"}]

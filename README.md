@@ -297,3 +297,13 @@ Tests never call a provider. The API adapters run against HTTP mocked with
 `respx`. The end-to-end acceptance test (`tests/test_end_to_end.py`) uses the
 offline fake adapter: one brief produces exact-size crops for two template sites
 with zero manual steps, and every library row carries full provenance.
+
+## Licence
+
+The whole repository, including `scenes/`, is MIT-licensed (see `LICENSE`). MIT,
+not AGPL, is deliberate: the scene renderer takes Remotion (source-available) as
+a peer dependency, and Remotion's terms are further restrictions that AGPL-3.0
+§10 forbids. Decision recorded in plan
+`2026-10-09-qontinui-marketing-studio-animated-process-explainers`, Phase 0
+("AGPL handling"). Remotion is never vendored here and stays under its own
+licence.
