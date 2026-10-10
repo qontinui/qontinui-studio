@@ -30,6 +30,7 @@ respx = "^0.22"
 ruff = "^0.14"
 mypy = "^1.18"
 types-pyyaml = "^6.0"
+jsonschema = "^4.25"
 
 [tool.poetry.scripts]
 studio = "qontinui_studio.cli:run"
