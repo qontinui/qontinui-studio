@@ -192,7 +192,7 @@ The full S1 sequence (426 PNG frames, 16:9) on the shared host. Load is the
 
 | Engine | Run | Wall time | Load |
 | --- | --- | --- | --- |
-| HyperFrames (6 workers, includes `docker run` start) | 1 | 11.3 s | 84 |
+| HyperFrames (6 workers, includes container start; measured with the spike's original `docker run`) | 1 | 11.3 s | 84 |
 | | 2 | 12.8 s | 95 |
 | | 3 (with remount) | 16.7 s | 113 |
 | | 4 (with remount) | 10.2 s | 77 |
@@ -265,24 +265,103 @@ adapter checks the image before every render:
   value starting with `-` is refused.
 
 **Container.** Each render runs in its own container:
-- **Name and lifecycle:** each render gets a unique `--name studio-hf-<random>`.
+- **Name and lifecycle:** each render's container gets a unique name
+  (`studio-hf-<random>`) and two labels: `org.qontinui.studio.run` (this
+  render) and `org.qontinui.studio.adapter` (this adapter).
   - It is made by `docker create --rm --init` and run by
-    `docker start --attach` as a separate client call. A timeout can only
-    interrupt `start`, after `create` has completed.
+    `docker start --attach`, as separate client calls.
+  - Every docker client is spawned `detached`, in its own process group. So
+    a terminal Ctrl-C, which goes to the whole foreground group, reaches only
+    node, and the adapter's `close()` drives the teardown. It never kills a
+    client in the middle of `create`.
   - On timeout the adapter runs `docker kill <name>`, then kills the client.
-  - Once the client has exited, `docker rm -fv <name>` runs in a `finally`. It
-    is a no-op after `--rm`, ignores "No such container", and waits (bounded)
-    until the name is gone.
-  - `close()` does the same for every in-flight container, and a container
-    created after `close()` is removed rather than started.
-  - The first version (`docker run`, kill on timeout) failed the reviewer's
-    reproduction. With a 4 s timeout at load ~100, the client was killed
-    between create and start, and the container stayed in `created`, because
-    `--rm` never fires for a container that never started. This box
-    reproduced it with a 300 ms timeout.
-  - After the fix, timeouts of 100 ms to 8 s were run for png and mp4 at
-    load 50–120, 46 renders in all. Every one left no container, no staging
-    entry and no project directory.
+  - After every render, in a `finally`, a sweep removes the render's
+    container by label and by name with `docker rm -fv` until a listing shows
+    none.
+    - When `create` did not exit cleanly (killed by its own timeout, failed,
+      or could not be spawned), the sweep keeps looking for 10 s even while
+      it finds nothing. The daemon can finish a create after its client is
+      gone.
+    - Every docker call on a cleanup path (`kill`, `rm`, `ps`, `inspect`) is
+      bounded to 15 s, and a whole sweep to 60 s.
+  - `close()` marks the adapter closed, so a render stops at its next phase
+    and a container created after close is never started. It also kills
+    running containers, waits for the renders to unwind, and then sweeps by
+    the adapter label.
+- **What is proven:**
+  - **Round 2.** The reviewer's reproduction (a 4 s timeout at load ~100,
+    with the client killed between create and start) leaves no container.
+    Timeouts of 100 ms to 8 s were run for png and mp4, 46 renders.
+  - **Round 3, Ctrl-C during `create`** (the reviewer's method), load ~27.
+    The CLI (`node bin/studio-scenes.mjs`) ran under `setsid`, and SIGINT
+    went to its whole process group 0 s to 8 s after `docker create`
+    started. A `docker` shim on `PATH` announced each `create` over a FIFO
+    and then `exec`ed the real client, so "0 s" is the moment the create
+    client starts. 22 runs: 13 png stills (0–3 s) and 9 mp4 (0–8 s), the
+    last 5 re-run on the final code.
+    - Every run exited 130 with "the render was stopped; nothing was
+      published to …".
+    - Every `create` client was in its own process group (its pgid was its
+      own pid, never the CLI's).
+    - `docker events` (label filter) showed 22 creates and 22 destroys; 13
+      of those containers were removed without ever being started.
+    - No run left a container (checked at exit and 3 s later), an entry in
+      the output directory, or a project directory.
+  - **Round 3, the same under the tsx CLI** (`tsx src/cli/main.ts`, how
+    `pnpm render` used to run). 6 runs (png and mp4, 0–5 s): 5 exited 130
+    as above; in 1 the render had finished before the signal and exited 0
+    with its output complete. None left a container. The first attempt of
+    this round found that tsx's parent re-sends SIGINT to its child when the
+    child does not acknowledge it within 30 ms, which, under load, hit the
+    CLI's "second signal exits at once" path and skipped cleanup (one run
+    left its staging directory and exited before its container was gone).
+    Fixed twice over: `pnpm render` / `pnpm studio-scenes` now run
+    `bin/studio-scenes.mjs` in one process, and the CLI treats a repeat
+    within 1 s as the same interrupt.
+  - **Round 3, create-timeout path.** `createTimeoutMs` of 1 ms to 600 ms,
+    12 runs, each rejected ("could not create the HyperFrames container")
+    after 10.1–12.2 s, i.e. after the 10 s late-create window.
+    - `docker events` showed 8 creates and 8 destroys: in 8 of the 12 runs
+      the daemon finished the create after its client had been SIGKILLed,
+      and the sweep removed the container.
+    - No container was left, at rejection or 3 s later.
+  - **Round 3, `close()` at several delays** after `render()` or
+    `renderStills()` started, by test (`tests/golden/interrupt.test.ts` for
+    Remotion, 9 cases; the gated `hyperframes.test.ts`, 7 cases). Each
+    rejects with `AdapterClosed`. A render or sequence leaves its output
+    directory empty, nothing in it is created or renamed after `close()`,
+    and no labelled container is left. A `renderStills` call may keep the
+    stills it published before `close()`. The Remotion cases run each in a
+    child process with no rejection listener, so they also fail if the
+    process crashes; the file passed 6 runs in a row on the final code.
+    Writing that test found three Remotion defects, all fixed:
+    - `close()` itself could reject: Remotion's `browser.close()` kills
+      Chrome and then queries its pages over the dead connection ("Target
+      closed"). In the CLI that would have exited 1 instead of 130. The
+      rejection is now ignored (Chrome is already gone).
+    - A png sequence could leave its staging directory: Remotion rejects at
+      once on cancel while frames it had started are still being written.
+      A cancelled render call now waits until `close()` has closed the
+      browser before its staging cleanup runs, and the cleanup retries
+      briefly if a last plain file lands after its first pass.
+    - Remotion abandons promises on cancel that later reject with nobody
+      awaiting them (EPIPE from a killed helper process; "Target/Session
+      closed" from pages torn down with the browser). `close()` of an
+      adapter with a render in flight absorbs exactly those for 30 s, with
+      one process `unhandledRejection` listener that rethrows anything else
+      when it is the only listener (README, "Remotion and SIGINT").
+  - **Round 3, Remotion through the CLI**, final code. SIGINT to the CLI's
+    group 0.5–12 s after start, mp4, 6 runs: each exited 130 with "the
+    render was stopped; nothing was published", and left nothing in the
+    output directory. In 3 more (4, 7, 12 s) every one of the 12 Chrome
+    processes the CLI had started was gone 2 s after exit.
+  - **Round 3, a Remotion library caller with no SIGINT handler** (default
+    options), SIGINT to its group at 7 s and 12 s, twice each: it exited
+    130, all 12 Chrome processes it had started were gone 2 s later, and
+    nothing was published. Its staging directory is left (no cleanup runs in that mode;
+    see README).
+  - **Not proven:** SIGTERM in this round (round 2 covered it by hand), and
+    anything after a SIGKILL of node itself, which no cleanup can handle.
 - **Output:** the image renders into its own tmpfs and copies only the
   finished artifact to `/output`, first as `.partial-<name>` and then renamed
   to `<name>` (`docker/hyperframes/studio-hf-render.sh`). HyperFrames
@@ -291,27 +370,45 @@ adapter checks the image before every render:
   removes `<name>` and `.partial-<name>`, which are a file or a directory of
   plain files, one level deep.
 - **Interrupts:** the CLI handles SIGINT and SIGTERM.
-  - It closes the adapter, which cancels a Remotion render through
-    `makeCancelSignal` or removes the HyperFrames container, and lets the
-    render unwind through its own staging and project cleanup.
-  - It then exits 130 (INT) or 143 (TERM). A second signal exits at once.
-  - Remotion's browser launcher registers a SIGINT listener that calls
-    `process.exit(130)` immediately, which skipped that cleanup. The Remotion
-    adapter now removes only the SIGINT listeners its own launch added;
-    Remotion's `exit` listener, which kills Chrome, stays.
-  - Verified by hand on both engines (png, mp4 and gif; INT and TERM; signal
-    to the process alone and to its whole process group, as Ctrl-C sends it).
-    Every run exited 130 or 143 and left no staging directory, no project
-    directory and no container.
-- **Isolation:** `--init`, `--network none`, `--read-only` with a 4 GB tmpfs
-  `/tmp` (the only path HyperFrames and Chrome write besides `/dev/shm` and
-  `/output`),
+  - It calls `close()` on the adapter, which is single-use after `close()`
+    (`AdapterClosed`) and never publishes after it. The render unwinds
+    through its own staging, project and container cleanup.
+  - The CLI exits 130 (INT) or 143 (TERM) and says which happened: stopped
+    (or failed while stopping) with nothing published, or already finished
+    with the output complete. A second signal a second or
+    more later exits at once and skips cleanup; an earlier repeat is taken
+    as the same Ctrl-C relayed by a wrapper (pnpm, the tsx CLI).
+  - On Remotion, `close()` cancels through `makeCancelSignal`, always. It
+    waits for a `selectComposition` in flight before closing the browser,
+    because closing the browser under it makes Remotion leak its file
+    server (the review's info item).
+  - Remotion's launcher adds a SIGINT listener that kills Chrome and calls
+    `process.exit(130)` at once. By default (`interrupts: "remotion"`) it
+    stays, so a library caller with no handler still kills Chrome on Ctrl-C.
+    The CLI passes `interrupts: "caller"`: the adapter then removes exactly
+    that listener after each launch, matched by its source, and touches no
+    other listener (README, "Remotion and SIGINT").
+  - Remotion's `close()` closes the browser (after any `selectComposition`
+    in flight), then waits at most 15 s for the cancelled renders to finish
+    their staging cleanup, and never rejects. While the CLI is stopping, any
+    stray engine rejection the adapter did not absorb is reported as a note
+    instead of crashing past the cleanup.
+- **Isolation:** `--init`, `--network none`, `--read-only` with a tmpfs `/tmp`
+  (4g by default; the only path HyperFrames and Chrome write besides
+  `/dev/shm` and `/output`),
   `--cap-drop=ALL` and `--security-opt no-new-privileges`. The image's default
   user is `studio`; the adapter runs as the caller's uid:gid so the output
   files belong to the caller.
-- **Limits:** `--pids-limit` 8192, `--memory` 8g and `--cpus` 8, overridable
-  by `STUDIO_HF_PIDS_LIMIT`, `STUDIO_HF_MEMORY` and `STUDIO_HF_CPUS`, which
-  are validated.
+- **Limits:** `--pids-limit` 8192, `--memory` 8g, `--cpus` 8 and a 4g tmpfs.
+  They can be overridden by `STUDIO_HF_PIDS_LIMIT`, `STUDIO_HF_MEMORY`,
+  `STUDIO_HF_CPUS` and `STUDIO_HF_TMPFS`, which are validated.
+  - **The tmpfs is memory.** Everything HyperFrames writes there (its work
+    directory, the captured frames, the artifact before it is copied out)
+    counts against `--memory` together with Chrome.
+  - A 1080p S1 render needs well under 1 GB.
+  - For long or 4K renders, raise `STUDIO_HF_TMPFS` (a 4K frame is about 4×
+    a 1080p one) and raise `STUDIO_HF_MEMORY` by at least as much. Otherwise
+    the container is OOM-killed instead of the tmpfs filling.
 - **Mounts:** `--mount type=bind,…`, not `-v`. A host path containing a comma,
   quote or newline is refused, because docker's `--mount` cannot take one
   safely. `:` is safe there.
@@ -347,7 +444,7 @@ existing CI jobs are unchanged.
     container** (`packages/cli/src/utils/dockerRunArgs.ts`), so the CLI inside
     it falls back to its persisted config.
   - The studio sets both variables in the image (`ENV`) and again on every
-    `docker run`, and runs the container with `--network none`, so nothing can
+    container it creates (`docker create -e …`), and runs the container with `--network none`, so nothing can
     leave it. Verified: `hyperframes telemetry status` in the image reports
     `disabled`, source `HYPERFRAMES_NO_TELEMETRY`.
 - **Page runtime analytics.** The in-page runtime only `postMessage`s events to

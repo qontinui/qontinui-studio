@@ -53,10 +53,16 @@ class UsageError extends Error {}
 
 /** The render was stopped by a signal; the process exits 128 + signal number. */
 class Interrupted extends Error {
-  constructor(readonly signal: NodeJS.Signals) {
-    super(`interrupted by ${signal}`);
+  constructor(
+    readonly signal: NodeJS.Signals,
+    outcome: string,
+  ) {
+    super(`interrupted by ${signal}: ${outcome}`);
   }
 }
+
+/** A signal this soon after the first is the same interrupt relayed, not a second one. */
+const REPEAT_SIGNAL_MS = 1000;
 
 function exitCodeFor(signal: NodeJS.Signals): number {
   return signal === "SIGTERM" ? 143 : 130;
@@ -107,7 +113,9 @@ async function loadAdapter(engine: Engine): Promise<EngineAdapter> {
     return new HyperFramesAdapter();
   }
   const { RemotionAdapter } = await import("../adapters/remotion/render");
-  return new RemotionAdapter();
+  // The CLI handles SIGINT itself (see render()), so Remotion's exit-at-once
+  // listener is removed and an interrupted render cleans up.
+  return new RemotionAdapter({ interrupts: "caller" });
 }
 
 async function render(args: string[]) {
@@ -190,19 +198,39 @@ async function render(args: string[]) {
   const adapter = await loadAdapter(engine as Engine);
   const outPath = path.resolve(out);
   let lastPct = -1;
-  // Ctrl-C / SIGTERM: stop the engine (adapter.close() kills its browser or
-  // container), let the render unwind so its own cleanup runs (staging and
-  // project directories, exactly as on any other failure), then exit
-  // 130 / 143. A second signal exits at once.
+  // Ctrl-C / SIGTERM: adapter.close() stops the render (an adapter publishes
+  // nothing after close), the render unwinds through its own cleanup
+  // (staging and project directories, containers, exactly as on any other
+  // failure), and the CLI exits 130 / 143 saying which happened: stopped
+  // with nothing published, or finished before the signal took effect. A
+  // second signal exits at once, skipping cleanup — but only one that comes
+  // REPEAT_SIGNAL_MS or more after the first: one Ctrl-C can arrive twice
+  // (a wrapper such as pnpm or the tsx CLI relays the signal the terminal
+  // already sent to the whole group), and that must not skip the cleanup.
   let interrupted: NodeJS.Signals | null = null;
+  let interruptedAt = 0;
   const onSignal = (signal: NodeJS.Signals) => {
-    if (interrupted) process.exit(exitCodeFor(signal));
+    if (interrupted) {
+      if (Date.now() - interruptedAt >= REPEAT_SIGNAL_MS) process.exit(exitCodeFor(signal));
+      return;
+    }
     interrupted = signal;
-    process.stderr.write(`\n${signal}: stopping the render and cleaning up (send it again to exit at once)\n`);
+    interruptedAt = Date.now();
+    process.stderr.write(`\n${signal}: stopping the render (send it again to exit at once, skipping cleanup)\n`);
     void adapter.close().catch(() => undefined);
+  };
+  // While stopping, an engine can reject a promise nobody awaits any more
+  // (Remotion's helper processes are torn down under work it abandoned on
+  // cancel, e.g. a write that fails with EPIPE). That must not crash the
+  // process past the cleanup still running, so after a signal such errors
+  // are reported and the shutdown continues. Before a signal they still crash.
+  const onStrayRejection = (reason: unknown) => {
+    if (!interrupted) throw reason;
+    process.stderr.write(`note: ignored an engine error while stopping: ${reason instanceof Error ? reason.message : String(reason)}\n`);
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
+  process.on("unhandledRejection", onStrayRejection);
   try {
     const result = await adapter.render({
       scene: sceneId,
@@ -221,22 +249,35 @@ async function render(args: string[]) {
         }
       },
     });
-    if (!interrupted) {
-      process.stdout.write(
-        `${result.files.length === 1 ? result.files[0] : `${result.files.length} frames in ${outPath}`}\n` +
-          `  ${result.width}x${result.height} @ ${result.fps} fps, ${result.durationInFrames} frames (${trace.meta.mode})\n`,
-      );
+    process.stdout.write(
+      `${result.files.length === 1 ? result.files[0] : `${result.files.length} frames in ${outPath}`}\n` +
+        `  ${result.width}x${result.height} @ ${result.fps} fps, ${result.durationInFrames} frames (${trace.meta.mode})\n`,
+    );
+    if (interrupted) {
+      // The render had already published when the signal took effect.
+      throw new Interrupted(interrupted, `the render had already finished; ${outPath} is complete`);
     }
   } catch (err) {
-    if (interrupted) throw new Interrupted(interrupted);
+    if (err instanceof Interrupted) throw err;
+    if (interrupted) {
+      // AdapterClosed: close() stopped the render before it published. Any
+      // other error: the render failed on its own (possibly while stopping);
+      // either way publishing is the last step, so nothing reached --out.
+      const what =
+        err instanceof Error && err.name === "AdapterClosed"
+          ? "the render was stopped"
+          : `the render failed while stopping (${err instanceof Error ? err.message : String(err)})`;
+      throw new Interrupted(interrupted, `${what}; nothing was published to ${outPath} and its temporary files were removed`);
+    }
     if (err instanceof Error && err.name === "OutputRefused") throw new UsageError(`render: ${err.message}`);
     throw err;
   } finally {
     await adapter.close();
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
+    // After a signal it stays until the process exits (130 / 143).
+    if (!interrupted) process.off("unhandledRejection", onStrayRejection);
   }
-  if (interrupted) throw new Interrupted(interrupted);
 }
 
 async function validate(args: string[]) {
@@ -282,7 +323,7 @@ async function main(argv: string[]) {
 
 main(process.argv.slice(2)).catch((err: unknown) => {
   if (err instanceof Interrupted) {
-    process.stderr.write(`${err.message}; cleaned up\n`);
+    process.stderr.write(`${err.message}\n`);
     process.exit(exitCodeFor(err.signal));
   }
   if (err instanceof UsageError) {

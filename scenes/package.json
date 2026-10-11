@@ -13,8 +13,8 @@
   },
   "packageManager": "pnpm@11.24.0",
   "scripts": {
-    "studio-scenes": "tsx src/cli/main.ts",
-    "render": "tsx src/cli/main.ts render",
+    "studio-scenes": "node bin/studio-scenes.mjs",
+    "render": "node bin/studio-scenes.mjs render",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --config vitest.config.ts",

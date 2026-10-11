@@ -15,12 +15,17 @@
  * - the result is published through ../output.ts (nothing is deleted that
  *   this adapter did not write, and nothing recursively).
  *
- * Each container gets a unique name. A timed-out render is stopped with
- * `docker kill <name>` (killing only the docker client would leave it
- * running). The container is made with `docker create` and run with
- * `docker start --attach`, so a timeout never lands mid-create, and once the
- * client has exited `docker rm -fv <name>` removes whatever is left (a no-op
- * after `--rm`).
+ * Container lifecycle. Each container gets a unique name and two labels (this
+ * render, this adapter). It is made with `docker create` and run with
+ * `docker start --attach`; every docker client runs in its own process group
+ * (`detached`), so a terminal Ctrl-C reaches only node and never kills a
+ * client mid-create. A timed-out render is stopped with `docker kill <name>`
+ * (killing only the client would leave it running). After every render, a
+ * sweep removes its container by name and label; after an unclean create it
+ * keeps looking for LATE_CREATE_WINDOW_MS, because the daemon can finish a
+ * create after its client is gone. close() kills what is running, waits for
+ * the renders to unwind, and sweeps by the adapter label. Every cleanup call
+ * is bounded.
  *
  * The image renders into its own tmpfs and copies only the finished artifact
  * into the staging directory (docker/hyperframes/studio-hf-render.sh), so a
@@ -38,7 +43,8 @@
  *
  * Telemetry: the HyperFrames CLI sends PostHog events unless told not to.
  * `HYPERFRAMES_NO_TELEMETRY=1` and `DO_NOT_TRACK=1` are set in the image and
- * again on every `docker run`, and the container has no network at all.
+ * again on every container this adapter creates, and the container has no
+ * network at all.
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -46,7 +52,14 @@ import { lstat, mkdtemp, readdir, rename, rmdir, unlink } from "node:fs/promises
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { EngineAdapter, OutputFormat, RenderRequest, RenderResult, StillsRequest } from "../../api/engine";
+import {
+  AdapterClosed,
+  type EngineAdapter,
+  type OutputFormat,
+  type RenderRequest,
+  type RenderResult,
+  type StillsRequest,
+} from "../../api/engine";
 import { ASPECT_SIZES, STUDIO_FPS } from "../../api/layout";
 import { missingRequirements } from "../../api/scene";
 import { sceneDuration } from "../../api/scene-root";
@@ -63,11 +76,31 @@ const FONTCONFIG_DIR = path.join(PACKAGE_ROOT, "fontconfig");
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 /** `docker create` returns in seconds; this only bounds a hung daemon. */
 const CREATE_TIMEOUT_MS = 5 * 60_000;
+/** Every docker call on a cleanup path (kill, rm, ps, inspect) is bounded by this. */
+const CLEANUP_CALL_TIMEOUT_MS = 15_000;
+/** How long a sweep waits for a container a killed `docker create` may still produce. */
+const LATE_CREATE_WINDOW_MS = 10_000;
+/** Upper bound on one sweep, whatever happens. */
+const SWEEP_MAX_MS = 60_000;
+/** Labels on every container: this render, and the adapter that made it. */
+const RUN_LABEL = "org.qontinui.studio.run";
+const ADAPTER_LABEL = "org.qontinui.studio.adapter";
 
-/** Container limits; each can be overridden by its environment variable. */
+/**
+ * Container limits; each can be overridden by its environment variable.
+ *
+ * The render tmpfs (`/tmp`, STUDIO_HF_TMPFS) is memory: what HyperFrames
+ * writes there (its work directory, captured frames, the finished artifact
+ * before it is copied out) counts against `--memory` (STUDIO_HF_MEMORY),
+ * together with Chrome's own use. A 1080p S1 render needs well under 1 GB of
+ * tmpfs. For long or 4K renders raise STUDIO_HF_TMPFS (a 4K PNG frame is ~4x
+ * a 1080p one) and raise STUDIO_HF_MEMORY by at least as much, or the
+ * container is OOM-killed instead of the tmpfs filling up.
+ */
 const LIMITS = {
   pids: { env: "STUDIO_HF_PIDS_LIMIT", fallback: "8192", pattern: /^[1-9][0-9]*$/ },
   memory: { env: "STUDIO_HF_MEMORY", fallback: "8g", pattern: /^[1-9][0-9]*[bkmg]?$/ },
+  tmpfs: { env: "STUDIO_HF_TMPFS", fallback: "4g", pattern: /^[1-9][0-9]*[kmg]?$/ },
   cpus: { env: "STUDIO_HF_CPUS", fallback: "8", pattern: /^(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$/ },
 } as const;
 
@@ -100,6 +133,8 @@ export interface HyperFramesAdapterOptions {
   log?: (chunk: string) => void;
   /** Kill a render (its container first) after this long. Default 30 min. */
   timeoutMs?: number;
+  /** Kill a `docker create` that has not returned after this long. Default 5 min. */
+  createTimeoutMs?: number;
 }
 
 export class HyperFramesRenderError extends Error {
@@ -118,7 +153,18 @@ function run(
   options: { log?: (chunk: string) => void; onTimeout?: () => Promise<void>; timeoutMs?: number } = {},
 ): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    // detached: the docker client gets its own process group, so a terminal
+    // Ctrl-C (sent to the whole foreground group) reaches only node, whose
+    // close() then drives the teardown. Killing a client mid-`create` is what
+    // leaves a container in `created` behind.
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const killClient = () => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
     let output = "";
     let timedOut = false;
     const take = (chunk: Buffer) => {
@@ -131,7 +177,7 @@ function run(
     const timer = setTimeout(() => {
       timedOut = true;
       // Stop the container first (killing the client alone leaves it running).
-      void (options.onTimeout?.() ?? Promise.resolve()).finally(() => child.kill("SIGKILL"));
+      void (options.onTimeout?.() ?? Promise.resolve()).finally(killClient);
     }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -222,10 +268,18 @@ export class HyperFramesAdapter implements EngineAdapter {
   private readonly docker: string;
   private readonly log: ((chunk: string) => void) | undefined;
   private readonly timeoutMs: number;
-  /** Containers started by this adapter and not yet finished. */
+  private readonly createTimeoutMs: number;
+  /** Containers of this adapter whose render has not finished cleaning up. */
   private readonly running = new Set<string>();
-  /** Set by close(): a container created after it is removed, never started. */
-  private closing = false;
+  /** Renders in flight; close() waits for them to unwind. */
+  private readonly inFlight = new Set<Promise<unknown>>();
+  /** Labels every container this adapter makes (close() sweeps by it). */
+  private readonly adapterId = randomBytes(8).toString("hex");
+  /** Set by close(); every phase checks it (single-use, see EngineAdapter). */
+  private closed = false;
+  private closing: Promise<void> | null = null;
+  /** Whether this adapter ever ran `docker create` (else close() has nothing to sweep). */
+  private createAttempted = false;
 
   constructor(options: HyperFramesAdapterOptions = {}) {
     const image = options.image ?? process.env.STUDIO_HYPERFRAMES_IMAGE ?? DEFAULT_HYPERFRAMES_IMAGE;
@@ -239,6 +293,7 @@ export class HyperFramesAdapter implements EngineAdapter {
     this.docker = options.docker ?? "docker";
     this.log = options.log;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.createTimeoutMs = options.createTimeoutMs ?? CREATE_TIMEOUT_MS;
   }
 
   /**
@@ -254,7 +309,7 @@ export class HyperFramesAdapter implements EngineAdapter {
       "{{.Id}} {{json .Config}}",
       "--",
       this.image,
-    ]);
+    ], { timeoutMs: CLEANUP_CALL_TIMEOUT_MS });
     if (result.code !== 0) {
       throw new HyperFramesRenderError(
         `HyperFrames render image ${this.image} is not available (${result.output.trim()}). ` +
@@ -293,27 +348,67 @@ export class HyperFramesAdapter implements EngineAdapter {
     return sceneDuration(scene, trace);
   }
 
+  private assertOpen(): void {
+    if (this.closed) throw new AdapterClosed(this.name);
+  }
+
   private async killContainer(name: string): Promise<void> {
-    await run(this.docker, ["kill", "--", name]).catch(() => undefined);
+    await run(this.docker, ["kill", "--", name], { timeoutMs: CLEANUP_CALL_TIMEOUT_MS }).catch(() => undefined);
   }
 
   /**
-   * `docker rm -fv` (a no-op once `--rm` has removed the container; "No such
-   * container" is ignored). Needed when the client was killed between
-   * create and start, which leaves a created container `--rm` never removes.
+   * Remove every container carrying `label` (and the one named `name`, if
+   * given) until none is left, with `docker rm -fv` ("No such container" and
+   * "removal in progress" are expected and ignored).
+   *
+   * - `lateCreate`: a `docker create` did not finish cleanly (killed, timed
+   *   out, failed or spawn error). The daemon can still complete it after the
+   *   client is gone, so the sweep keeps looking for LATE_CREATE_WINDOW_MS
+   *   even while it finds nothing, instead of trusting one empty listing.
+   * - Every docker call is bounded (CLEANUP_CALL_TIMEOUT_MS) and so is the
+   *   whole sweep (SWEEP_MAX_MS).
    */
-  private async removeContainer(name: string): Promise<void> {
-    // `--rm`'s own removal can still be in progress (rm then fails with
-    // "removal in progress"), so wait, bounded, until the name is gone.
-    for (let attempt = 0; attempt < 40; attempt++) {
-      await run(this.docker, ["rm", "-fv", "--", name]).catch(() => undefined);
-      const inspected = await run(this.docker, ["container", "inspect", "--format", "{{.State.Status}}", "--", name]).catch(
+  private async sweep(label: string, name: string | null, lateCreate: boolean): Promise<void> {
+    const started = Date.now();
+    const bounded = { timeoutMs: CLEANUP_CALL_TIMEOUT_MS };
+    for (;;) {
+      const listed = await run(this.docker, ["ps", "-aq", "--no-trunc", "--filter", `label=${label}`], bounded).catch(
         () => null,
       );
-      if (!inspected || inspected.code !== 0) return;
+      // The docker CLI cannot even be started: nothing of ours can exist.
+      if (listed === null) return;
+      const ids = listed.code === 0 ? listed.output.split(/\s+/).filter(Boolean) : [];
+      const targets = name ? [...ids, name] : ids;
+      if (targets.length) await run(this.docker, ["rm", "-fv", "--", ...targets], bounded).catch(() => undefined);
+      let named = false;
+      if (name) {
+        const inspected = await run(this.docker, ["container", "inspect", "--format", "{{.Id}}", "--", name], bounded).catch(
+          () => null,
+        );
+        named = inspected !== null && inspected.code === 0;
+      }
+      const elapsed = Date.now() - started;
+      const clean = listed.code === 0 && ids.length === 0 && !named;
+      if (clean && (!lateCreate || elapsed >= LATE_CREATE_WINDOW_MS)) return;
+      if (elapsed >= SWEEP_MAX_MS) {
+        process.stderr.write(
+          `note: could not confirm that every container labelled ${label} is gone; ` +
+            `check with \`docker ps -a --filter label=${label}\`\n`,
+        );
+        return;
+      }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    process.stderr.write(`note: container ${name} could not be removed; run \`docker rm -fv ${name}\`\n`);
+  }
+
+  /** Track a render so close() can wait for it to unwind. */
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.inFlight.add(work);
+    void work.then(
+      () => this.inFlight.delete(work),
+      () => this.inFlight.delete(work),
+    );
+    return work;
   }
 
   /**
@@ -326,16 +421,22 @@ export class HyperFramesAdapter implements EngineAdapter {
     outputName: string,
     format: string,
   ): Promise<void> {
+    this.assertOpen();
     const imageId = await this.imageId();
+    this.assertOpen();
     // Refuse unmountable paths before writing anything.
     const fontconfigMount = bindMount(FONTCONFIG_DIR, "/studio-fontconfig", true);
     const outputMount = bindMount(outputDir, "/output", false);
     const projectDir = await mkdtemp(path.join(tmpdir(), "studio-hyperframes-"));
-    const name = `studio-hf-${randomBytes(8).toString("hex")}`;
+    const runId = randomBytes(8).toString("hex");
+    const name = `studio-hf-${runId}`;
     let rendered = false;
+    // Until `docker create` has exited 0, a container may still appear.
+    let lateCreate = false;
     try {
       const projectMount = bindMount(projectDir, "/project", true);
       await writeProject(projectDir, spec);
+      this.assertOpen();
       const uid = process.getuid?.();
       const gid = process.getgid?.();
       const createArgs = [
@@ -344,12 +445,16 @@ export class HyperFramesAdapter implements EngineAdapter {
         "--init",
         "--name",
         name,
+        "--label",
+        `${RUN_LABEL}=${runId}`,
+        "--label",
+        `${ADAPTER_LABEL}=${this.adapterId}`,
         "--network",
         "none",
         "--shm-size=2g",
         "--read-only",
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,size=4g",
+        `/tmp:rw,nosuid,nodev,size=${limit("tmpfs")}`,
         "--cap-drop=ALL",
         "--security-opt",
         "no-new-privileges",
@@ -390,16 +495,20 @@ export class HyperFramesAdapter implements EngineAdapter {
       // (Killing a `docker run` client while the daemon was still creating
       // the container left a created, never-started container behind.)
       this.running.add(name);
-      const created = await run(this.docker, createArgs, { timeoutMs: CREATE_TIMEOUT_MS });
+      lateCreate = true;
+      this.createAttempted = true;
+      const created = await run(this.docker, createArgs, { timeoutMs: this.createTimeoutMs });
       if (created.timedOut || created.code !== 0) {
         throw new HyperFramesRenderError(`could not create the HyperFrames container: ${created.output.slice(-2000)}`);
       }
-      if (this.closing) throw new HyperFramesRenderError("render stopped: the adapter was closed");
+      lateCreate = false;
+      this.assertOpen();
       const result = await run(this.docker, ["start", "--attach", "--", name], {
         log: this.log,
         onTimeout: () => this.killContainer(name),
         timeoutMs: this.timeoutMs,
       });
+      if (this.closed) throw new AdapterClosed(this.name);
       if (result.timedOut) {
         throw new HyperFramesRenderError(`HyperFrames render timed out after ${this.timeoutMs} ms; container ${name} was killed`);
       }
@@ -408,8 +517,10 @@ export class HyperFramesAdapter implements EngineAdapter {
       }
       rendered = true;
     } finally {
-      // The client has exited (or never started): nothing writes any more.
-      await this.removeContainer(name);
+      // The client has exited (or never started). Remove this render's
+      // container by name and label; after an unclean create, keep looking
+      // for one the daemon may still finish creating.
+      await this.sweep(`${RUN_LABEL}=${runId}`, name, lateCreate);
       this.running.delete(name);
       if (!rendered) await cleanContainerOutput(outputDir, outputName);
       await removeProject(projectDir);
@@ -417,7 +528,12 @@ export class HyperFramesAdapter implements EngineAdapter {
   }
 
 
-  async render(request: RenderRequest): Promise<RenderResult> {
+  render(request: RenderRequest): Promise<RenderResult> {
+    return this.track(this.renderUntracked(request));
+  }
+
+  private async renderUntracked(request: RenderRequest): Promise<RenderResult> {
+    this.assertOpen();
     const overwrite = request.overwrite ?? false;
     const outPath = path.resolve(request.outPath);
     const sequence = request.format === "png" && request.frame === undefined;
@@ -437,6 +553,7 @@ export class HyperFramesAdapter implements EngineAdapter {
         await this.renderProject({ ...spec, frames, fps: STUDIO_FPS }, staging, "frames", HF_FORMATS.png);
         const files = await adoptSequence(path.join(staging, "frames"), staging, frames.length);
         request.onProgress?.(1);
+        this.assertOpen();
         if (sequence) return result(await publishSequence(staging, outPath, overwrite));
         return result([await publishFile(files[0] as string, outPath, overwrite)]);
       }
@@ -447,6 +564,7 @@ export class HyperFramesAdapter implements EngineAdapter {
       const name = `output.${request.format}`;
       await this.renderProject({ ...spec, frames, fps }, staging, name, HF_FORMATS[request.format]);
       request.onProgress?.(1);
+      this.assertOpen();
       return result([await publishFile(path.join(staging, name), outPath, overwrite)]);
     });
   }
@@ -455,7 +573,12 @@ export class HyperFramesAdapter implements EngineAdapter {
    * Chosen frames in ONE container and one composition whose i-th frame is
    * the i-th requested frame (the HyperFrames CLI has no single-frame mode).
    */
-  async renderStills(request: StillsRequest): Promise<string[]> {
+  renderStills(request: StillsRequest): Promise<string[]> {
+    return this.track(this.renderStillsUntracked(request));
+  }
+
+  private async renderStillsUntracked(request: StillsRequest): Promise<string[]> {
+    this.assertOpen();
     if (request.frames.length === 0) return [];
     const overwrite = request.overwrite ?? false;
     const target = (frame: number) =>
@@ -474,6 +597,7 @@ export class HyperFramesAdapter implements EngineAdapter {
       const staged = await adoptSequence(path.join(staging, "frames"), staging, request.frames.length);
       const files: string[] = [];
       for (const [index, frame] of request.frames.entries()) {
+        this.assertOpen();
         files.push(await publishFile(staged[index] as string, target(frame), overwrite));
       }
       return files;
@@ -481,11 +605,20 @@ export class HyperFramesAdapter implements EngineAdapter {
   }
 
   /**
-   * Nothing long-lived: each render is its own container. Closing while a
-   * render is in flight (an abort) kills its container.
+   * Single-use (see EngineAdapter). Each render is its own container, so
+   * close() stops what is in flight: it marks the adapter closed (a render
+   * then stops at its next phase and publishes nothing), kills running
+   * containers, waits for every render to unwind through its own cleanup,
+   * then removes any container still carrying this adapter's label.
+   * Idempotent.
    */
   async close(): Promise<void> {
-    this.closing = true;
-    await Promise.all([...this.running].map((name) => this.removeContainer(name)));
+    this.closed = true;
+    this.closing ??= (async () => {
+      await Promise.all([...this.running].map((name) => this.killContainer(name)));
+      await Promise.allSettled([...this.inFlight]);
+      if (this.createAttempted) await this.sweep(`${ADAPTER_LABEL}=${this.adapterId}`, null, false);
+    })();
+    return this.closing;
   }
 }

@@ -17,6 +17,7 @@
  * Cross-engine parity with the Remotion goldens is informative only and is
  * not asserted (antialiasing differs between the engines' raster paths).
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import path from "node:path";
@@ -24,7 +25,9 @@ import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { HyperFramesAdapter } from "../../src/adapters/hyperframes/render";
+import { AdapterClosed } from "../../src/api/engine";
 import { GOLDEN_CASES, OUT_DIR, SCENE_ID, loadS1Trace } from "./cases";
+import { interruptAfter, type InterruptKind } from "./interrupt";
 
 const ENABLED = process.env.HYPERFRAMES === "1";
 const HF_OUT = path.join(OUT_DIR, "hyperframes");
@@ -95,4 +98,33 @@ describe.skipIf(!ENABLED)("HyperFrames adapter: S1 determinism", () => {
   it("two mp4 renders are byte-identical", () => {
     expect(sha256(mp4[1] as string)).toBe(sha256(mp4[0] as string));
   });
+});
+
+/**
+ * close() mid-render (review F1/F2): at several delays — before the image
+ * check, during `docker create`, during the render, between render and
+ * publish — the render rejects with AdapterClosed, nothing is published
+ * after close(), and no studio container is left behind.
+ */
+const INTERRUPTS: { kind: InterruptKind; delayMs: number }[] = [
+  { kind: "mp4", delayMs: 0 },
+  { kind: "mp4", delayMs: 150 },
+  { kind: "mp4", delayMs: 400 },
+  { kind: "mp4", delayMs: 1000 },
+  { kind: "mp4", delayMs: 3000 },
+  { kind: "png-sequence", delayMs: 6000 },
+  { kind: "stills", delayMs: 2000 },
+];
+
+const studioContainers = () =>
+  execFileSync("docker", ["ps", "-aq", "--filter", "label=org.qontinui.studio.run"], { encoding: "utf8" }).split(/\s+/).filter(Boolean);
+
+describe.skipIf(!ENABLED)("HyperFrames adapter: close() mid-render", () => {
+  it.each(INTERRUPTS)("$kind, close after $delayMs ms", async ({ kind, delayMs }) => {
+    const outcome = await interruptAfter(new HyperFramesAdapter(), kind, delayMs);
+    expect(outcome.error).toBeInstanceOf(AdapterClosed);
+    expect(outcome.writtenAfterClose).toEqual([]);
+    if (kind !== "stills") expect(outcome.entries).toEqual([]);
+    expect(studioContainers(), "containers left after close()").toEqual([]);
+  }, TIMEOUT_MS);
 });

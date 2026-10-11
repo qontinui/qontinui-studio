@@ -225,6 +225,52 @@ pnpm studio-scenes render s1-plan-lifecycle \
   hold only `element-*.png` from a previous run; `--force` replaces exactly
   those files, and any other file in the directory makes the render refuse.
 
+- **Interrupts.** Ctrl-C (SIGINT) or SIGTERM during `render` closes the
+  adapter. The render stops, publishes nothing, and removes its staging
+  files (and, for HyperFrames, its project directory and container). The CLI
+  then exits 130 or 143 and says which happened: the render was stopped (or
+  failed while stopping) and nothing was published, or it had already
+  finished and the output is complete. A second signal, sent a second
+  or more after the first, exits at once and skips that cleanup (a repeat
+  within that second is taken as the same Ctrl-C relayed by a wrapper such
+  as pnpm or tsx). `pnpm render` runs `bin/studio-scenes.mjs` in one node
+  process.
+- **Adapters are single-use.** After `close()`, every `render` or
+  `renderStills` call (new or in flight) rejects with `AdapterClosed`
+  (`src/api/engine.ts`), and nothing is published after `close()`.
+  `close()` is idempotent. Create a new adapter to render again.
+- **Remotion and SIGINT, for library callers.** Remotion's browser launcher
+  installs a SIGINT listener that kills Chrome and calls `process.exit(130)`
+  at once. `RemotionAdapter`'s `interrupts` option picks who handles SIGINT:
+  - `"remotion"` (the default) leaves that listener alone. A program with no
+    SIGINT handler of its own therefore still kills Chrome and exits 130 on
+    Ctrl-C, but no staging cleanup runs (a `.studio-render-*` directory can be left
+    next to the output).
+  - `"caller"` (what the CLI uses) removes exactly that one listener after
+    each browser launch, matched by its source
+    (`killProcess(); process.exit(130);`), so listeners added by anyone else,
+    even during the launch, are untouched. The caller must then handle SIGINT
+    and call `close()`, which cancels the render and closes Chrome; the render
+    unwinds through its staging cleanup. Remotion's `exit` listener, which
+    kills Chrome on any process exit, stays in both modes.
+  - `close()` never rejects. Cancelling a Remotion render leaves some of
+    Remotion's own promises rejecting later with nobody awaiting them (an
+    EPIPE from a killed helper process, "Target closed" / "Session closed"
+    from pages closed with the browser). So `close()` of an adapter with a
+    render in flight adds, for 30 s, one process `unhandledRejection`
+    listener that absorbs exactly those; anything else is rethrown when that
+    listener is the only one, as Node would, and otherwise left to yours.
+
+- **HyperFrames container resources.** A HyperFrames render runs with
+  `--memory` 8g, `--cpus` 8, `--pids-limit` 8192 and a 4g tmpfs at `/tmp`
+  (`STUDIO_HF_MEMORY`, `STUDIO_HF_CPUS`, `STUDIO_HF_PIDS_LIMIT`,
+  `STUDIO_HF_TMPFS`). The tmpfs is memory, so what HyperFrames writes there
+  (work files, captured frames, the finished artifact) counts against
+  `--memory` together with Chrome. For long or 4K renders, raise
+  `STUDIO_HF_TMPFS` (a 4K frame is about 4× a 1080p one) and raise
+  `STUDIO_HF_MEMORY` by at least as much. Otherwise the container is killed
+  for running out of memory before the tmpfs fills.
+
 `bin/studio-scenes.mjs` exposes the same commands as `studio-scenes`. The other
 commands are `studio-scenes validate <trace> [--scene <id>]` and
 `studio-scenes list`.

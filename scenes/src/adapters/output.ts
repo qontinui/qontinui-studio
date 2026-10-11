@@ -60,6 +60,8 @@ export async function checkSequenceTarget(dir: string, overwrite: boolean): Prom
   return previous;
 }
 
+const STAGING_CLEAN_RETRIES = 5;
+
 /** Run `fn` with a fresh staging directory beside `target`; always clean it up. */
 export async function withStaging<T>(target: string, fn: (stagingDir: string) => Promise<T>): Promise<T> {
   const parent = path.dirname(path.resolve(target));
@@ -72,16 +74,29 @@ export async function withStaging<T>(target: string, fn: (stagingDir: string) =>
   }
 }
 
+/**
+ * Unlink the plain files in `staging`, then remove it. An engine that was
+ * stopped can still be finishing a write into it (a frame captured just
+ * before the stop), so a directory that is not empty yet is retried a few
+ * times, briefly; whatever is not a plain file is never touched.
+ */
 async function cleanStaging(staging: string): Promise<void> {
-  const entries = await readdir(staging, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isFile()) await unlink(path.join(staging, entry.name));
-  }
-  try {
-    await rmdir(staging);
-  } catch {
-    // Something we did not create a plain file for is in there; leave it.
-    process.stderr.write(`note: left staging directory ${staging} (not empty)\n`);
+  for (let attempt = 0; ; attempt++) {
+    const entries = await readdir(staging, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile()) await unlink(path.join(staging, entry.name)).catch(() => undefined);
+    }
+    try {
+      await rmdir(staging);
+      return;
+    } catch {
+      if (attempt >= STAGING_CLEAN_RETRIES || entries.some((entry) => !entry.isFile())) {
+        // Something we did not create a plain file for is in there; leave it.
+        process.stderr.write(`note: left staging directory ${staging} (not empty)\n`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
   }
 }
 

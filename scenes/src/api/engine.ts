@@ -55,13 +55,28 @@ export interface StillsRequest {
   overwrite?: boolean;
 }
 
+/**
+ * An adapter is SINGLE-USE with respect to close(): once close() has been
+ * called, every render or renderStills call (new or in flight) rejects with
+ * `AdapterClosed`, and nothing is published after it. A render in flight is
+ * stopped and unwinds through its own cleanup; close() resolves once the
+ * engine's resources are released. Create a new adapter to render again.
+ */
 export interface EngineAdapter {
   readonly name: string;
   render(request: RenderRequest): Promise<RenderResult>;
   /** Render chosen frames to PNG (golden tests, posters). */
   renderStills(request: StillsRequest): Promise<string[]>;
-  /** Release long-lived resources (browser, bundle). */
+  /** Stop any render in flight and release resources. Idempotent; see above. */
   close(): Promise<void>;
+}
+
+/** Thrown by an adapter's render calls after close() (see EngineAdapter). */
+export class AdapterClosed extends Error {
+  override readonly name = "AdapterClosed";
+  constructor(adapter: string) {
+    super(`the ${adapter} adapter was closed; nothing was published (create a new adapter to render again)`);
+  }
 }
 
 /** Props of an adapter's embeddable web player. */
