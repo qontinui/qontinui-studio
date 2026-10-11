@@ -438,14 +438,20 @@ export class HyperFramesAdapter implements EngineAdapter {
     }
   }
 
-  /** Track a render so close() can wait for it to unwind. */
+  /**
+   * Track a render so close() can wait for it. The bookkeeping hangs off an
+   * internal branch; the caller gets a separate promise derived from `work`
+   * with no rejection handler, so a caller that never awaits a failing
+   * render still gets Node's unhandled-rejection behaviour for it.
+   */
   private track<T>(work: Promise<T>): Promise<T> {
-    this.inFlight.add(work);
-    void work.then(
-      () => this.inFlight.delete(work),
-      () => this.inFlight.delete(work),
+    const settled = work.then(
+      () => undefined,
+      () => undefined,
     );
-    return work;
+    this.inFlight.add(settled);
+    void settled.then(() => this.inFlight.delete(settled));
+    return work.then((value) => value);
   }
 
   /**

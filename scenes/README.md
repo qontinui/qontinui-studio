@@ -267,10 +267,15 @@ pnpm studio-scenes render s1-plan-lifecycle \
     context, and your `onProgress` runs outside it). For any other
     rejection it does what Node would have done without it: nothing if you
     have your own listener; otherwise it follows `--unhandled-rejections`
-    from `process.execArgv` and `NODE_OPTIONS`: `throw` (the default)
-    raises it as an uncaught exception, `warn` prints Node's warning,
-    `warn-with-error-code` also sets exit code 1, `none` ignores it, and
-    under `strict` Node has already raised it. Node 24 is needed for the
+    from `process.execArgv` and `NODE_OPTIONS` (either spelling,
+    `--unhandled-rejections=warn` or `--unhandled-rejections warn`): `throw`
+    (the default) raises it as an uncaught exception; under `warn` Node
+    prints its warning itself and the listener adds nothing;
+    `warn-with-error-code` prints that warning once and sets exit code 1;
+    `none` ignores it; under `strict` Node has already raised it.
+  - The adapters' own bookkeeping of a render never counts as handling its
+    rejection: a render you start and never await still surfaces as an
+    unhandled rejection when it fails. Node 24 is needed for the
     attribution (it restores the rejection's async context for the
     listener); on older Node nothing is absorbed.
 

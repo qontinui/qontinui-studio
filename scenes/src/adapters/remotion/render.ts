@@ -290,12 +290,20 @@ export class RemotionAdapter implements EngineAdapter {
     return { serveUrl, puppeteerInstance, composition, inputProps };
   }
 
-  /** Track a render so close() can let it unwind before closing the browser. */
+  /**
+   * Track a render so close() can wait for it. The bookkeeping hangs off an
+   * internal branch; the caller gets a separate promise derived from `work`
+   * with no rejection handler, so a caller that never awaits a failing
+   * render still gets Node's unhandled-rejection behaviour for it.
+   */
   private track<T>(work: Promise<T>): Promise<T> {
-    this.inFlight.add(work);
-    const done = () => this.inFlight.delete(work);
-    void work.then(done, done);
-    return work;
+    const settled = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.inFlight.add(settled);
+    void settled.then(() => this.inFlight.delete(settled));
+    return work.then((value) => value);
   }
 
   render(request: RenderRequest): Promise<RenderResult> {
@@ -508,7 +516,15 @@ export function unhandledRejectionsMode(
   nodeOptions: string = process.env.NODE_OPTIONS ?? "",
 ): string {
   let mode = "throw";
-  for (const arg of [...nodeOptions.split(/\s+/), ...execArgv]) {
+  // Node accepts both `--unhandled-rejections=<mode>` and
+  // `--unhandled-rejections <mode>` (two arguments), in either source.
+  const args = [...nodeOptions.split(/\s+/).filter(Boolean), ...execArgv];
+  for (const [index, arg] of args.entries()) {
+    if (arg === "--unhandled-rejections") {
+      const next = args[index + 1];
+      if (next !== undefined && !next.startsWith("-")) mode = next;
+      continue;
+    }
     const match = /^--unhandled-rejections=(.+)$/.exec(arg);
     if (match?.[1]) mode = match[1];
   }
@@ -526,7 +542,10 @@ function onCancelRejection(reason: unknown, promise: Promise<unknown>): void {
   if (process.listenerCount("unhandledRejection") > 1) return;
   const mode = unhandledRejectionsMode();
   if (mode === "throw") throw reason;
-  if (mode === "warn" || mode === "warn-with-error-code") {
+  // "warn": Node itself always warns, listener or not; nothing to add.
+  // "warn-with-error-code": Node warns and sets exit code 1 only when no
+  // listener handled it, and this listener did, so it does both itself.
+  if (mode === "warn-with-error-code") {
     const detail = reason instanceof Error ? (reason.stack ?? String(reason)) : String(reason);
     process.emitWarning(detail, "UnhandledPromiseRejectionWarning");
     process.emitWarning(
@@ -534,7 +553,7 @@ function onCancelRejection(reason: unknown, promise: Promise<unknown>): void {
         "without a catch block, or by rejecting a promise which was not handled with .catch().",
       "UnhandledPromiseRejectionWarning",
     );
-    if (mode === "warn-with-error-code") process.exitCode = 1;
+    process.exitCode = 1;
   }
   void promise;
 }

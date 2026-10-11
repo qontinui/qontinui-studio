@@ -89,11 +89,13 @@ describe("Remotion SIGINT listener handling", () => {
 
 describe("Remotion cancel noise", () => {
   const CHILD = path.join(path.dirname(fileURLToPath(import.meta.url)), "cancel-noise-child.ts");
-  const run = (where: "inside" | "outside", mode?: string) =>
-    spawnSync(process.execPath, [...(mode ? [`--unhandled-rejections=${mode}`] : []), "--import", "tsx", CHILD, where], {
-      encoding: "utf8",
-      timeout: 60_000,
-    });
+  /** `spelling`: "=" passes `--unhandled-rejections=<mode>`, " " passes it as two arguments, "env" via NODE_OPTIONS. */
+  const run = (where: "inside" | "outside", mode?: string, spelling: "=" | " " | "env" = "=") => {
+    const flag = mode === undefined ? [] : spelling === "=" ? [`--unhandled-rejections=${mode}`] : spelling === " " ? ["--unhandled-rejections", mode] : [];
+    const env = mode !== undefined && spelling === "env" ? { ...process.env, NODE_OPTIONS: `--unhandled-rejections ${mode}` } : process.env;
+    return spawnSync(process.execPath, [...flag, "--import", "tsx", CHILD, where], { encoding: "utf8", timeout: 60_000, env });
+  };
+  const count = (text: string, needle: string) => text.split(needle).length - 1;
 
   it("absorbs a rejection from a cancelled render's own async context", () => {
     const r = run("inside");
@@ -109,14 +111,21 @@ describe("Remotion cancel noise", () => {
     expect(r.stderr).toContain("write EPIPE");
   });
 
-  it("leaves the caller's own rejection to Node: only a warning in warn mode, exit 1 in warn-with-error-code", () => {
-    const warn = run("outside", "warn");
-    expect(warn.status).toBe(0);
-    expect(warn.stdout).toContain("alive");
-    expect(warn.stderr).toContain("UnhandledPromiseRejectionWarning");
+  it.each(["=", " ", "env"] as const)(
+    "leaves the caller's own rejection to Node in warn mode (spelling %j): one warning, no crash",
+    (spelling) => {
+      const warn = run("outside", "warn", spelling);
+      expect(warn.status).toBe(0);
+      expect(warn.stdout).toContain("alive");
+      expect(count(warn.stderr, "UnhandledPromiseRejectionWarning: Error: write EPIPE")).toBe(1);
+    },
+  );
+
+  it("leaves the caller's own rejection to Node: exit 1 in warn-with-error-code, nothing in none", () => {
     const code = run("outside", "warn-with-error-code");
     expect(code.status).toBe(1);
     expect(code.stdout).toContain("alive");
+    expect(count(code.stderr, "UnhandledPromiseRejectionWarning: Error: write EPIPE")).toBe(1);
     const none = run("outside", "none");
     expect(none.status).toBe(0);
     expect(none.stderr).not.toContain("EPIPE");
@@ -127,5 +136,17 @@ describe("Remotion cancel noise", () => {
     expect(unhandledRejectionsMode(["--unhandled-rejections=warn"], "")).toBe("warn");
     expect(unhandledRejectionsMode([], "--max-old-space-size=4096 --unhandled-rejections=none")).toBe("none");
     expect(unhandledRejectionsMode(["--unhandled-rejections=strict"], "--unhandled-rejections=none")).toBe("strict");
+    expect(unhandledRejectionsMode(["--unhandled-rejections", "warn"], "")).toBe("warn");
+    expect(unhandledRejectionsMode([], "--unhandled-rejections warn")).toBe("warn");
+    expect(unhandledRejectionsMode(["--import", "tsx", "--unhandled-rejections", "none"], "--unhandled-rejections=warn")).toBe("none");
+  });
+});
+
+describe("an un-awaited failing render", () => {
+  const CHILD = path.join(path.dirname(fileURLToPath(import.meta.url)), "unawaited-render-child.ts");
+  it.each(["remotion", "hyperframes"])("%s: still surfaces as an unhandled rejection in Node's default mode", (engine) => {
+    const r = spawnSync(process.execPath, ["--import", "tsx", CHILD, engine], { encoding: "utf8", timeout: 60_000 });
+    expect(r.status).toBe(1);
+    expect(r.stdout).not.toContain("alive");
   });
 });
