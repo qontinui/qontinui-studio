@@ -5,15 +5,17 @@
  * started: close() comes first, and the HyperFrames adapter is given a
  * docker binary that does not exist.
  */
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { HyperFramesAdapter } from "../../src/adapters/hyperframes/render";
-import { REMOTION_SIGINT_EXIT, RemotionAdapter, isCancelNoise, removeRemotionSigintExit } from "../../src/adapters/remotion/render";
+import { REMOTION_SIGINT_EXIT, RemotionAdapter, removeRemotionSigintExit, unhandledRejectionsMode } from "../../src/adapters/remotion/render";
 import { AdapterClosed, type EngineAdapter } from "../../src/api/engine";
 import { parseTrace } from "../../src/api/trace/schema";
 import { s1TraceJson } from "./fixtures";
@@ -86,13 +88,44 @@ describe("Remotion SIGINT listener handling", () => {
 });
 
 describe("Remotion cancel noise", () => {
-  it("absorbs only EPIPE and closed-target/session protocol errors", () => {
-    expect(isCancelNoise(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).toBe(true);
-    expect(isCancelNoise(new Error("Protocol error (Target.closeTarget): Target closed. https://www.remotion.dev/docs/target-closed"))).toBe(true);
-    expect(isCancelNoise(new Error("Protocol error (Runtime.callFunctionOn): Session closed."))).toBe(true);
-    expect(isCancelNoise(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }))).toBe(false);
-    expect(isCancelNoise(new Error("something else"))).toBe(false);
-    expect(isCancelNoise("EPIPE")).toBe(false);
-    expect(isCancelNoise(null)).toBe(false);
+  const CHILD = path.join(path.dirname(fileURLToPath(import.meta.url)), "cancel-noise-child.ts");
+  const run = (where: "inside" | "outside", mode?: string) =>
+    spawnSync(process.execPath, [...(mode ? [`--unhandled-rejections=${mode}`] : []), "--import", "tsx", CHILD, where], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+
+  it("absorbs a rejection from a cancelled render's own async context", () => {
+    const r = run("inside");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("alive");
+    expect(r.stderr).not.toContain("EPIPE");
+  });
+
+  it("leaves the caller's own rejection to Node: crashes in the default throw mode", () => {
+    const r = run("outside");
+    expect(r.status).toBe(1);
+    expect(r.stdout).not.toContain("alive");
+    expect(r.stderr).toContain("write EPIPE");
+  });
+
+  it("leaves the caller's own rejection to Node: only a warning in warn mode, exit 1 in warn-with-error-code", () => {
+    const warn = run("outside", "warn");
+    expect(warn.status).toBe(0);
+    expect(warn.stdout).toContain("alive");
+    expect(warn.stderr).toContain("UnhandledPromiseRejectionWarning");
+    const code = run("outside", "warn-with-error-code");
+    expect(code.status).toBe(1);
+    expect(code.stdout).toContain("alive");
+    const none = run("outside", "none");
+    expect(none.status).toBe(0);
+    expect(none.stderr).not.toContain("EPIPE");
+  });
+
+  it("reads the --unhandled-rejections mode from execArgv and NODE_OPTIONS", () => {
+    expect(unhandledRejectionsMode([], "")).toBe("throw");
+    expect(unhandledRejectionsMode(["--unhandled-rejections=warn"], "")).toBe("warn");
+    expect(unhandledRejectionsMode([], "--max-old-space-size=4096 --unhandled-rejections=none")).toBe("none");
+    expect(unhandledRejectionsMode(["--unhandled-rejections=strict"], "--unhandled-rejections=none")).toBe("strict");
   });
 });

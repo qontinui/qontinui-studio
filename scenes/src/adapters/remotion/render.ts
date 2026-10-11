@@ -23,6 +23,7 @@
  * event; the free-licence eligibility is recorded in plan Phase 0. No cloud
  * or Lambda rendering is used.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -175,6 +176,8 @@ export class RemotionAdapter implements EngineAdapter {
   private selecting: Promise<unknown> | null = null;
   /** Renders in flight: close() waits (bounded) for them to unwind. */
   private readonly inFlight = new Set<Promise<unknown>>();
+  /** Stills in flight: close() lets them finish before closing the browser (see still()). */
+  private readonly stills = new Set<Promise<unknown>>();
   /** Settles once close() has closed the browser (see rendering()). */
   private browserDown: Promise<void> | null = null;
 
@@ -214,6 +217,22 @@ export class RemotionAdapter implements EngineAdapter {
    * so the rejection is held until close() has closed the browser (no more
    * frames), and only then does the caller's staging cleanup run.
    */
+  /**
+   * One renderStill. It is NOT given the cancel signal: Remotion's cancel
+   * path for renderStill closes the page but can leave the call itself
+   * pending forever, so the file server it started is never closed and
+   * keeps a library caller's process alive (measured: 3 in 24 runs). A still
+   * is one frame, so close() instead lets it finish (bounded by
+   * CLOSE_UNWIND_MS) before closing the browser, and the result is not
+   * published (every caller checks assertOpen() before publishing).
+   */
+  private still<T>(work: Promise<T>): Promise<T> {
+    this.stills.add(work);
+    const done = () => this.stills.delete(work);
+    void work.then(done, done);
+    return work;
+  }
+
   private async rendering<T>(call: (port: number) => Promise<T>): Promise<T> {
     try {
       return await this.onPort(call);
@@ -280,7 +299,7 @@ export class RemotionAdapter implements EngineAdapter {
   }
 
   render(request: RenderRequest): Promise<RenderResult> {
-    return this.track(this.renderUntracked(request));
+    return this.track(renderContext.run(this, () => this.renderUntracked(request)));
   }
 
   private async renderUntracked(request: RenderRequest): Promise<RenderResult> {
@@ -308,6 +327,10 @@ export class RemotionAdapter implements EngineAdapter {
       logLevel: this.logLevel,
       scale,
     };
+    // The caller's callback runs outside the render's async context, so a
+    // rejection it causes is never attributed to this render (see
+    // renderContext below).
+    const progress = (fraction: number) => renderContext.exit(() => request.onProgress?.(fraction));
     const result = (files: string[]): RenderResult => ({
       files,
       width: Math.round(composition.width * scale),
@@ -324,7 +347,7 @@ export class RemotionAdapter implements EngineAdapter {
           outputDir: staging,
           imageFormat: "png",
           onStart: () => undefined,
-          onFrameUpdate: (rendered) => request.onProgress?.(rendered / composition.durationInFrames),
+          onFrameUpdate: (rendered) => progress(rendered / composition.durationInFrames),
         }));
         this.assertOpen();
         return result(await publishSequence(staging, outPath, overwrite));
@@ -334,7 +357,9 @@ export class RemotionAdapter implements EngineAdapter {
       if (request.format === "png") {
         const frame = request.frame as number;
         assertFrame(frame, composition.durationInFrames);
-        await this.rendering((port) => renderStill({ ...common, port, output: staged, frame, imageFormat: "png" }));
+        const { cancelSignal: _uncancellable, ...still } = common;
+        void _uncancellable;
+        await this.rendering((port) => this.still(renderStill({ ...still, port, output: staged, frame, imageFormat: "png" })));
       } else {
         const codec = CODECS[request.format];
         const everyNthFrame = request.format === "gif" ? 2 : 1;
@@ -345,7 +370,7 @@ export class RemotionAdapter implements EngineAdapter {
           outputLocation: staged,
           // GIF at half rate keeps files sane; video keeps every frame.
           everyNthFrame,
-          onProgress: ({ progress }) => request.onProgress?.(progress),
+          onProgress: ({ progress: fraction }) => progress(fraction),
         }));
       }
       this.assertOpen();
@@ -354,7 +379,7 @@ export class RemotionAdapter implements EngineAdapter {
   }
 
   renderStills(request: StillsRequest): Promise<string[]> {
-    return this.track(this.renderStillsUntracked(request));
+    return this.track(renderContext.run(this, () => this.renderStillsUntracked(request)));
   }
 
   private async renderStillsUntracked(request: StillsRequest): Promise<string[]> {
@@ -375,9 +400,8 @@ export class RemotionAdapter implements EngineAdapter {
       const files: string[] = [];
       for (const frame of request.frames) {
         const staged = path.join(staging, `f${frame}.png`);
-        await this.rendering((port) => renderStill({
+        await this.rendering((port) => this.still(renderStill({
           port,
-          cancelSignal: this.cancel.cancelSignal,
           serveUrl,
           composition,
           inputProps,
@@ -388,7 +412,7 @@ export class RemotionAdapter implements EngineAdapter {
           output: staged,
           frame,
           imageFormat: "png",
-        }));
+        })));
         this.assertOpen();
         files.push(await publishFile(staged, target(frame), overwrite));
       }
@@ -413,10 +437,17 @@ export class RemotionAdapter implements EngineAdapter {
   async close(): Promise<void> {
     this.closed = true;
     this.closing ??= (async () => {
-      if (this.inFlight.size) absorbCancelNoise();
-      this.cancel.cancel();
+      if (this.inFlight.size) listenForCancelNoise(this);
+      // Remotion's cancel callbacks start cleanup work it never awaits; run
+      // them in this adapter's render context so what they leave rejecting
+      // is attributed to it (see renderContext).
+      renderContext.run(this, () => this.cancel.cancel());
       this.browserDown = (async () => {
         await this.selecting?.catch(() => undefined);
+        await Promise.race([
+          Promise.allSettled([...this.stills]),
+          new Promise((resolve) => setTimeout(resolve, CLOSE_UNWIND_MS).unref()),
+        ]);
         const browser = this.browser ? await this.browser.catch(() => null) : null;
         this.browser = null;
         // Remotion's close kills Chrome first, then queries its pages over
@@ -437,48 +468,90 @@ export class RemotionAdapter implements EngineAdapter {
 }
 
 /**
- * Cancelling a Remotion render leaves some of Remotion's own promises
- * rejecting with nobody awaiting them (4.0.529): an EPIPE from a write to a
- * helper process killed under work Remotion has already abandoned, and
- * "Target closed" / "Session closed" protocol errors from pages that were
- * still being torn down when the browser closed. Node treats each as an
- * unhandled rejection, which by default crashes a library caller's process
- * after close() has done its job.
+ * Rejections Remotion abandons on cancel (4.0.529). Cancelling a render
+ * leaves some of Remotion's own promises rejecting later with nobody
+ * awaiting them, e.g. renderStill's un-awaited page cleanup ("Target
+ * closed" once the browser is gone) and renderFrames' un-awaited server
+ * cleanup (an EPIPE writing to a helper process that already quit). By
+ * default Node crashes the process on those, after close() has done its job.
  *
- * So close() of an adapter with a render in flight installs, for
- * CANCEL_NOISE_WINDOW_MS, one process 'unhandledRejection' listener that
- * absorbs exactly those. Any other reason is left to Node's default as far
- * as a listener can: rethrown when no other listener exists (Node's default
- * 'throw' mode crashes the same way), else left to the caller's listener.
- * One shared listener, however many adapters close. A test runner's own
- * listener still sees them (it is a listener too), which is why the
- * interrupt test drives the adapter in a child process.
+ * They cannot be caught where they arise (Remotion holds the promises), so
+ * they are ATTRIBUTED instead: every render call runs inside
+ * `renderContext.run(adapter, …)`, and Node runs an 'unhandledRejection'
+ * listener in the async context in which the promise was rejected. A
+ * rejection is absorbed only when that context is a render of an adapter
+ * that close() has cancelled. The caller's own callbacks (onProgress) run
+ * outside that context, so their rejections are never attributed to it.
+ *
+ * Everything else gets what Node would have done without this listener:
+ * if another 'unhandledRejection' listener exists, it handles it; otherwise
+ * the --unhandled-rejections mode (from process.execArgv and NODE_OPTIONS)
+ * decides: "throw" (the default) raises it as an uncaught exception, as Node
+ * does; "warn" emits Node's warning; "warn-with-error-code" also sets exit
+ * code 1; "none" does nothing; under "strict" Node has already raised it
+ * before any listener runs.
+ *
+ * The listener is installed by close() of an adapter with a render in flight
+ * and removed CANCEL_NOISE_WINDOW_MS after the last such close(). Where Node
+ * does not restore the async context for the listener (before Node 24's
+ * AsyncContextFrame), nothing is attributed and nothing is absorbed.
  */
+const renderContext = new AsyncLocalStorage<object>();
+const cancelledAdapters = new WeakSet<object>();
 const CANCEL_NOISE_WINDOW_MS = 30_000;
-const CANCEL_NOISE_MESSAGE = /\b(?:Target|Session) closed\b/;
-let absorbUntil = 0;
-let absorbing = false;
-export function isCancelNoise(reason: unknown): boolean {
-  if (typeof reason !== "object" || reason === null) return false;
-  const { code, message } = reason as { code?: unknown; message?: unknown };
-  return code === "EPIPE" || (typeof message === "string" && CANCEL_NOISE_MESSAGE.test(message));
+let listenUntil = 0;
+let listening = false;
+
+/** The --unhandled-rejections mode Node runs with (last flag wins; default "throw"). */
+export function unhandledRejectionsMode(
+  execArgv: readonly string[] = process.execArgv,
+  nodeOptions: string = process.env.NODE_OPTIONS ?? "",
+): string {
+  let mode = "throw";
+  for (const arg of [...nodeOptions.split(/\s+/), ...execArgv]) {
+    const match = /^--unhandled-rejections=(.+)$/.exec(arg);
+    if (match?.[1]) mode = match[1];
+  }
+  return mode;
 }
-function onCancelRejection(reason: unknown): void {
-  if (Date.now() < absorbUntil && isCancelNoise(reason)) return;
-  if (process.listenerCount("unhandledRejection") === 1) throw reason;
+
+/** Whether the current async context is a render of a cancelled adapter. */
+export function isCancelledRender(): boolean {
+  const adapter = renderContext.getStore();
+  return adapter !== undefined && cancelledAdapters.has(adapter);
 }
-function absorbCancelNoise(): void {
-  absorbUntil = Date.now() + CANCEL_NOISE_WINDOW_MS;
-  if (absorbing) return;
-  absorbing = true;
+
+function onCancelRejection(reason: unknown, promise: Promise<unknown>): void {
+  if (isCancelledRender()) return;
+  if (process.listenerCount("unhandledRejection") > 1) return;
+  const mode = unhandledRejectionsMode();
+  if (mode === "throw") throw reason;
+  if (mode === "warn" || mode === "warn-with-error-code") {
+    const detail = reason instanceof Error ? (reason.stack ?? String(reason)) : String(reason);
+    process.emitWarning(detail, "UnhandledPromiseRejectionWarning");
+    process.emitWarning(
+      "Unhandled promise rejection. This error originated either by throwing inside of an async function " +
+        "without a catch block, or by rejecting a promise which was not handled with .catch().",
+      "UnhandledPromiseRejectionWarning",
+    );
+    if (mode === "warn-with-error-code") process.exitCode = 1;
+  }
+  void promise;
+}
+
+function listenForCancelNoise(adapter: object): void {
+  cancelledAdapters.add(adapter);
+  listenUntil = Date.now() + CANCEL_NOISE_WINDOW_MS;
+  if (listening) return;
+  listening = true;
   process.on("unhandledRejection", onCancelRejection);
   const release = () => {
-    if (Date.now() < absorbUntil) {
-      setTimeout(release, absorbUntil - Date.now()).unref();
+    if (Date.now() < listenUntil) {
+      setTimeout(release, listenUntil - Date.now()).unref();
       return;
     }
     process.off("unhandledRejection", onCancelRejection);
-    absorbing = false;
+    listening = false;
   };
   setTimeout(release, CANCEL_NOISE_WINDOW_MS).unref();
 }
@@ -488,3 +561,9 @@ function assertFrame(frame: number, durationInFrames: number) {
     throw new RangeError(`frame ${frame} is outside 0..${durationInFrames - 1}`);
   }
 }
+
+/** Test seam for the cancel-noise attribution (tests/unit/adapter-lifecycle.test.ts). */
+export const cancelNoiseForTests = {
+  runAsRender: <T>(adapter: object, fn: () => T): T => renderContext.run(adapter, fn),
+  listen: (adapter: object): void => listenForCancelNoise(adapter),
+};

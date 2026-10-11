@@ -24,7 +24,7 @@ import path from "node:path";
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { HyperFramesAdapter } from "../../src/adapters/hyperframes/render";
+import { ADAPTER_LABEL, HyperFramesAdapter } from "../../src/adapters/hyperframes/render";
 import { AdapterClosed } from "../../src/api/engine";
 import { GOLDEN_CASES, OUT_DIR, SCENE_ID, loadS1Trace } from "./cases";
 import { interruptAfter, type InterruptKind } from "./interrupt";
@@ -116,15 +116,19 @@ const INTERRUPTS: { kind: InterruptKind; delayMs: number }[] = [
   { kind: "stills", delayMs: 2000 },
 ];
 
-const studioContainers = () =>
-  execFileSync("docker", ["ps", "-aq", "--filter", "label=org.qontinui.studio.run"], { encoding: "utf8" }).split(/\s+/).filter(Boolean);
+/** Containers of THIS adapter (its own label value), so other renders on the host cannot flake the test. */
+const containersOf = (adapter: HyperFramesAdapter) =>
+  execFileSync("docker", ["ps", "-aq", "--filter", `label=${ADAPTER_LABEL}=${adapter.adapterId}`], { encoding: "utf8" })
+    .split(/\s+/)
+    .filter(Boolean);
 
 describe.skipIf(!ENABLED)("HyperFrames adapter: close() mid-render", () => {
   it.each(INTERRUPTS)("$kind, close after $delayMs ms", async ({ kind, delayMs }) => {
-    const outcome = await interruptAfter(new HyperFramesAdapter(), kind, delayMs);
+    const adapter = new HyperFramesAdapter();
+    const outcome = await interruptAfter(adapter, kind, delayMs);
     expect(outcome.error).toBeInstanceOf(AdapterClosed);
     expect(outcome.writtenAfterClose).toEqual([]);
     if (kind !== "stills") expect(outcome.entries).toEqual([]);
-    expect(studioContainers(), "containers left after close()").toEqual([]);
+    expect(containersOf(adapter), "containers left after close()").toEqual([]);
   }, TIMEOUT_MS);
 });

@@ -240,7 +240,7 @@ fixed when the composition is built (see D7 finding 1).
 | Debian packages | `snapshot.debian.org` at `20260925T000000Z` (ffmpeg 5.1.9, fontconfig, the Chrome libraries) | Upstream uses the live mirror. |
 | Browser | chrome-headless-shell **149.0.7790.0** (Chrome for Testing), downloaded from the official CfT URL and checked at build against the committed SHA-256 `a3b011ab4c726e215cdeb623907a09cfb48f07054a7271fdda555ee2ae4f804d` | The same Chromium version `@remotion/renderer` 4.0.529 pins (`TESTED_VERSION`), so engine differences are not browser differences. Upstream uses `@stable`, unverified. The hash was computed on 2026-10-11 from the official URL, before install; the zip's MD5 matched the bucket's own `x-goog-hash`. |
 | npm tree | `npm ci` from the committed lockfile | Upstream runs `npm install -g hyperframes@<v>`, which floats every transitive dependency. |
-| Built image | `studio-hyperframes:0.8.78`, id `sha256:e9fed5e3d72980f2709a40f0b8653b4d0fbdd647ad53b6edfe43af1e80d4e687`, label `org.qontinui.studio.inputs-sha256=ee27c606d1cabec7bdf1d9b61b34f26ddfce53abb5d00e659f4ce56fb1298262`, user `studio`, entry point `studio-hf-render` | The current image, after two rounds of review fixes. The spike's measurements used the first build, `sha256:bf9b3f51ca8a4bc382086dc6e78412a5ab40e9705893b49b89b0e047858681c1`. Its Chrome came from `@puppeteer/browsers` at the same version, without a hash check. The current image reproduces that build's 426 frames byte for byte. |
+| Built image | `studio-hyperframes:0.8.78`, id `sha256:8aac16e543dc1899882e040dc73534efdb81a7b224ecec367ca06318fce4a8d2`, label `org.qontinui.studio.inputs-sha256=840e3d688f3ae410d1df90f255da54326686c2badb210ce17fed25aef7513186`, user `studio`, entry point `studio-hf-render` | The current image, after three rounds of review fixes (round 3 added the container deadline in `studio-hf-render.sh`; the previous id was `sha256:e9fed5e3d72980f2709a40f0b8653b4d0fbdd647ad53b6edfe43af1e80d4e687`). The spike's measurements used the first build, `sha256:bf9b3f51ca8a4bc382086dc6e78412a5ab40e9705893b49b89b0e047858681c1`. Its Chrome came from `@puppeteer/browsers` at the same version, without a hash check. The current image reproduces that build's 426 frames byte for byte. |
 
 **About "the pinned Docker image".** HyperFrames publishes no render image.
 `hyperframes render --docker` builds `hyperframes-renderer:<version>` locally
@@ -283,7 +283,13 @@ adapter checks the image before every render:
       it finds nothing. The daemon can finish a create after its client is
       gone.
     - Every docker call on a cleanup path (`kill`, `rm`, `ps`, `inspect`) is
-      bounded to 15 s, and a whole sweep to 60 s.
+      bounded to 15 s. Inside a sweep each call is also cut at the sweep's
+      60 s deadline, so 60 s is the real bound on a sweep (plus the moment
+      it takes to kill a docker client).
+  - The container renders under `timeout` set to the adapter's render
+    timeout plus 60 s (`STUDIO_HF_DEADLINE_SECONDS`, in
+    `studio-hf-render.sh`), so a container nobody manages any more still
+    ends.
   - `close()` marks the adapter closed, so a render stops at its next phase
     and a container created after close is never started. It also kills
     running containers, waits for the renders to unwind, and then sweeps by
@@ -305,8 +311,12 @@ adapter checks the image before every render:
       own pid, never the CLI's).
     - `docker events` (label filter) showed 22 creates and 22 destroys; 13
       of those containers were removed without ever being started.
-    - No run left a container (checked at exit and 3 s later), an entry in
-      the output directory, or a project directory.
+    - No run left a container (checked at exit and 3 s later) or an entry
+      in the output directory. The project-directory check of these runs
+      looked in `/tmp` while `$TMPDIR` pointed elsewhere, so it proved
+      nothing; the re-review's runs below check `$TMPDIR`. One project
+      directory found there afterwards was traced by its timestamps to the
+      tsx run described next, which exited without cleanup.
   - **Round 3, the same under the tsx CLI** (`tsx src/cli/main.ts`, how
     `pnpm render` used to run). 6 runs (png and mp4, 0–5 s): 5 exited 130
     as above; in 1 the render had finished before the signal and exited 0
@@ -334,7 +344,7 @@ adapter checks the image before every render:
     stills it published before `close()`. The Remotion cases run each in a
     child process with no rejection listener, so they also fail if the
     process crashes; the file passed 6 runs in a row on the final code.
-    Writing that test found three Remotion defects, all fixed:
+    Writing that test found four Remotion defects, all fixed:
     - `close()` itself could reject: Remotion's `browser.close()` kills
       Chrome and then queries its pages over the dead connection ("Target
       closed"). In the CLI that would have exited 1 instead of 130. The
@@ -345,11 +355,23 @@ adapter checks the image before every render:
       browser before its staging cleanup runs, and the cleanup retries
       briefly if a last plain file lands after its first pass.
     - Remotion abandons promises on cancel that later reject with nobody
-      awaiting them (EPIPE from a killed helper process; "Target/Session
-      closed" from pages torn down with the browser). `close()` of an
-      adapter with a render in flight absorbs exactly those for 30 s, with
-      one process `unhandledRejection` listener that rethrows anything else
-      when it is the only listener (README, "Remotion and SIGINT").
+      awaiting them: `renderStill`'s un-awaited page cleanup ("Target
+      closed") and `renderFrames`' un-awaited server cleanup (a raw EPIPE
+      from the compositor's stdin). The re-review (R2) rejected the first
+      fix, a shape-matching process listener, because it could swallow a
+      caller's own rejections and overrode `--unhandled-rejections`. Now
+      every render call runs in an `AsyncLocalStorage` context, and the
+      listener absorbs only rejections Node reports from inside a
+      cancelled render of that adapter; anything else gets Node's own
+      behaviour for the active mode (README, "Remotion and SIGINT"; unit
+      tests cover inside, outside, and the throw / warn /
+      warn-with-error-code / none modes). Before the fix, with the listener
+      disabled, 3 of 27 child runs crashed; after it, 0 of 48.
+    - A still cancelled through Remotion could leave its file server open,
+      keeping the process alive (3 of 24 child runs). Stills are no longer
+      given the cancel signal; `close()` lets a still in flight finish
+      (bounded by 15 s) before closing the browser, and the result is not
+      published.
   - **Round 3, Remotion through the CLI**, final code. SIGINT to the CLI's
     group 0.5–12 s after start, mp4, 6 runs: each exited 130 with "the
     render was stopped; nothing was published", and left nothing in the
@@ -360,8 +382,36 @@ adapter checks the image before every render:
     130, all 12 Chrome processes it had started were gone 2 s later, and
     nothing was published. Its staging directory is left (no cleanup runs in that mode;
     see README).
-  - **Not proven:** SIGTERM in this round (round 2 covered it by hand), and
-    anything after a SIGKILL of node itself, which no cleanup can handle.
+  - **Round 3 re-review (R1), SIGHUP.** The reviewer's method: CLI under
+    `setsid`, SIGHUP to its group 0–9 s after `docker start` began (the
+    shim announced `start` instead of `create`), 11 runs (8 mp4, 3 png).
+    Every run exited 129 with "the render was stopped; nothing was
+    published", 0.2–0.6 s after the signal. `docker events`: 11 creates,
+    11 kills, 11 destroys. No container at exit or 3 s later, nothing in
+    the output directory, no project directory in `$TMPDIR`.
+    - A first batch of 7 found one more gap: with SIGHUP right as `docker
+      start` began, `docker kill` hit a container that was not running
+      yet, failed, and the render then ran to its end (30 s) before the
+      CLI could exit, unpublished. `close()` now retries the kill until it
+      lands or the render has let go of the container (at most 15 s).
+    - SIGHUP during `create`: 3 runs, all exit 129, nothing left.
+  - **Round 3 re-review, SIGTERM.** During `start`, 5 runs (mp4 and png,
+    0–4 s): all exit 143, nothing left. SIGINT during `create` re-run with
+    the `$TMPDIR` check: 6 runs, all exit 130, nothing left.
+  - **Round 3 re-review, Remotion CLI.** SIGHUP at 3, 6, 10 s: exit 129;
+    SIGTERM at 4, 8 s: exit 143. In all 5, all 12 Chrome processes were gone
+    2 s after exit, nothing was published and no staging directory added.
+  - **Round 3 re-review, container deadline.** The image run directly with
+    `STUDIO_HF_DEADLINE_SECONDS` of 1, 2 and 3 on a full 426-frame mp4
+    project: each exited 124 (timeout) after 2.0–3.6 s, wrote nothing to
+    `/output`, and was removed by `--rm`. A bad value is refused. Frame 200
+    rendered by the rebuilt image is byte-identical to the same frame
+    rendered by the previous image earlier this round (the previous image
+    itself was no longer on the host for a full comparison); the gated
+    determinism test passes on the rebuilt image.
+  - **Not proven:** anything after a SIGKILL of node itself. Then nothing is
+    left to clean up the staging and project directories; the container
+    still ends at its own deadline.
 - **Output:** the image renders into its own tmpfs and copies only the
   finished artifact to `/output`, first as `.partial-<name>` and then renamed
   to `<name>` (`docker/hyperframes/studio-hf-render.sh`). HyperFrames
@@ -369,11 +419,15 @@ adapter checks the image before every render:
   `--output`, inside our staging directory. After a failure the adapter
   removes `<name>` and `.partial-<name>`, which are a file or a directory of
   plain files, one level deep.
-- **Interrupts:** the CLI handles SIGINT and SIGTERM.
+- **Interrupts:** the CLI handles SIGINT, SIGTERM and SIGHUP. SIGHUP was
+  added in round 3: with every docker client in its own process group, a
+  terminal hang-up no longer reaches the container through its client, and
+  the CLI died at once (129) leaving the container rendering for minutes
+  (the round-3 re-review's finding R1).
   - It calls `close()` on the adapter, which is single-use after `close()`
     (`AdapterClosed`) and never publishes after it. The render unwinds
     through its own staging, project and container cleanup.
-  - The CLI exits 130 (INT) or 143 (TERM) and says which happened: stopped
+  - The CLI exits 130 (INT), 143 (TERM) or 129 (HUP) and says which happened: stopped
     (or failed while stopping) with nothing published, or already finished
     with the output complete. A second signal a second or
     more later exits at once and skips cleanup; an earlier repeat is taken

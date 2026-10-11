@@ -64,8 +64,18 @@ class Interrupted extends Error {
 /** A signal this soon after the first is the same interrupt relayed, not a second one. */
 const REPEAT_SIGNAL_MS = 1000;
 
+/**
+ * The signals that stop a render: Ctrl-C, a kill, and a terminal hang-up.
+ * SIGHUP matters because every docker client runs in its own process group
+ * (the HyperFrames adapter), so a hang-up no longer reaches the container
+ * through the client: the CLI must stop it itself.
+ */
+const STOP_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+
 function exitCodeFor(signal: NodeJS.Signals): number {
-  return signal === "SIGTERM" ? 143 : 130;
+  if (signal === "SIGTERM") return 143;
+  if (signal === "SIGHUP") return 129;
+  return 130;
 }
 
 function requireScene(id: string) {
@@ -198,10 +208,10 @@ async function render(args: string[]) {
   const adapter = await loadAdapter(engine as Engine);
   const outPath = path.resolve(out);
   let lastPct = -1;
-  // Ctrl-C / SIGTERM: adapter.close() stops the render (an adapter publishes
+  // Ctrl-C / SIGTERM / SIGHUP: adapter.close() stops the render (an adapter publishes
   // nothing after close), the render unwinds through its own cleanup
   // (staging and project directories, containers, exactly as on any other
-  // failure), and the CLI exits 130 / 143 saying which happened: stopped
+  // failure), and the CLI exits 130 / 143 / 129 saying which happened: stopped
   // with nothing published, or finished before the signal took effect. A
   // second signal exits at once, skipping cleanup — but only one that comes
   // REPEAT_SIGNAL_MS or more after the first: one Ctrl-C can arrive twice
@@ -228,8 +238,12 @@ async function render(args: string[]) {
     if (!interrupted) throw reason;
     process.stderr.write(`note: ignored an engine error while stopping: ${reason instanceof Error ? reason.message : String(reason)}\n`);
   };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
+  for (const signal of STOP_SIGNALS) process.on(signal, onSignal);
+  // After a hang-up the terminal is gone and writing to it fails (EIO); that
+  // must not crash the process in the middle of its cleanup.
+  const ignoreStreamError = () => undefined;
+  process.stdout.on("error", ignoreStreamError);
+  process.stderr.on("error", ignoreStreamError);
   process.on("unhandledRejection", onStrayRejection);
   try {
     const result = await adapter.render({
@@ -273,9 +287,12 @@ async function render(args: string[]) {
     throw err;
   } finally {
     await adapter.close();
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
-    // After a signal it stays until the process exits (130 / 143).
+    for (const signal of STOP_SIGNALS) process.off(signal, onSignal);
+    // After a signal these stay until the process exits (130 / 143 / 129).
+    if (!interrupted) {
+      process.stdout.off("error", ignoreStreamError);
+      process.stderr.off("error", ignoreStreamError);
+    }
     if (!interrupted) process.off("unhandledRejection", onStrayRejection);
   }
 }

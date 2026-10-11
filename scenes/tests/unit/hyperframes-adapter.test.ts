@@ -4,15 +4,16 @@
  * does not exist, so reaching docker would fail with ENOENT instead of the
  * refusal asserted here.
  */
-import { mkdtempSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { imageRefProblem } from "../../src/adapters/hyperframes/image";
 import { writeProject } from "../../src/adapters/hyperframes/project";
-import { HyperFramesAdapter, bindMount } from "../../src/adapters/hyperframes/render";
+import { HyperFramesAdapter, bindMount, containerDeadlineSeconds } from "../../src/adapters/hyperframes/render";
 import { REPLAY_REFUSAL } from "../../src/api/trace/provenance";
 import { parseTrace } from "../../src/api/trace/schema";
 import { replayTraceJson, s1TraceJson } from "./fixtures";
@@ -129,5 +130,18 @@ describe("container inputs", () => {
     expect(() => bindMount("/tmp/a,dst=/etc", "/output", false)).toThrow(/contains a comma, quote or newline/);
     expect(() => bindMount('/tmp/a"b', "/output", false)).toThrow(/contains a comma, quote or newline/);
     expect(bindMount("/tmp/a:b", "/output", true)).toBe("type=bind,src=/tmp/a:b,dst=/output,readonly");
+  });
+});
+
+describe("HyperFrames container deadline", () => {
+  it("is the adapter's render timeout plus a 60 s margin, in whole seconds", () => {
+    expect(containerDeadlineSeconds(30 * 60_000)).toBe(1860);
+    expect(containerDeadlineSeconds(1)).toBe(61);
+  });
+
+  it("matches the entry script's default for the default timeout", () => {
+    const script = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../../docker/hyperframes/studio-hf-render.sh"), "utf8");
+    expect(script).toContain(`STUDIO_HF_DEADLINE_SECONDS:-${containerDeadlineSeconds(30 * 60_000)}`);
+    expect(script).toMatch(/timeout --signal=TERM --kill-after=30 "\$deadline"/);
   });
 });

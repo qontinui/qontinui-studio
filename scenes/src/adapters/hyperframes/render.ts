@@ -25,7 +25,9 @@
  * keeps looking for LATE_CREATE_WINDOW_MS, because the daemon can finish a
  * create after its client is gone. close() kills what is running, waits for
  * the renders to unwind, and sweeps by the adapter label. Every cleanup call
- * is bounded.
+ * is bounded. The container also has its own deadline (render timeout plus
+ * 60 s, enforced by `timeout` in studio-hf-render.sh), so it ends even when
+ * nothing is left to stop it (e.g. the CLI was SIGKILLed).
  *
  * The image renders into its own tmpfs and copies only the finished artifact
  * into the staging directory (docker/hyperframes/studio-hf-render.sh), so a
@@ -80,11 +82,11 @@ const CREATE_TIMEOUT_MS = 5 * 60_000;
 const CLEANUP_CALL_TIMEOUT_MS = 15_000;
 /** How long a sweep waits for a container a killed `docker create` may still produce. */
 const LATE_CREATE_WINDOW_MS = 10_000;
-/** Upper bound on one sweep, whatever happens. */
+/** Upper bound on one sweep, whatever happens: each call in it is cut at this deadline too. */
 const SWEEP_MAX_MS = 60_000;
 /** Labels on every container: this render, and the adapter that made it. */
 const RUN_LABEL = "org.qontinui.studio.run";
-const ADAPTER_LABEL = "org.qontinui.studio.adapter";
+export const ADAPTER_LABEL = "org.qontinui.studio.adapter";
 
 /**
  * Container limits; each can be overridden by its environment variable.
@@ -103,6 +105,14 @@ const LIMITS = {
   tmpfs: { env: "STUDIO_HF_TMPFS", fallback: "4g", pattern: /^[1-9][0-9]*[kmg]?$/ },
   cpus: { env: "STUDIO_HF_CPUS", fallback: "8", pattern: /^(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$/ },
 } as const;
+
+/** Margin of the container's own deadline over the adapter's render timeout. */
+const CONTAINER_DEADLINE_MARGIN_S = 60;
+
+/** The container's own deadline: the adapter's render timeout plus a margin. */
+export function containerDeadlineSeconds(timeoutMs: number): number {
+  return Math.ceil(timeoutMs / 1000) + CONTAINER_DEADLINE_MARGIN_S;
+}
 
 function limit(name: keyof typeof LIMITS): string {
   const { env, fallback, pattern } = LIMITS[name];
@@ -274,7 +284,7 @@ export class HyperFramesAdapter implements EngineAdapter {
   /** Renders in flight; close() waits for them to unwind. */
   private readonly inFlight = new Set<Promise<unknown>>();
   /** Labels every container this adapter makes (close() sweeps by it). */
-  private readonly adapterId = randomBytes(8).toString("hex");
+  readonly adapterId = randomBytes(8).toString("hex");
   /** Set by close(); every phase checks it (single-use, see EngineAdapter). */
   private closed = false;
   private closing: Promise<void> | null = null;
@@ -352,6 +362,24 @@ export class HyperFramesAdapter implements EngineAdapter {
     if (this.closed) throw new AdapterClosed(this.name);
   }
 
+  /**
+   * close(): kill a render's container. `docker kill` fails on a container
+   * that is created but not yet running, and `docker start` can be just
+   * about to run it, so the kill is retried until it lands or the render
+   * has stopped using the container (it leaves `running` once its cleanup
+   * has run), for at most CLEANUP_CALL_TIMEOUT_MS.
+   */
+  private async stopContainer(name: string): Promise<void> {
+    const deadline = Date.now() + CLEANUP_CALL_TIMEOUT_MS;
+    while (this.running.has(name) && Date.now() < deadline) {
+      const result = await run(this.docker, ["kill", "--", name], {
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      }).catch(() => null);
+      if (result === null || result.code === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
   private async killContainer(name: string): Promise<void> {
     await run(this.docker, ["kill", "--", name], { timeoutMs: CLEANUP_CALL_TIMEOUT_MS }).catch(() => undefined);
   }
@@ -370,31 +398,40 @@ export class HyperFramesAdapter implements EngineAdapter {
    */
   private async sweep(label: string, name: string | null, lateCreate: boolean): Promise<void> {
     const started = Date.now();
-    const bounded = { timeoutMs: CLEANUP_CALL_TIMEOUT_MS };
+    const deadline = started + SWEEP_MAX_MS;
+    // Each docker call is cut at CLEANUP_CALL_TIMEOUT_MS or at the sweep's
+    // deadline, whichever comes first, so the whole sweep ends by SWEEP_MAX_MS.
+    const bounded = () => ({ timeoutMs: Math.max(1, Math.min(CLEANUP_CALL_TIMEOUT_MS, deadline - Date.now())) });
+    const giveUp = () =>
+      process.stderr.write(
+        `note: could not confirm that every container labelled ${label} is gone; ` +
+          `check with \`docker ps -a --filter label=${label}\`\n`,
+      );
     for (;;) {
-      const listed = await run(this.docker, ["ps", "-aq", "--no-trunc", "--filter", `label=${label}`], bounded).catch(
+      const listed = await run(this.docker, ["ps", "-aq", "--no-trunc", "--filter", `label=${label}`], bounded()).catch(
         () => null,
       );
       // The docker CLI cannot even be started: nothing of ours can exist.
       if (listed === null) return;
-      const ids = listed.code === 0 ? listed.output.split(/\s+/).filter(Boolean) : [];
+      const ids = listed.code === 0 && !listed.timedOut ? listed.output.split(/\s+/).filter(Boolean) : [];
       const targets = name ? [...ids, name] : ids;
-      if (targets.length) await run(this.docker, ["rm", "-fv", "--", ...targets], bounded).catch(() => undefined);
+      if (targets.length && Date.now() < deadline) {
+        await run(this.docker, ["rm", "-fv", "--", ...targets], bounded()).catch(() => undefined);
+      }
       let named = false;
-      if (name) {
-        const inspected = await run(this.docker, ["container", "inspect", "--format", "{{.Id}}", "--", name], bounded).catch(
+      if (name && Date.now() < deadline) {
+        const inspected = await run(this.docker, ["container", "inspect", "--format", "{{.Id}}", "--", name], bounded()).catch(
           () => null,
         );
         named = inspected !== null && inspected.code === 0;
+      } else if (name) {
+        named = true; // not checked before the deadline: unconfirmed
       }
       const elapsed = Date.now() - started;
-      const clean = listed.code === 0 && ids.length === 0 && !named;
+      const clean = listed.code === 0 && !listed.timedOut && ids.length === 0 && !named;
       if (clean && (!lateCreate || elapsed >= LATE_CREATE_WINDOW_MS)) return;
-      if (elapsed >= SWEEP_MAX_MS) {
-        process.stderr.write(
-          `note: could not confirm that every container labelled ${label} is gone; ` +
-            `check with \`docker ps -a --filter label=${label}\`\n`,
-        );
+      if (Date.now() + 250 >= deadline) {
+        giveUp();
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -473,6 +510,10 @@ export class HyperFramesAdapter implements EngineAdapter {
         "DO_NOT_TRACK=1",
         "-e",
         "FONTCONFIG_FILE=/studio-fontconfig/fonts.conf",
+        // The container's own deadline (docker/hyperframes/studio-hf-render.sh):
+        // it ends even if nothing is left to stop it.
+        "-e",
+        `STUDIO_HF_DEADLINE_SECONDS=${containerDeadlineSeconds(this.timeoutMs)}`,
         "--mount",
         fontconfigMount,
         "--mount",
@@ -615,7 +656,7 @@ export class HyperFramesAdapter implements EngineAdapter {
   async close(): Promise<void> {
     this.closed = true;
     this.closing ??= (async () => {
-      await Promise.all([...this.running].map((name) => this.killContainer(name)));
+      await Promise.all([...this.running].map((name) => this.stopContainer(name)));
       await Promise.allSettled([...this.inFlight]);
       if (this.createAttempted) await this.sweep(`${ADAPTER_LABEL}=${this.adapterId}`, null, false);
     })();

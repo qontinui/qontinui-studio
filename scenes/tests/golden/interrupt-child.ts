@@ -29,3 +29,8 @@ const outcome = await interruptAfter(adapter, args.kind, args.delayMs);
 await new Promise((resolve) => setTimeout(resolve, STRAY_WAIT_MS));
 const error = outcome.error instanceof Error ? { name: outcome.error.name, message: outcome.error.message } : { name: "?", message: String(outcome.error) };
 process.stdout.write(`${JSON.stringify({ ...outcome, error })}\n`);
+// Diagnostics only: if something keeps the process alive after the outcome,
+// say what (the test then times out on this child).
+setTimeout(() => {
+  process.stderr.write(`interrupt-child: still alive 5 s after the outcome: ${process.getActiveResourcesInfo().join(", ")}\n`);
+}, 5000).unref();

@@ -225,10 +225,10 @@ pnpm studio-scenes render s1-plan-lifecycle \
   hold only `element-*.png` from a previous run; `--force` replaces exactly
   those files, and any other file in the directory makes the render refuse.
 
-- **Interrupts.** Ctrl-C (SIGINT) or SIGTERM during `render` closes the
-  adapter. The render stops, publishes nothing, and removes its staging
+- **Interrupts.** Ctrl-C (SIGINT), SIGTERM or a terminal hang-up (SIGHUP)
+  during `render` closes the adapter. The render stops, publishes nothing, and removes its staging
   files (and, for HyperFrames, its project directory and container). The CLI
-  then exits 130 or 143 and says which happened: the render was stopped (or
+  then exits 130, 143 or 129 and says which happened: the render was stopped (or
   failed while stopping) and nothing was published, or it had already
   finished and the output is complete. A second signal, sent a second
   or more after the first, exits at once and skips that cleanup (a repeat
@@ -253,14 +253,34 @@ pnpm studio-scenes render s1-plan-lifecycle \
     and call `close()`, which cancels the render and closes Chrome; the render
     unwinds through its staging cleanup. Remotion's `exit` listener, which
     kills Chrome on any process exit, stays in both modes.
-  - `close()` never rejects. Cancelling a Remotion render leaves some of
-    Remotion's own promises rejecting later with nobody awaiting them (an
-    EPIPE from a killed helper process, "Target closed" / "Session closed"
-    from pages closed with the browser). So `close()` of an adapter with a
-    render in flight adds, for 30 s, one process `unhandledRejection`
-    listener that absorbs exactly those; anything else is rethrown when that
-    listener is the only one, as Node would, and otherwise left to yours.
+  - `close()` never rejects. A still in flight is not cancelled but allowed
+    to finish (Remotion's cancel path for `renderStill` can leave its file
+    server open, keeping your process alive); its result is not published.
+  - Cancelling a Remotion render leaves some of Remotion's own promises
+    rejecting later with nobody awaiting them (e.g. "Target closed" from a
+    page it closes without awaiting, an EPIPE from a helper process that
+    already quit). By default Node would crash your process on those. So
+    `close()` of an adapter with a render in flight adds, for 30 s after the
+    last such close, one process `unhandledRejection` listener. It absorbs a
+    rejection only when Node reports it from inside that adapter's own
+    cancelled render (every render call runs in an `AsyncLocalStorage`
+    context, and your `onProgress` runs outside it). For any other
+    rejection it does what Node would have done without it: nothing if you
+    have your own listener; otherwise it follows `--unhandled-rejections`
+    from `process.execArgv` and `NODE_OPTIONS`: `throw` (the default)
+    raises it as an uncaught exception, `warn` prints Node's warning,
+    `warn-with-error-code` also sets exit code 1, `none` ignores it, and
+    under `strict` Node has already raised it. Node 24 is needed for the
+    attribution (it restores the rejection's async context for the
+    listener); on older Node nothing is absorbed.
 
+- **HyperFrames container deadline.** Every container renders under
+  `timeout` (`docker/hyperframes/studio-hf-render.sh`) set to the adapter's
+  render timeout plus 60 s (30 min + 60 s by default), so a container that
+  nothing manages any more, e.g. after the CLI was killed with SIGKILL,
+  still ends: SIGTERM, then SIGKILL 30 s later, then `--rm` removes it. The
+  staging and project directories of such a run are left behind (nothing is
+  left to remove them).
 - **HyperFrames container resources.** A HyperFrames render runs with
   `--memory` 8g, `--cpus` 8, `--pids-limit` 8192 and a 4g tmpfs at `/tmp`
   (`STUDIO_HF_MEMORY`, `STUDIO_HF_CPUS`, `STUDIO_HF_PIDS_LIMIT`,
