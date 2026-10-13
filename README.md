@@ -4,8 +4,11 @@ The asset pipeline for products shipped by the Qontinui software factory: briefs
 in, slot-cropped, labelled, provenance-carrying images out, published by
 automated gates.
 
+It also holds the launch kit, which turns a shipped product into a launch bundle
+built from the factory's build record.
+
 Plan: `qontinui-dev-notes/plans/2026-10-09-factory-built-product-portfolio-and-launch-kit.md`
-(Phase 0 provider inventory, Phase 2 asset pipeline).
+(Phase 0 provider inventory, Phase 2 asset pipeline, Phase 3 launch kit).
 
 ## Separation: the studio is a client of the factory
 
@@ -15,7 +18,8 @@ factory builds, and it talks to the factory only over the doors any tenant
 uses:
 
 - it posts operator notices to coord's findings door;
-- it will read the factory's build-record export (plan Phase 1) for the launch kit.
+- it reads the factory's build-record export (plan Phase 1) for the launch kit;
+- it registers coord gates that run the launch kit when a product ships.
 
 Third-party generator dependencies (API keys, provider terms) live here, so
 marketing churn never touches merge-critical factory code.
@@ -46,9 +50,8 @@ lands.
 | **D5** every asset carries provenance and licence | Each library row stores provider, model, prompt, brief id (or, for an imported asset, account alias, reference images and terms URL), date and SHA-256. It also snapshots the licence terms as reviewed, and the watermark. `ai_generated` is pinned true by a SQL `CHECK`. An unreviewed licence is refused for every site; a non-commercial licence is refused for a commercial site. | `store.py`, `library.py`, `gates.py` (`d5_licence`, `d5_provenance`) |
 | **D6** AI imagery is never presented as the real thing | Refuses AI imagery in any `product_screenshot` slot, and in `food`/`premises` slots on a `real_business` site. Demo sites must carry an illustrative label. The label is written to the site's `studio-manifest.json` for the site build to render. | `gates.py` (`d6_not_the_real_thing`), `publish.py` |
 | **D7** automated gates decide; the operator is notified, not asked | A batch publishes only when every gate passes, including UI Bridge page health on a preview of the batch, which runs before anything goes live. Page health is **required, with no waiver**. The operator gets a notice carrying a one-step `studio --root <abs path> unpublish --batch <id>`. The review page is not an approval queue. | `publish.py`, `notify.py`, `review.py` |
-
-D3, the build-record allowlist, gates the factory's export (Phase 1). It has no
-subject in this repo.
+| **D3** public redaction is explicit | The launch kit runs qontinui-web's own validator on every build record. It is ported in `launch/allowlist.py`, and a parity test runs it over a shared fixture corpus. The validator checks key for key, per-slot value types and the `<path>: <reason_code>` grammar for unknowns. It also scans every string for private repo names, UUIDs and emails, after Unicode normalisation that defeats lookalike and invisible characters. It enforces the caps: strings of at most 512 characters (decomposed too, with at most 2× NFKD expansion) and documents of at most 256 KiB. Any repo the product declares but the record left out (at most 50 such repos) must not be named anywhere in the record. A record must belong to the product: matching slugs, and only repos the product declares. Only a versioned public snapshot can back a published launch. | `launch/allowlist.py`, `launch/record.py`, `launch/publish.py` |
+| **D1** the record is the credibility asset | The "How this was built" page is rendered only from the record, and every value names its document field. A null is shown as `unknown — <reason>`, never as 0. List counts are judged from coord's reason codes: `door_unavailable` (or any code other than `not_established`) makes a count unknown, and `not_established` on a non-empty list makes it a lower bound. A bundle without a record does not publish. | `launch/facts.py`, `launch/bundle.py` |
 
 A site that declares no UI Bridge preview reports the page-health gate as
 `not_configured`, which **refuses** publication. There is no waiver (plan D7).
@@ -264,7 +267,8 @@ platform (`shlex` on POSIX, `list2cmdline` on Windows), so a root containing
 spaces still pastes correctly.
 
 Exit codes: `0` ok, `1` config error, `2` publication refused by a gate,
-`3` generation deferred or failed.
+`3` generation deferred or failed, `4` no build record yet, `5` a trigger was
+registered but its read-back did not confirm it.
 
 ### The library: import, approval, export
 
@@ -385,7 +389,8 @@ upgraded in place the first time any command opens it.
 |---|---|
 | `GEMINI_API_KEY` | the `gemini` adapter. The env var name is set per row by `api_key_env`. |
 | `OPENAI_API_KEY` | the `openai` adapter |
-| `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. Notice files are timestamped and never overwritten. |
+| `STUDIO_WEB_BEARER` or `STUDIO_WEB_BEARER_FILE` | the launch kit's authed build-record door (`record.door: authed`) |
+| `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | `studio launch register-trigger`, and operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. Notice files are timestamped and never overwritten. |
 
 To let the scheduler use a provider, set `daily_quota` on its row. This is the
 per-UTC-day cap. The scheduler works through a brief's `provider_preference` in
@@ -416,12 +421,264 @@ state is kept in `.studio/studio.db`.
   `real_business` / `product`), whether it is `commercial`, `publish_dir`,
   the four D7 preview fields, and per-slot size, category, formats, focal point and
   optional background removal.
+- `products/*.yaml`: launch-kit products (slug, repos, record door, capture
+  script, brief and assets site, publish target), plus their capture scripts.
 - `briefs/*.yaml`: the asset id, purpose, targets (`{site, slot}` or
   `{campaign}`), aspect ratio, prompt, style guide, reference images, provider
   preference and number of variants.
 - `schemas/import-manifest.schema.json`: the `library import` manifest contract.
 - `.studio/` (gitignored): the SQLite library and scheduler state, raw downloads
   and imports, variants, notices and the review page.
+
+## Launch kit (plan Phase 3)
+
+`studio launch run products/<slug>.yaml` takes a product from shipped to
+launched in one step:
+
+1. **Build record.** The kit fetches the public snapshot
+   `GET https://api.qontinui.io/api/v1/public/build-records/<slug>`, or, with
+   `record.door: authed`, the authed proxy `GET /api/v1/build-records/<slug>`
+   using a bearer from `STUDIO_WEB_BEARER` / `STUDIO_WEB_BEARER_FILE`. The bearer
+   is sent only over https to an allowlisted host (`api.qontinui.io`); any other
+   door is refused as `refused_door`. The kit verifies the snapshot's
+   `content_sha256` and runs the D3 validator. It also requires the record to be
+   this product's: `public_slug` equals `document.product.slug` equals the
+   product slug, and the document's repos are a subset of the product's.
+   Only a public snapshot with a version can be published. An authed document or
+   a `--record-file` builds a preview bundle only. The `d1_record` gate refuses
+   to publish it, and no non-public URL is written into its files.
+   A 404, an unreachable route or a refused credential is a typed
+   `NoBuildRecord`, not a crash and not an empty record. The bundle still
+   assembles, says there is no record, shows no numbers, and does not publish
+   (exit `4`).
+2. **Capture.** A declarative action script (`navigate` / `click` / `fill` /
+   `wait` / `screenshot` steps in YAML) is run against the running product. The
+   kit can also serve a static directory on `127.0.0.1` for the capture.
+   Playwright is the headless browser, which is its one sanctioned use here. It
+   produces real screenshots and records a walkthrough video. A `navigate`
+   target is resolved against the product's URL and must stay on its origin, so
+   `file:`, `javascript:` and other sites are refused. Requests to other
+   origins are blocked, and a screenshot is refused if the page has left the
+   product. When the kit captures the studio's own UI, the review page, it
+   builds a public variant with no absolute operator paths. Its images are
+   copied into the served directory, so every image link resolves under the
+   capture server. When recording is
+   off or fails, ffmpeg stitches the screenshots instead. Playwright is the
+   optional `launch` extra; without it the kit raises `PlaywrightUnavailable`
+   and assembles without a capture.
+3. **Decoration (optional).** The product's brief runs through the Phase 2 path
+   (brief, scheduler, library, D5/D6/D7 gates) onto its `assets_site`. The kit
+   reads only what those gates published. None of it is required; every failure
+   becomes a note in the bundle.
+4. **Bundle.** The bundle is a static directory with these files:
+   - `index.html`: the landing page, with OG meta;
+   - `how-it-was-built.html`: rendered from the record only;
+   - `build-record.json`;
+   - `social/{og,x,linkedin,square}.png`: 1200×630, 1200×675, 1200×627 and 1080×1080;
+   - `posts/{x,bluesky,mastodon,linkedin}.txt`: known facts only, plus the record link;
+   - `video/launch.mp4` and `film.json`: about 60 s;
+   - `launch-manifest.json`: the SHA-256 of every file.
+
+   Film frames and segments are rendered outside the bundle in temporary
+   directories and removed whatever happens. A bundle can never list a
+   dot-prefixed path: assembly refuses one, and so does the integrity gate.
+   Each image's D7 group is a readable slug of its path plus a hash of the
+   exact path, and a collision is refused when the bundle is assembled.
+
+   `--out` is refused when it:
+   - equals or overlaps any product's or site's publish or preview dir, or a
+     registered launch's publish dir or bundle;
+   - holds `.studio.lock` or a `.studio-journal-*` file;
+   - holds a bundle that a launch row owns (a bundle is never rebuilt in place);
+   - holds anything other than an unregistered `launch-bundle/1` bundle.
+
+   An empty directory is accepted. The bundle is built in a temporary sibling
+   directory and renamed into place.
+
+   The film runs in this order: a title, the walkthrough, build-record summary
+   slides, a replay slot, AI b-roll labelled in the frame, and a closing card.
+   The **replay slot** is pluggable (`ReplaySegment`, or `--replay-clip FILE`).
+   It holds the sibling plan's animated build-record scene. Until that scene's
+   renderer exists, the slot is omitted and `film.json` says why.
+5. **Gates and publication (D7).** The pre-publication gates are:
+   - `d1_record`, `d3_allowlist` and `integrity`;
+   - `d1_current`: the public door is re-read at publish time, and it must still
+     serve the very snapshot (version and `content_sha256`) the bundle was built
+     from. A retracted or newer record refuses;
+   - `d1_tenant`: the snapshot must be OWNED by the operator's tenant. Public
+     slugs belong to whichever tenant published first, while product slugs are
+     per-tenant, so another tenant can own the public snapshot of a slug the
+     operator also opted in, and a product listing proves nothing. The proof
+     comes from the authed `GET /api/v1/build-records/{slug}/publication`: it
+     must answer `owned_by_caller_tenant: true`, not `unpublished`, with the
+     bundle's own version and `content_sha256`. The answer is checked exactly
+     as qontinui-web serves it: the keys `public_slug`,
+     `owned_by_caller_tenant`, `unpublished`, `version` and `content_sha256`,
+     no more and no fewer. `public_slug` must be this slug, and a not-owned
+     answer must carry no state. When that route answers 404 or
+     no web bearer is configured, the product definition must pin
+     `record.expected_sha256` and/or `record.expected_version`. Otherwise
+     publication is refused;
+   - `public_text`: no text the kit composes from local inputs may carry an
+     absolute local path, the operator's home directory, this machine's
+     hostname, or a machine-internal host (`localhost`, loopback, `*.local`,
+     `file://`). That covers the manifest, posts, `film.json`, captions and the
+     page templates. Pages are judged by position, never by matching content:
+     - the gate re-runs the one page renderer on the bundle's own inputs, which
+       proves the pages are exactly that render;
+     - it renders them again with every record string replaced by a
+       placeholder, and scans that render.
+     
+     So a PR titled "bind to 127.0.0.1" publishes, while a record string can
+     never hide a leak in kit-composed text. For example, a homepage of
+     `http://qontinui-studio.internal:8080/` is refused even though the slug
+     is also a record string. The manifest, posts and `film.json` are scanned
+     as written, and `build-record.json` is left to the D3 validator.
+     Assembly notes and capture URLs are operator-only. They are kept in the
+     launch row and the notice, never in the manifest;
+   - `d5_provenance` and `d5_licence`, run per decorative image;
+   - `d6`;
+   - `footer`, which checks that every page links "Built by the Qontinui software
+     factory" to the public build record;
+   - `already_live`, which refuses a launch that is already the live publication;
+   - `foreign_file`, which refuses when any file in the publish directory is not
+     a file the live launch placed, still holding the bytes it placed. A hand
+     edit or someone else's page is never overwritten. The studio's
+     `.studio.lock` and `.studio-journal-*` files are ignored.
+
+   D7 follows the asset pipeline's preview-first order and its UI Bridge
+   binding, with no waiver. The target declares all four of `ui_bridge_url`,
+   `preview_url`, `preview_dir` and `preview_manifest_url`, or none of them.
+   None refuses as `not_configured`. A `#fragment` in any of the three URLs is
+   refused, because D7 binds through the real query string. The bridge URL is judged by the asset
+   pipeline's `forbidden_bridge_reason`. On ports 9875 and 9876 (the
+   supervisor's and runner's own UIs) it is refused if the host, as httpx will
+   see it and resolve it, is local, or if the host doesn't resolve. The checks
+   run in this order:
+
+   1. The bundle is written to `publish.preview_dir`.
+   2. `d7_preview`: the preview serves exactly this bundle's
+      `launch-manifest.json`, checked by sha256.
+   3. `d7_navigate`: the preview's UI Bridge is driven, with a hard document
+      load, to `preview_url?studio_launch=<id>&studio_attempt=<uuid4>`. A fresh
+      attempt token is used every run. The kit then polls the snapshot until
+      the page reports exactly that URL, compared browser-normalised and with
+      the preview's origin, retrying bridge errors up to a deadline.
+   4. `d7_page_health`: UI Bridge page health must say OK or WARNING.
+   5. `d7_images`: the kit keeps polling, within the same deadline, until every
+      image on the page has settled (loaded or failed), and the page must not
+      move meanwhile. This check covers every image in the bundle.
+      - The landing page renders each image with `loading='eager'`, its
+        `width`/`height`, and a unique `data-media-id`, in the form
+        `studio-img-launch-<path>`. D7 finds each image by that id and never by
+        file name. A bridge that reports no media at all is refused, because it
+        needs media discovery. Every URL naming a bundle image carries
+        `?sha=<sha256>`, and the manifest records each image's sha256.
+      - An image on the landing page must be shown from exactly
+        `urljoin(preview_manifest_url, <path>)`, compared by scheme, host, port
+        and full path, so it is served beside the launch manifest. It must
+        carry its `?sha=` and load. The bytes at the exact URL the element
+        shows are fetched and hashed.
+      - An element with no `src`, a lazy image, or one still pending at the
+        deadline is refused. `preview_manifest_url` must be on the same origin
+        as `preview_url`.
+      - An image the page doesn't show (the social cards) is fetched from the
+        preview, relative to `preview_manifest_url`, and its sha256 compared.
+
+   Nothing live changes until every check passes.
+
+   The preview dir has the same limits as a site's:
+   - it must be outside the studio root and must not contain it;
+   - it must be neither `publish_dir`, inside it, nor a parent of it;
+   - neither the preview dir nor the publish dir may overlap any site's publish
+     or preview dir;
+   - the kit only deletes files listed in the preview manifest it wrote itself.
+
+   Publication also holds a lock on the bundle directory from the first gate to
+   the commit. Before each file is placed, its staged bytes must hash to the
+   manifest entry D7 verified. The manifest itself must be the bytes the preview
+   served. A bundle edited mid-publish is refused, and nothing goes live.
+
+   Publish and unpublish both hold the OS locks on the publish dir and the
+   preview dir (`.studio.lock`, `locks.site_locks`) until the notice is sent.
+   Both are journalled by `LaunchJournal` (`.studio-journal-<launch>.json`),
+   which follows the pipeline's protocol with bundle-relative paths:
+   - every original is re-checked by sha256 right before it moves, so a file
+     that changed since the check is never moved or overwritten;
+   - a backup that isn't the kit's own bytes is kept;
+   - a journal is validated before recovery acts on it. Its paths must stay
+     inside the publish dir, and its launch id must match the file name and
+     belong to that directory.
+
+   The DB transaction is the commit point, and the gate results are written
+   inside it. After the commit, a problem with cleanup or the notice is
+   reported as a warning, never as a refusal.
+
+   Recovery runs at the start of every publish or unpublish of that directory,
+   or for all of them with `studio launch recover`. It replays a leftover
+   journal forward if the change committed and backward otherwise, and notifies
+   the operator either way (`publish-rolled-back` / `unpublish-rolled-back`). It
+   also refuses launches stuck in `publishing`, and re-sends the published
+   notice for a live launch whose `notified_at` is unset.
+
+   On success, the previous launch is marked superseded. The operator gets a
+   notice with a shell-quoted `studio --root <abs path> launch unpublish --launch <id>`.
+   Only the live publication can be unpublished. Unpublish never restores an
+   earlier launch on its own. To restore one, run
+   `studio launch publish --launch <id>`, which re-runs every gate, D7 on a
+   preview included.
+
+```bash
+poetry install -E launch && poetry run playwright install chromium
+poetry run studio launch record qontinui-studio            # fetch + validate; exit 4 = no record yet
+poetry run studio launch build products/qontinui-studio.yaml [--record-file F] [--no-video] [--no-capture] [--no-generate] [--replay-clip F]
+poetry run studio launch run products/qontinui-studio.yaml  # build + gated publish
+poetry run studio launch publish --launch ID
+poetry run studio launch unpublish --launch ID              # one step
+poetry run studio launch list
+poetry run studio launch recover                            # replay interrupted publishes/unpublishes
+poetry run studio launch register-trigger --work-unit-slug <plan-slug> --product qontinui-studio
+```
+
+### Trigger (no poller)
+
+`register-trigger` first resolves the work unit read-only through the agent
+read door, `GET /coord/agent-work-units/<slug>`. An unknown slug is refused and
+nothing is written: the trigger never creates a work unit. The slug is
+URL-quoted in every path, and the coord bearer is sent only over https to the
+allowlisted coord host (`coord.qontinui.io`). Any other `--coord-base` is
+refused before a request is made. It then registers
+this gate on
+`POST https://coord.qontinui.io/coord/work-units/<slug>/register-gate`:
+
+```json
+{"kind": "unit_status", "work_unit_id": "<uuid>", "status": "shipped"}
+```
+
+The gate carries a `run_skill` continuation for the `launch-kit` skill
+(`.claude/skills/launch-kit/SKILL.md`). The command uses the bearer from
+`STUDIO_COORD_BEARER` / `_FILE`. It prints the `gate_id` and reads the gate back
+through `GET /coord/agent-gates?work_unit_id=`. It exits `0` only when that
+read-back lists the gate, and `5` when the read-back is absent or unreadable.
+
+### Self-launch: what is still owed
+
+`products/qontinui-studio.yaml` launches the studio itself. Its walkthrough is
+the studio's own UI, the review page. `tests/test_launch_end_to_end.py` runs the
+whole kit offline, on a fixture build record and a local test site. That run
+includes the shipped product definition, Playwright capture and a short ffmpeg
+film. Two steps remain before the **live** self-launch:
+
+- Phase 1 must be deployed. The public build-record route answers 404 today,
+  which the kit reports as "no build record yet".
+- The operator must decide which public org/domain hosts build records and the
+  bundle. That decision sets `record.public_url`, `publish.public_url` and the
+  four D7 preview fields: `ui_bridge_url`, `preview_url`, `preview_dir` and
+  `preview_manifest_url`. Until those are declared, `studio launch run`
+  assembles the self-launch and then refuses to publish it
+  (`d7_page_health not_configured`, exit 2). This is deliberate: D7 is never
+  waived. For the same reason, `sites/qontinui-studio-launch.yaml` refuses
+  decoration until it has a preview.
 
 ## Development
 

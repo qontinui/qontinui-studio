@@ -1,0 +1,18 @@
+# Decoration for qontinui-studio's launch bundle. Optional: when no provider is
+# schedulable the kit assembles without it (D1).
+id: qontinui-studio-launch
+purpose: Abstract hero and b-roll for the qontinui-studio launch page and film
+targets:
+  - site: qontinui-studio-launch
+    slot: hero
+  - site: qontinui-studio-launch
+    slot: broll-1
+aspect_ratio: "16:9"
+prompt: >-
+  An abstract, calm illustration of an assembly line made of light, producing
+  small glowing documents and screens, on a dark blue background.
+negative_prompt: text, logos, people, watermarks, product screenshots
+style_guide: ../style/warm-minimal.md
+reference_images: []
+provider_preference: [gemini, openai]
+variants: 1

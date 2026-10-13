@@ -35,8 +35,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-poetry-
 
+      # The [launch] extra brings Playwright, the headless browser the launch
+      # kit's walkthrough capture drives; its end-to-end tests skip without it.
       - name: Install dependencies
-        run: poetry install --no-interaction --no-ansi
+        run: poetry install --no-interaction --no-ansi -E launch
+
+      - name: Install Chromium for Playwright
+        run: poetry run playwright install --with-deps chromium
 
       - name: Ruff (lint)
         run: poetry run ruff check .
@@ -56,3 +61,9 @@ jobs:
       # itself fail CI if it stops loading.
       - name: Provider inventory loads
         run: poetry run studio providers list
+
+      # Plan Phase 3: the launch kit's own product definition and the shipped
+      # self-launch test run above (tests/test_launch_end_to_end.py); this
+      # step fails CI if the CLI group stops loading.
+      - name: Launch kit CLI loads
+        run: poetry run studio launch --help

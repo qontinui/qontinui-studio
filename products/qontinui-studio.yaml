@@ -1,0 +1,41 @@
+# The launch kit's first product is itself (plan Phase 3 acceptance: "the launch
+# kit launches itself"). Every number on its pages comes from the factory's
+# build record for this slug; nothing here states one.
+slug: qontinui-studio
+title: qontinui-studio
+tagline: Launch kits and labelled, provenance-carrying assets for products the Qontinui software factory ships.
+description: >-
+  qontinui-studio turns a product the factory shipped into a launch: its build
+  record rendered as a "How this was built" page, screenshots and a walkthrough
+  of the running product, social cards and posts, and a short film. Decorative
+  AI imagery is optional, gated by licence and provenance checks, and always
+  labelled as AI-generated.
+repos: [qontinui/qontinui-studio]
+homepage: https://github.com/qontinui/qontinui-studio
+record:
+  door: public
+  # public_url: set once the operator decides the public org/domain for build
+  # records (plan "Open questions"); until then the public snapshot route.
+  # Publication must prove the snapshot is this tenant's: with a web bearer
+  # (STUDIO_WEB_BEARER) the authed product listing does; without one, pin the
+  # published snapshot here — expected_sha256: <content_sha256> and/or
+  # expected_version: <n>.
+capture:
+  script: qontinui-studio.capture.yaml
+  # The studio's own UI is its static review page; the kit builds it and
+  # serves it on 127.0.0.1 for the capture.
+  serve_dir: ../.studio/review
+  build_review_page: true
+  record_video: true
+brief: ../briefs/qontinui-studio-launch.yaml
+assets_site: qontinui-studio-launch
+publish:
+  # Local until the public org/domain is decided.
+  publish_dir: ../.studio/published/qontinui-studio
+  commercial: false
+  # No D7 preview yet (ui_bridge_url + preview_url + preview_dir +
+  # preview_manifest_url): the preview belongs with wherever the bundle is
+  # hosted, which is the operator's open decision. D7 is never waived, so
+  # `studio launch run` REFUSES publication (not_configured) until all four
+  # are declared here. preview_dir must sit outside the studio root.
+video_seconds: 60

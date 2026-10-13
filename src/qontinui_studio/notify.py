@@ -88,11 +88,12 @@ class FileNotifier:
         return Delivery(channel="file", location=str(stem.with_suffix(".md")), note=note)
 
 
-def resolve_bearer() -> str | None:
-    token = os.environ.get(BEARER_ENV)
+def resolve_bearer(env: str = BEARER_ENV, file_env: str = BEARER_FILE_ENV) -> str | None:
+    """A bearer from ``$<env>``, else from the file ``$<file_env>`` names."""
+    token = os.environ.get(env)
     if token:
         return token.strip()
-    path = os.environ.get(BEARER_FILE_ENV)
+    path = os.environ.get(file_env)
     if path and Path(path).is_file():
         return Path(path).read_text(encoding="utf-8").strip() or None
     return None

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import os
+import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -37,10 +38,29 @@ def _e(value: object) -> str:
 
 
 def build_review_page(
-    conn: sqlite3.Connection, out_dir: Path, generated_at: datetime, root: Path | None = None
+    conn: sqlite3.Connection,
+    out_dir: Path,
+    generated_at: datetime,
+    root: Path | None = None,
+    public: bool = False,
 ) -> Path:
     """Write the review page. ``root`` (the studio root) makes every printed
-    command runnable from any directory."""
+    command runnable from any directory.
+
+    ``public=True`` renders the variant the launch kit captures into public
+    screenshots: no absolute operator path anywhere — brief paths are shown
+    relative to ``root``, commands carry no ``--root``, and any absolute path
+    under ``root`` or the home directory in gate details is shown relative."""
+    scrub_roots = [p for p in (root, Path.home()) if p is not None] if public else []
+
+    def show(text: object) -> str:
+        out = "" if text is None else str(text)
+        for base in scrub_roots:
+            for spelled in {str(base), str(base.resolve())}:
+                out = out.replace(spelled + os.sep, "").replace(spelled, ".")
+        return out
+
+    command_root = None if public else root
 
     library = Library(conn)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -63,14 +83,15 @@ def build_review_page(
                 "published.</p>"
             )
         else:
-            parts.append(f"<dl><dt>brief</dt><dd>{_e(b['brief_path'])}</dd></dl>")
+            brief_path = show(b["brief_path"])
+            parts.append(f"<dl><dt>brief</dt><dd>{_e(brief_path)}</dd></dl>")
             parts.append("<p>Regenerate:</p>")
             parts.append(
-                f"<code>{_e(studio_command(['brief', 'run', b['brief_path']], root))}</code>"
+                f"<code>{_e(studio_command(['brief', 'run', brief_path], command_root))}</code>"
             )
         if b["status"] == "published":
             parts.append("<p>Unpublish:</p>")
-            parts.append(f"<code>{_e(unpublish_command(b['id'], root))}</code>")
+            parts.append(f"<code>{_e(unpublish_command(b['id'], command_root))}</code>")
         gates = conn.execute(
             "SELECT gate, subject, outcome, detail FROM gate_results WHERE batch_id = ? ORDER BY rowid",
             (b["id"],),
@@ -80,7 +101,7 @@ def build_review_page(
             for g in gates:
                 parts.append(
                     f"<li class='{_e(g['outcome'])}'>{_e(g['outcome'])} — {_e(g['gate'])} — "
-                    f"{_e(g['subject'])}: {_e(g['detail'])}</li>"
+                    f"{_e(show(g['subject']))}: {_e(show(g['detail']))}</li>"
                 )
             parts.append("</ul></details>")
         parts.append("<div class='assets'>")
@@ -88,11 +109,20 @@ def build_review_page(
             variants = library.variants(asset.uid)
             preview = next((v for v in variants if v.format in ("webp", "png", "jpeg")), None)
             parts.append("<div class='asset'>")
-            shown = preview.path if preview is not None else None
-            if shown is None and asset.origin == "imported":
-                shown = asset.raw_path  # an import has no variants; show the stored original
-            if shown is not None:
-                rel = os.path.relpath(shown, out_dir)
+            source = preview.path if preview is not None else None
+            if source is None and asset.origin == "imported":
+                source = asset.raw_path  # an import has no variants; show the stored original
+            if source is not None:
+                if public:
+                    # The public variant is captured through a server rooted
+                    # at out_dir: copy the shown file INTO it so the link
+                    # resolves there (a ../variants path would 404).
+                    shown = out_dir / "img" / f"{asset.uid}{Path(source).suffix}"
+                    shown.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, shown)
+                    rel = str(shown.relative_to(out_dir))
+                else:
+                    rel = os.path.relpath(source, out_dir)
                 parts.append(
                     f"<img src='{_e(rel)}' alt='{_e(asset.asset_id)} preview' loading='lazy'>"
                 )

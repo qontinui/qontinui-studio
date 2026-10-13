@@ -1,0 +1,186 @@
+{
+ "source": "qontinui-web backend/app/services/build_record_allowlist.py",
+ "commit": "f300da6cd399577b860f88f1f1cb4405022cd975",
+ "sha256": "354a745de7e643f54636b3594c1945276bcaa4d560bf06ca23baea77470c6c66",
+ "violations": {
+  "base": [],
+  "extra-root-key": [
+   "<unlisted key>: key is not in the build-record allowlist"
+  ],
+  "extra-nested-key": [
+   "product.<unlisted key>: key is not in the build-record allowlist"
+  ],
+  "extra-pr-key": [
+   "prs[0].<unlisted key>: key is not in the build-record allowlist"
+  ],
+  "bool-count": [
+   "gates.cleared: not a valid count value"
+  ],
+  "negative-count": [
+   "gates.cleared: not a valid count value"
+  ],
+  "negative-ci": [
+   "prs[0].ci_duration_secs: not a valid count value"
+  ],
+  "float-count": [
+   "wall_clock_secs: not a valid count value"
+  ],
+  "string-number": [
+   "prs[0].number: not a valid count value"
+  ],
+  "bad-status": [
+   "work_units[0].status: not a valid status value"
+  ],
+  "null-to-status": [
+   "timeline[0].to_status: not a valid status value"
+  ],
+  "bad-timestamp-shape": [
+   "generated_at: not a valid timestamp value"
+  ],
+  "bad-timestamp-value": [
+   "generated_at: not a valid timestamp value"
+  ],
+  "bad-landed": [
+   "prs[0].landed_at: not a valid timestamp_or_null value"
+  ],
+  "bad-repo": [
+   "product.repos[0]: not a valid repo value",
+   "prs[0].repo: names an owner/name not in product.repos",
+   "prs[0].repo: not one of product.repos, so not known public"
+  ],
+  "bad-slug": [
+   "product.slug: not a valid slug value"
+  ],
+  "free-text-unknown": [
+   "unknowns[0]: not a valid unknown value"
+  ],
+  "unknown-bad-path": [
+   "unknowns[0]: not a valid unknown value"
+  ],
+  "free-text-session-reason": [
+   "sessions.unknown_reason: not a valid unknown_or_null value"
+  ],
+  "private-repo-in-title": [
+   "work_units[0].title: names an owner/name not in product.repos"
+  ],
+  "email-in-title": [
+   "work_units[0].title: contains an email-shaped identity"
+  ],
+  "user-at-host": [
+   "work_units[0].title: contains an email-shaped identity"
+  ],
+  "uuid-in-title": [
+   "prs[0].title: contains a UUID-shaped identifier"
+  ],
+  "hex32-in-title": [
+   "prs[0].title: contains a UUID-shaped identifier"
+  ],
+  "hex40-ok": [],
+  "division-slash": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "fraction-slash": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "fullwidth": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "spaced-slash": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "zwsp": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "soft-hyphen": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "word-joiner": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "overlay-solidus": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "cgj": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "vs16": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "hangul-filler": [
+   "prs[0].title: contains an invisible, control or overlay character"
+  ],
+  "rising-diagonal": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "cyrillic-confusable": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "ci-cd-false-positive": [
+   "prs[0].title: names an owner/name not in product.repos"
+  ],
+  "dates-ok": [],
+  "private-pr-repo": [
+   "prs[0].repo: names an owner/name not in product.repos",
+   "prs[0].repo: not one of product.repos, so not known public"
+  ],
+  "plan-stem-ok": [],
+  "hex32-slug": [
+   "work_units[0].slug: contains a UUID-shaped identifier"
+  ],
+  "null-title-ok": [],
+  "schema-v2": [
+   "schema: not a valid schema value"
+  ],
+  "title-512-ok": [],
+  "title-513": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "title-600": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "spaces-20k": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "spaces-100k": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "local-part-40k": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "spaced-slashes-500": [],
+  "at-run-500": [
+   "prs[0].title: contains an email-shaped identity"
+  ],
+  "nfkd-one-fdfa": [],
+  "nfkd-two-fdfa": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "nfkd-ligatures-300": [
+   "prs[0].title: longer than 512 characters"
+  ],
+  "nfkd-ligatures-200": [],
+  "nfkd-accents-ok": [],
+  "missing-schema": [
+   "schema: required, must be 'build-record/1'"
+  ],
+  "indexed-unknown-ok": [],
+  "not-an-object": [
+   "<root>: expected an object, got list"
+  ],
+  "document-over-256kib": [
+   "<root>: larger than 262144 bytes serialized"
+  ],
+  "document-at-256kib": [],
+  "document-under-256kib": [],
+  "excluded-named": [
+   "prs[0].title: names a repo excluded as not known public"
+  ],
+  "excluded-fullwidth": [
+   "prs[0].title: names a repo excluded as not known public"
+  ],
+  "excluded-substring-ok": [],
+  "excluded-many": [
+   "prs[0].title: names a repo excluded as not known public"
+  ]
+ }
+}

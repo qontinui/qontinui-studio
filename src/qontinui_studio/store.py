@@ -145,6 +145,40 @@ CREATE TABLE IF NOT EXISTS publications (
     -- batch restores this publication.
     superseded_by TEXT
 );
+
+-- Launch bundles (plan Phase 3). A launch is assembled, then published or
+-- refused by the D7 gates, and can be unpublished in one step.
+CREATE TABLE IF NOT EXISTS launches (
+    id TEXT PRIMARY KEY,
+    product_slug TEXT NOT NULL,
+    product_path TEXT NOT NULL,
+    bundle_dir TEXT NOT NULL,
+    record_sha256 TEXT,
+    status TEXT NOT NULL
+        CHECK (status IN ('assembled', 'publishing', 'published', 'refused', 'unpublished')),
+    -- Why a launch was refused or rolled back (NULL otherwise).
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    publish_dir TEXT,
+    published_files TEXT,
+    published_at TEXT,
+    unpublished_at TEXT,
+    -- The launch that replaced this one in the same publish dir, if any.
+    superseded_by TEXT REFERENCES launches(id),
+    -- Set once the published notice went out; recovery re-sends when NULL.
+    notified_at TEXT,
+    -- Operator-only notes from assembly (JSON list): never in a published file.
+    operator_notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS launch_gate_results (
+    launch_id TEXT NOT NULL REFERENCES launches(id),
+    gate TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('pass', 'fail', 'not_configured')),
+    detail TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL
+);
 """
 
 

@@ -4,8 +4,15 @@ Each gate is a pure function over the library records and the site config,
 returning a :class:`GateResult`. A batch publishes only when no gate fails
 (D7: automated gates decide publication; the operator is notified, not asked).
 
-D3 (the build-record export allowlist) is a gate on the FACTORY's export
-(Phase 1, qontinui-coord) and has no subject in this repo.
+D3 (the build-record export allowlist) is enforced by the factory's export
+(Phase 1, qontinui-coord + qontinui-web) and again by the launch kit before it
+renders or publishes a bundle (``launch/allowlist.py``, ``launch/publish.py``).
+
+The D7 functions come in two layers: a target-neutral core over a
+:class:`PreviewSpec` (``page_health_gate``, ``preview_page_gates``,
+``images_gate``, ``preview_images_settled``, ``preview_manifest_gate``),
+shared by sites and launch bundles, and the site wrappers (``d7_*``,
+``images_settled``) the asset pipeline calls — same rules, same messages.
 """
 
 from __future__ import annotations
@@ -77,7 +84,13 @@ def d5_provenance(asset: AssetRecord, variant: VariantRecord) -> GateResult:
 
 def d5_licence(asset: AssetRecord, variant: VariantRecord, site: Site) -> GateResult:
     """Refuse an unreviewed licence anywhere, and a non-commercial one on a commercial site."""
-    subject = _subject(asset, variant)
+    return licence_verdict(asset, _subject(asset, variant), site.commercial, f"site '{site.id}'")
+
+
+def licence_verdict(asset: AssetRecord, subject: str, commercial: bool, target: str) -> GateResult:
+    """The D5 licence rule for any publication target (a site, a launch bundle):
+    an unreviewed or unknown licence is refused everywhere, a non-commercial one
+    on a commercial target."""
     if asset.licence_tos_reviewed is None:
         return GateResult(
             "d5_licence",
@@ -92,13 +105,13 @@ def d5_licence(asset: AssetRecord, variant: VariantRecord, site: Site) -> GateRe
             "fail",
             f"{asset.provider}: commercial terms unknown (unreviewed)",
         )
-    if site.commercial and asset.licence_commercial_use != "yes":
+    if commercial and asset.licence_commercial_use != "yes":
         return GateResult(
             "d5_licence",
             subject,
             "fail",
             f"{asset.provider}: commercial_use is '{asset.licence_commercial_use}' "
-            f"but site '{site.id}' is commercial",
+            f"but {target} is commercial",
         )
     return GateResult(
         "d5_licence",
@@ -171,16 +184,25 @@ def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) 
     REFUSES publication. There is no waiver (plan D7). In the publish path this
     runs inside :func:`d7_preview_page`, after the bridged page was navigated to
     this batch's preview."""
-    subject = f"site {site.id}"
-    if not site.ui_bridge_url:
-        return GateResult(
-            "d7_page_health",
-            subject,
-            "not_configured",
-            "site declares no UI Bridge preview; D7 page health is required — refused",
-        )
+    return page_health_gate(
+        f"site {site.id}",
+        site.ui_bridge_url,
+        probe,
+        "site declares no UI Bridge preview; D7 page health is required — refused",
+    )
+
+
+def page_health_gate(
+    subject: str,
+    ui_bridge_url: str | None,
+    probe: PageHealthProbe = http_page_health_probe,
+    missing: str = "no UI Bridge preview declared; D7 page health is required — refused",
+) -> GateResult:
+    """The target-neutral D7 page-health gate (a site, a launch bundle)."""
+    if not ui_bridge_url:
+        return GateResult("d7_page_health", subject, "not_configured", missing)
     try:
-        body = probe(site.ui_bridge_url.rstrip("/") + "/control/page-health")
+        body = probe(ui_bridge_url.rstrip("/") + "/control/page-health")
     except Exception as e:  # any probe failure is UNKNOWN; UNKNOWN does not publish
         return GateResult(
             "d7_page_health", subject, "fail", f"page-health probe failed: {type(e).__name__}: {e}"
@@ -281,9 +303,15 @@ def preview_target(site: Site, batch_id: str, attempt: str) -> str:
     loaded THIS attempt — a tab still showing an earlier attempt's document
     for the same batch never matches."""
     assert site.preview_url is not None
-    parts = urlsplit(site.preview_url)
-    params = urlencode({"studio_batch": batch_id, "studio_attempt": attempt})
-    query = f"{parts.query}&{params}" if parts.query else params
+    return with_query(site.preview_url, {"studio_batch": batch_id, "studio_attempt": attempt})
+
+
+def with_query(url: str, params: dict[str, str]) -> str:
+    """``url`` with ``params`` appended to its REAL query (urlsplit/urlunsplit:
+    an existing query is kept, never put inside a fragment)."""
+    parts = urlsplit(url)
+    encoded = urlencode(params)
+    query = f"{parts.query}&{encoded}" if parts.query else encoded
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
@@ -313,9 +341,14 @@ def origin(url: str) -> tuple[str, str, int | None]:
     return scheme, host, port
 
 
-def same_page(actual: str | None, target: str) -> bool:
+def same_page(
+    actual: str | None,
+    target: str,
+    params: tuple[str, ...] = ("studio_batch", "studio_attempt"),
+) -> bool:
     """Whether the bridged page's URL is ``target``: same origin and path
-    (browser-normalised) and the same ``studio_batch`` and ``studio_attempt``."""
+    (browser-normalised) and the same values for ``params`` (by default
+    ``studio_batch`` and ``studio_attempt``; a launch uses ``studio_launch``)."""
     if not actual:
         return False
     if normalise_url(actual) != normalise_url(target):
@@ -324,7 +357,7 @@ def same_page(actual: str | None, target: str) -> bool:
     if a.fragment != t.fragment:
         return False
     got, want = parse_qs(a.query), parse_qs(t.query)
-    return all(got.get(k) == want.get(k) for k in ("studio_batch", "studio_attempt"))
+    return all(got.get(k) == want.get(k) for k in params)
 
 
 def _current_url(snapshot: dict[str, Any]) -> str | None:
@@ -365,31 +398,74 @@ NO_MEDIA = (
 )
 
 
+@dataclass(frozen=True)
+class PreviewSpec:
+    """What the target-neutral D7 core needs to know about a preview: a site's
+    (built by :func:`site_preview`) or a launch bundle's.
+
+    Groups are slots (a site) or bundle images (a launch); each group's
+    elements carry ``data-media-id`` ``studio-picture-<group>`` /
+    ``studio-img-<group>``. ``files`` keys are file names (a site) or
+    preview-relative paths (a launch bundle); either way the preview serves
+    each one at ``urljoin(preview_manifest_url, key)``."""
+
+    subject: str
+    preview_url: str
+    preview_manifest_url: str | None
+    # Groups not shown on the page (og:image-like): fetch-checked instead.
+    unrendered: frozenset[str] = frozenset()
+    # The query parameters that must match between the target and the page.
+    params: tuple[str, ...] = ("studio_batch", "studio_attempt")
+
+
+def site_preview(site: Site) -> PreviewSpec:
+    assert site.preview_url is not None
+    return PreviewSpec(
+        subject=f"site {site.id}",
+        preview_url=site.preview_url,
+        preview_manifest_url=site.preview_manifest_url,
+        unrendered=frozenset(name for name, slot in site.slots.items() if not slot.rendered),
+    )
+
+
 def expected_file_url(site: Site, name: str) -> str:
     """Where the preview serves a slot file: beside the manifest, since both
     live in ``preview_dir``."""
-    base = site.preview_manifest_url or site.preview_url
-    assert base is not None
-    return urljoin(base, name)
+    return expected_url(site_preview(site), name)
 
 
-def _file_at(site: Site, url: str, files: dict[str, str]) -> str | None:
-    """The slot file ``url`` (already absolute) points at, matching scheme,
-    host, port and the FULL path against where the preview serves it — never
-    just the basename — or None."""
+def expected_url(spec: PreviewSpec, name: str) -> str:
+    """The target-neutral :func:`expected_file_url`."""
+    return urljoin(spec.preview_manifest_url or spec.preview_url, name)
+
+
+def _file_at(spec: PreviewSpec, url: str, files: dict[str, str]) -> str | None:
+    """The file ``url`` (already absolute) points at, matching scheme, host,
+    port and the FULL path against where the preview serves it — never just
+    the basename — or None."""
     for name in files:
-        if normalise_url(url) == normalise_url(expected_file_url(site, name)):
+        if normalise_url(url) == normalise_url(expected_url(spec, name)):
             return name
     return None
 
 
+def _names_a_file(url: str, files: dict[str, str]) -> bool:
+    """Whether a URL's file name is one of ``files``' (by basename) — a
+    candidate that must then match its full preview URL exactly."""
+    leaf = PurePosixPath(urlparse(url).path).name
+    return any(PurePosixPath(name).name == leaf for name in files)
+
+
 def _slot_elements(
-    site: Site, page_url: str, media: dict[str, dict[str, Any]], slot: str, files: dict[str, str]
+    spec: PreviewSpec,
+    page_url: str,
+    media: dict[str, dict[str, Any]],
+    slot: str,
+    files: dict[str, str],
 ) -> tuple[list[tuple[str, dict[str, Any], str | None, list[str] | None]], list[str]]:
     """The slot's elements, found by ``data-media-id``: (id, metadata, file
     name or None when the source is not exactly one of the slot's preview file
     URLs, ?sha= values). Also returns the problems seen while matching."""
-    assert site.preview_url is not None
     picture_id, img_id = slot_media_ids(slot)
     found: list[tuple[str, dict[str, Any], str | None, list[str] | None]] = []
     problems: list[str] = []
@@ -406,9 +482,9 @@ def _slot_elements(
             found.append((mid, meta, None, None))
             continue
         src = urljoin(page_url, src_raw)
-        name = _file_at(site, src, files)
+        name = _file_at(spec, src, files)
         if name is None:
-            expected = ", ".join(expected_file_url(site, n) for n in sorted(files))
+            expected = ", ".join(expected_url(spec, n) for n in sorted(files))
             problems.append(
                 f"slot '{slot}' element '{mid}' shows {src}, which is not one of the slot's "
                 f"preview files ({expected})"
@@ -445,12 +521,19 @@ def images_settled(
     change the verdict."""
     if not site.preview_url:
         return True
-    page_url = _current_url(snapshot) or site.preview_url
+    return preview_images_settled(site_preview(site), snapshot, slot_files)
+
+
+def preview_images_settled(
+    spec: PreviewSpec, snapshot: dict[str, Any], groups: dict[str, dict[str, str]]
+) -> bool:
+    """The target-neutral :func:`images_settled`."""
+    page_url = _current_url(snapshot) or spec.preview_url
     media = _media(snapshot)
-    for slot, files in slot_files.items():
-        if not site.slots[slot].rendered:
+    for slot, files in groups.items():
+        if slot in spec.unrendered:
             continue
-        found, _ = _slot_elements(site, page_url, media, slot, files)
+        found, _ = _slot_elements(spec, page_url, media, slot, files)
         # Settled only once some element actually shows one of the slot's
         # files and none is still loading; a src-less element never settles.
         if not any(name is not None for _, _, name, _ in found):
@@ -471,9 +554,9 @@ def _hash_check(slot: str, url: str, sha: str, fetch: Callable[[str], bytes]) ->
 
 
 def _fetch_check(
-    site: Site, slot: str, name: str, sha: str, fetch: Callable[[str], bytes]
+    spec: PreviewSpec, slot: str, name: str, sha: str, fetch: Callable[[str], bytes]
 ) -> str | None:
-    return _hash_check(slot, expected_file_url(site, name), sha, fetch)
+    return _hash_check(slot, expected_url(spec, name), sha, fetch)
 
 
 def d7_images(
@@ -499,18 +582,30 @@ def d7_images(
 
     A slot declared ``rendered: false`` (meta only, e.g. ``og:image``) is
     verified by fetching every file."""
-    subject = f"site {site.id}"
     if not site.preview_url:
-        return GateResult("d7_images", subject, "not_configured", "site declares no preview_url")
-    page_url = _current_url(snapshot) or site.preview_url
+        return GateResult(
+            "d7_images", f"site {site.id}", "not_configured", "site declares no preview_url"
+        )
+    return images_gate(site_preview(site), snapshot, slot_files, fetch)
+
+
+def images_gate(
+    spec: PreviewSpec,
+    snapshot: dict[str, Any],
+    slot_files: dict[str, dict[str, str]],
+    fetch: Callable[[str], bytes],
+) -> GateResult:
+    """The target-neutral :func:`d7_images` (same rules, any preview)."""
+    subject = spec.subject
+    page_url = _current_url(snapshot) or spec.preview_url
     media = _media(snapshot)
     problems: list[str] = []
-    if any(site.slots[slot].rendered for slot in slot_files) and not media:
+    if any(slot not in spec.unrendered for slot in slot_files) and not media:
         return GateResult("d7_images", subject, "fail", NO_MEDIA)
     for slot, files in sorted(slot_files.items()):
         to_fetch = dict(files)
-        if site.slots[slot].rendered:
-            found, matched_problems = _slot_elements(site, page_url, media, slot, files)
+        if slot not in spec.unrendered:
+            found, matched_problems = _slot_elements(spec, page_url, media, slot, files)
             problems += matched_problems
             if not found:
                 picture_id, img_id = slot_media_ids(slot)
@@ -555,9 +650,9 @@ def d7_images(
                         to_fetch.pop(name, None)
                 for url in _srcset_urls(m):
                     resolved = urljoin(page_url, url)
-                    if PurePosixPath(urlparse(resolved).path).name not in files:
+                    if not _names_a_file(resolved, files):
                         continue
-                    sname = _file_at(site, resolved, files)
+                    sname = _file_at(spec, resolved, files)
                     if sname is None:
                         problems.append(
                             f"slot '{slot}' source {resolved} is not one of the slot's preview files"
@@ -573,7 +668,7 @@ def d7_images(
                 )
                 continue
         for name, sha in sorted(to_fetch.items()):
-            problem = _fetch_check(site, slot, name, sha, fetch)
+            problem = _fetch_check(spec, slot, name, sha, fetch)
             if problem:
                 problems.append(problem)
     if problems:
@@ -600,10 +695,43 @@ def d7_preview_page(
     (browser-normalised; a bridge error while the tab re-registers is retried
     until the deadline), require its origin to be the preview's, run page
     health, confirm the page did not move, and verify every changed slot."""
-    subject = f"site {site.id}"
     if not (site.ui_bridge_url and site.preview_url):
         return [d7_page_health(site)]
-    target = preview_target(site, batch_id, uuid.uuid4().hex)
+    return preview_page_gates(
+        site_preview(site),
+        site.ui_bridge_url,
+        preview_target(site, batch_id, uuid.uuid4().hex),
+        slot_files,
+        bridge_factory,
+        fetch,
+        what="this batch's preview",
+        deadline_s=deadline_s,
+        poll_s=poll_s,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+
+
+def preview_page_gates(
+    spec: PreviewSpec,
+    ui_bridge_url: str,
+    target: str,
+    slot_files: dict[str, dict[str, str]],
+    bridge_factory: BridgeFactory,
+    fetch: Callable[[str], bytes],
+    *,
+    what: str = "the preview",
+    deadline_s: float = 30.0,
+    poll_s: float = 0.5,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> list[GateResult]:
+    """The target-neutral :func:`d7_preview_page`: navigate the bridge to
+    ``target`` (which carries a fresh attempt token), poll until the page
+    reports it (browser-normalised, every ``spec.params`` equal, the preview's
+    origin), page health, then poll until the images settle (the page must not
+    move) and run :func:`images_gate`."""
+    subject = spec.subject
     stop = monotonic() + deadline_s
     bridge: UiBridge | None = None
     navigated = False
@@ -613,13 +741,13 @@ def d7_preview_page(
     while True:
         try:
             if bridge is None:
-                bridge = bridge_factory(site.ui_bridge_url)
+                bridge = bridge_factory(ui_bridge_url)
             if not navigated:
                 bridge.navigate(target, hard=True)
                 navigated = True
             snap = bridge.snapshot()
             seen = _current_url(snap)
-            if same_page(seen, target):
+            if same_page(seen, target, spec.params):
                 before = snap
                 break
         except Exception as e:  # e.g. the tab is re-registering after navigation
@@ -629,7 +757,7 @@ def d7_preview_page(
         sleep(poll_s)
     if before is None or bridge is None:
         why = (
-            f"bridged page is at {seen!r}, not this batch's preview {target!r}"
+            f"bridged page is at {seen!r}, not {what} {target!r}"
             if seen is not None or not last_error
             else f"bridge unavailable: {last_error}"
         )
@@ -637,7 +765,7 @@ def d7_preview_page(
             why += f" (origin {origin(seen)} is not the preview origin {origin(target)})"
         return [GateResult("d7_navigate", subject, "fail", f"{why} after {deadline_s:.0f}s")]
     results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {seen}")]
-    results.append(d7_page_health(site, lambda _url: bridge.page_health()))
+    results.append(page_health_gate(subject, ui_bridge_url, lambda _url: bridge.page_health()))
     # Poll until every changed slot's image has settled (loaded or failed),
     # within the remaining deadline; the page must not move meanwhile.
     after: dict[str, Any] | None = None
@@ -647,7 +775,7 @@ def d7_preview_page(
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
         else:
-            if not same_page(_current_url(snap), target):
+            if not same_page(_current_url(snap), target, spec.params):
                 results.append(
                     GateResult(
                         "d7_navigate",
@@ -658,7 +786,7 @@ def d7_preview_page(
                 )
                 return results
             after = snap
-            if images_settled(site, snap, slot_files):
+            if preview_images_settled(spec, snap, slot_files):
                 break
         if monotonic() >= stop:
             break
@@ -668,7 +796,7 @@ def d7_preview_page(
             GateResult("d7_navigate", subject, "fail", f"bridge unavailable: {last_error}")
         )
         return results
-    results.append(d7_images(site, after, slot_files, fetch))
+    results.append(images_gate(spec, after, slot_files, fetch))
     return results
 
 
@@ -686,13 +814,30 @@ def d7_preview_manifest(
 ) -> GateResult:
     """Confirm the preview the page-health probe will look at is actually
     serving THIS batch: the manifest it serves must hash to the one just written."""
-    subject = f"site {site.id}"
-    if not site.preview_manifest_url:
-        return GateResult(
-            "d7_preview", subject, "not_configured", "site declares no preview_manifest_url"
-        )
+    return preview_manifest_gate(
+        f"site {site.id}",
+        site.preview_manifest_url,
+        expected_sha256,
+        fetch,
+        "this batch's",
+        "site declares no preview_manifest_url",
+    )
+
+
+def preview_manifest_gate(
+    subject: str,
+    preview_manifest_url: str | None,
+    expected_sha256: str,
+    fetch: ManifestFetch = http_manifest_fetch,
+    what: str = "this batch's",
+    missing: str = "no preview_manifest_url declared; D7 is required — refused",
+) -> GateResult:
+    """The target-neutral preview-identity gate: the manifest the preview
+    serves must hash to the one just staged."""
+    if not preview_manifest_url:
+        return GateResult("d7_preview", subject, "not_configured", missing)
     try:
-        served = fetch(site.preview_manifest_url)
+        served = fetch(preview_manifest_url)
     except Exception as e:  # an unreachable preview is a refusal
         return GateResult(
             "d7_preview", subject, "fail", f"preview manifest fetch failed: {type(e).__name__}: {e}"
@@ -703,6 +848,6 @@ def d7_preview_manifest(
             "d7_preview",
             subject,
             "fail",
-            f"preview serves manifest {digest[:12]}, not this batch's {expected_sha256[:12]}",
+            f"preview serves manifest {digest[:12]}, not {what} {expected_sha256[:12]}",
         )
     return GateResult("d7_preview", subject, "pass", f"preview serves manifest {digest[:12]}")

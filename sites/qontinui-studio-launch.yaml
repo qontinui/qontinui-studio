@@ -1,0 +1,23 @@
+# Decorative slots for qontinui-studio's own launch bundle (plan Phase 3). The
+# launch kit reads what the Phase 2 gates published here; nothing is required.
+id: qontinui-studio-launch
+name: qontinui-studio launch
+kind: product
+commercial: false
+# D7 is never waived. This site declares no D7 preview (ui_bridge_url +
+# preview_url + preview_dir + preview_manifest_url) until the launch page is
+# hosted, so the Phase 2 gates REFUSE to publish decoration here
+# (d7_page_health not_configured) and the launch kit assembles without it, as
+# D1 allows.
+publish_dir: ../.studio/sites/qontinui-studio-launch
+slots:
+  hero:
+    width: 1600
+    height: 900
+    category: decorative
+    formats: [png, webp]
+  broll-1:
+    width: 1280
+    height: 720
+    category: decorative
+    formats: [png]

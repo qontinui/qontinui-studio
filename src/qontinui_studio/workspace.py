@@ -1,8 +1,10 @@
 """Where a studio's config and state live, relative to one root directory.
 
-``<root>/providers.yaml``, ``<root>/sites/*.yaml`` and ``<root>/briefs/*.yaml``
+``<root>/providers.yaml``, ``<root>/sites/*.yaml``, ``<root>/briefs/*.yaml`` and
+``<root>/products/*.yaml``
 are tracked config. ``<root>/.studio/`` is local state (gitignored): the SQLite
-file, raw downloads, processed variants, notices and the review page.
+file, raw downloads, processed variants, notices, the review page and
+assembled launch bundles.
 """
 
 from __future__ import annotations
@@ -50,3 +52,11 @@ class Workspace:
     @property
     def review_dir(self) -> Path:
         return self.state_dir / "review"
+
+    @property
+    def products_dir(self) -> Path:
+        return self.root / "products"
+
+    @property
+    def launches_dir(self) -> Path:
+        return self.state_dir / "launches"

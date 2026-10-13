@@ -101,16 +101,16 @@ def sha256_file(path: Path) -> str:
 # ---- ffmpeg -----------------------------------------------------------------
 
 
-def _ffmpeg() -> str:
+def ffmpeg_exe() -> str:
     exe = shutil.which("ffmpeg")
     if exe is None:
         raise FfmpegUnavailable("ffmpeg is not on PATH (apt install ffmpeg)")
     return exe
 
 
-def _run_ffmpeg(args: list[str]) -> None:
+def run_ffmpeg(args: list[str]) -> None:
     proc = subprocess.run(
-        [_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", *args],
+        [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y", *args],
         capture_output=True,
         text=True,
         check=False,
@@ -119,7 +119,7 @@ def _run_ffmpeg(args: list[str]) -> None:
         raise FfmpegFailed(f"ffmpeg exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
 
 
-def _ff(path: Path) -> str:
+def ffmpeg_path(path: Path) -> str:
     """An ffmpeg URL for a local file: ``file:`` + the resolved path, so a name
     starting with ``-`` or containing ``:`` is never read as an option or protocol."""
     return "file:" + str(path.resolve())
@@ -130,7 +130,18 @@ def trim(src: Path, dest: Path, start_s: float, duration_s: float) -> Path:
     if duration_s <= 0 or start_s < 0:
         raise ValueError("trim needs start >= 0 and duration > 0")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(["-ss", f"{start_s}", "-i", _ff(src), "-t", f"{duration_s}", "-an", _ff(dest)])
+    run_ffmpeg(
+        [
+            "-ss",
+            f"{start_s}",
+            "-i",
+            ffmpeg_path(src),
+            "-t",
+            f"{duration_s}",
+            "-an",
+            ffmpeg_path(dest),
+        ]
+    )
     return dest
 
 
@@ -139,22 +150,22 @@ def loop(src: Path, dest: Path, count: int) -> Path:
     if count < 1:
         raise ValueError("loop count must be >= 1")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(["-stream_loop", str(count - 1), "-i", _ff(src), "-an", _ff(dest)])
+    run_ffmpeg(["-stream_loop", str(count - 1), "-i", ffmpeg_path(src), "-an", ffmpeg_path(dest)])
     return dest
 
 
 def boomerang(src: Path, dest: Path) -> Path:
     """A seamless loop: the clip forwards then reversed."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(
+    run_ffmpeg(
         [
             "-i",
-            _ff(src),
+            ffmpeg_path(src),
             "-filter_complex",
             "[0:v]reverse[r];[0:v][r]concat=n=2:v=1:a=0[v]",
             "-map",
             "[v]",
-            _ff(dest),
+            ffmpeg_path(dest),
         ]
     )
     return dest

@@ -1,0 +1,15 @@
+# Walkthrough of qontinui-studio's running UI (its review page).
+viewport: {width: 1280, height: 720}
+steps:
+  - navigate: /
+  - wait: {selector: "h1"}
+  - screenshot:
+      name: review
+      caption: "The review page: every batch, the gates that judged it, and its one-step unpublish"
+      hold: 4
+  - wait: {ms: 400}
+  - screenshot:
+      name: review-full
+      caption: "The whole review page"
+      full_page: true
+      hold: 4
