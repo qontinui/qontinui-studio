@@ -111,7 +111,18 @@ def build_review_page(
             parts.append("<div class='asset'>")
             source = preview.path if preview is not None else None
             if source is None and asset.origin == "imported":
-                source = asset.raw_path  # an import has no variants; show the stored original
+                # An import has no variants: show the stored original - but on
+                # the PUBLIC page (captured into launch screenshots) only when
+                # its commercial use is cleared, the same bar D5 applies to a
+                # commercial site. A third party's non-commercial or unreviewed
+                # image never reaches a public capture.
+                if public and asset.licence_commercial_use != "yes":
+                    parts.append(
+                        "<p>Imported original not shown on the public page: "
+                        "commercial use not cleared.</p>"
+                    )
+                else:
+                    source = asset.raw_path
             if source is not None:
                 if public:
                     # The public variant is captured through a server rooted

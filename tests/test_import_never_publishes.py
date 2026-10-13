@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -19,7 +20,7 @@ from qontinui_studio.store import connect
 from qontinui_studio.workspace import Workspace
 
 from .conftest import FakeClock
-from .library_support import do_import, make_inbox
+from .library_support import do_import, entry, make_inbox
 
 BATCH = "import:inbox-1"
 
@@ -126,3 +127,37 @@ def test_review_page_shows_an_import_without_a_regenerate_command(
     assert "import:inbox-1 — imported" in text
     assert "an import is never published" in text
     assert "brief run None" not in text and "approval" in text
+
+
+def _public_page(studio_root: Path, clock: FakeClock) -> tuple[str, Path]:
+    ws = Workspace(studio_root)
+    page = build_review_page(
+        connect(ws.db_path), ws.review_dir, clock(), root=studio_root, public=True
+    )
+    return page.read_text(), ws.review_dir
+
+
+def test_public_page_shows_a_cleared_import_by_a_relative_copy(
+    studio_root: Path, tmp_path: Path, clock: FakeClock
+) -> None:
+    do_import(studio_root, make_inbox(tmp_path / "inbox"), clock)
+    text, out_dir = _public_page(studio_root, clock)
+    srcs = re.findall(r"<img src='([^']+)'", text)
+    assert srcs, "a commercially cleared import is shown"
+    for src in srcs:
+        assert not src.startswith("/") and ".." not in src
+        assert (out_dir / src).is_file()
+    for local in (str(studio_root), str(studio_root.resolve()), str(Path.home())):
+        assert local not in text
+
+
+@pytest.mark.parametrize("commercial_use", ["no", "unknown"])
+def test_public_page_never_shows_an_uncleared_import(
+    studio_root: Path, tmp_path: Path, clock: FakeClock, commercial_use: str
+) -> None:
+    inbox = make_inbox(tmp_path / "inbox", [entry(commercial_use=commercial_use)])
+    do_import(studio_root, inbox, clock)
+    text, out_dir = _public_page(studio_root, clock)
+    assert re.findall(r"<img src='([^']+)'", text) == []
+    assert "commercial use not cleared" in text
+    assert not (out_dir / "img").exists() or not any((out_dir / "img").iterdir())
