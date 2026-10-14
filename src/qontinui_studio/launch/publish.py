@@ -321,7 +321,12 @@ def gate_decor(
         if rejected is not None:
             # The bundle was assembled before the rejection, or edited after.
             out.append(
-                GateResult("library_approval", subject, "fail", f"{rejected}; do not use it")
+                GateResult(
+                    "library_approval",
+                    subject,
+                    "fail",
+                    f"{rejected}; re-run the launch kit to assemble a bundle without it",
+                )
             )
             continue
         digest = sha256_file(bundle / rel) if (bundle / rel).is_file() else None

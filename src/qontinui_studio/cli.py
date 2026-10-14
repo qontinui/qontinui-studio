@@ -34,7 +34,7 @@ from qontinui_studio.launch.publish import (
 from qontinui_studio.launch.record import WEB_BASE, BuildRecordClient, NoBuildRecord
 from qontinui_studio.launch.trigger import TriggerError, register_trigger
 from qontinui_studio.launch.video import FileReplaySegment
-from qontinui_studio.library import APPROVAL_STATUSES, Library, export_yaml
+from qontinui_studio.library import APPROVAL_STATUSES, ORIGINS, Library, export_yaml
 from qontinui_studio.notify import COORD_BASE, CoordFindingNotifier, FileNotifier
 from qontinui_studio.pipeline import BatchOutcome, Context, resume_all, run_brief
 from qontinui_studio.providers import load_providers
@@ -237,7 +237,7 @@ def library() -> None:
 )
 @click.option(
     "--origin",
-    type=click.Choice(["generated", "imported"]),
+    type=click.Choice(ORIGINS),
     default=None,
     help="Only generated or only imported assets.",
 )

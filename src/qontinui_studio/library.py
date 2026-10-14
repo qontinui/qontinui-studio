@@ -63,6 +63,7 @@ class TermsSnapshot:
 END_OF_STRING = r"(?![\s\S])"
 ALIAS_PATTERN = r"^[A-Za-z0-9._-]+" + END_OF_STRING
 APPROVAL_STATUSES = ("candidate", "approved", "rejected")
+ORIGINS = ("generated", "imported")  # the CHECK on assets.origin (store.py)
 MIMES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 
 

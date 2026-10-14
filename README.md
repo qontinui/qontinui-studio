@@ -370,10 +370,12 @@ consumers, not a publish gate**: generated batches still publish on the
 automated D5/D6/D7 gates alone, with the operator notified rather than asked
 (D7). Generated assets start as `candidate`.
 
-A **rejection** binds every consumer. The launch kit leaves a rejected asset
-out of a bundle and says so in an operator note (decoration is optional), and
-its publish refuses a bundle that still carries one (gate `library_approval`),
-for example one assembled before the rejection. `candidate` assets stay usable.
+A **rejection** binds the launch kit: it leaves a rejected asset out of a new
+bundle and says so in an operator note (decoration is optional), and its
+publish refuses a bundle that still carries one (gate `library_approval`), for
+example one assembled before the rejection. `candidate` assets stay usable. A
+rejection withdraws nothing already live: unpublish the batch or launch for
+that. External consumers are expected to filter with `--status`.
 `studio library list --status approved|candidate|rejected` (repeatable) and
 `--origin generated|imported` narrow the listing; with `--json` that is what a
 consumer project reads to pick assets.
@@ -476,7 +478,8 @@ launched in one step:
    and assembles without a capture.
 3. **Decoration (optional).** The product's brief runs through the Phase 2 path
    (brief, scheduler, library, D5/D6/D7 gates) onto its `assets_site`. The kit
-   reads only what those gates published. None of it is required; every failure
+   reads only what those gates published, minus any asset rejected in the
+   library, which is skipped with a note. None of it is required; every failure
    becomes a note in the bundle.
 4. **Bundle.** The bundle is a static directory with these files:
    - `index.html`: the landing page, with OG meta;
@@ -545,6 +548,8 @@ launched in one step:
      Assembly notes and capture URLs are operator-only. They are kept in the
      launch row and the notice, never in the manifest;
    - `d5_provenance` and `d5_licence`, run per decorative image;
+   - `library_approval`, run per decorative image: refuses an asset rejected in
+     the library after the bundle was assembled (re-run the kit to drop it);
    - `d6`;
    - `footer`, which checks that every page links "Built by the Qontinui software
      factory" to the public build record;

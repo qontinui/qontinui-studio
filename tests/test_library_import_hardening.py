@@ -701,14 +701,16 @@ def test_sweep_that_cannot_list_staging_warns_and_closes_its_descriptor(
 ) -> None:
     """A staging directory the sweep cannot list skips the sweep with a
     warning: the import still succeeds and no descriptor is leaked."""
+    # inbox_mod.os IS the os module, so these patches are process-wide for the
+    # test; each one therefore acts only on the staging parent's descriptor.
     real_scandir = os.scandir
+    opened: list[int] = []
 
     def refusing(path: Any = ".") -> Any:
-        if isinstance(path, int) or str(path).endswith(".staging"):
+        if path in opened:
             raise PermissionError(errno.EACCES, "denied")
         return real_scandir(path)
 
-    opened: list[int] = []
     closed: list[int] = []
     real_open, real_close = os.open, os.close
 
