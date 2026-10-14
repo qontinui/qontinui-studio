@@ -10,10 +10,14 @@ name: scenes
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "scenes/**"
-      - ".github/workflows/scenes.yml"
+    branches:
+      - main
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+    # No paths filter on push: a candidate ref is diffed against its own
+    # previous state, not main, so a filter can silently skip the checks
+    # coord's merge engine is waiting on.
   pull_request:
     paths:
       - "scenes/**"
@@ -24,7 +28,9 @@ permissions:
 
 concurrency:
   group: scenes-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs are cancelled by a newer push; main and merge-candidate
+  # runs are what coord's merge engine reads.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
