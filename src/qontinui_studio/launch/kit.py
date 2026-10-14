@@ -32,6 +32,7 @@ from qontinui_studio.launch.record import (
     load_record_file,
 )
 from qontinui_studio.launch.video import ReplaySegment
+from qontinui_studio.library import Library
 from qontinui_studio.pipeline import Context
 from qontinui_studio.review import build_review_page
 
@@ -168,7 +169,7 @@ def run_kit(
     notes: list[str] = []
     if options.generate_decor and product.brief is not None:
         notes += decor.generate(ctx, product)
-    decor_outcome = decor.collect(product, ctx.sites)
+    decor_outcome = decor.collect(product, ctx.sites, Library(ctx.conn))
     decor_outcome.notes[:0] = notes
 
     launch_id = new_launch_id(ctx, product.slug)

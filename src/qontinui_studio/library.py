@@ -313,6 +313,21 @@ class Library:
             raise
         return self.asset(uid), True
 
+    def rejection(self, uid: str) -> str | None:
+        """Why a consumer must not use asset ``uid``, or None. Only an explicit
+        rejection counts: approval is library metadata, never a publish gate
+        (D7), so a ``candidate`` asset stays usable. An unknown uid is None
+        here; the D5 provenance gate is what refuses it."""
+        row = self.conn.execute(
+            "SELECT approval_status, approval_by, approval_on FROM assets WHERE uid = ?", (uid,)
+        ).fetchone()
+        if row is None or row["approval_status"] != "rejected":
+            return None
+        return (
+            f"asset {uid} was rejected in the library by {row['approval_by']} "
+            f"on {row['approval_on']}"
+        )
+
     def asset(self, uid: str) -> AssetRecord:
         row = self.conn.execute("SELECT * FROM assets WHERE uid = ?", (uid,)).fetchone()
         if row is None:

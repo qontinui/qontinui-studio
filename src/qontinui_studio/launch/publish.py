@@ -317,6 +317,13 @@ def gate_decor(
                 GateResult("d5_provenance", subject, "fail", "no library record for this asset")
             )
             continue
+        rejected = library.rejection(asset.uid)
+        if rejected is not None:
+            # The bundle was assembled before the rejection, or edited after.
+            out.append(
+                GateResult("library_approval", subject, "fail", f"{rejected}; do not use it")
+            )
+            continue
         digest = sha256_file(bundle / rel) if (bundle / rel).is_file() else None
         variant = next((v for v in library.variants(asset.uid) if v.sha256 == digest), None)
         if variant is None:

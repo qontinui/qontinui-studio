@@ -694,3 +694,38 @@ def test_r14_s4_old_dir_that_is_not_a_run_is_kept(
     _age(stg / name)
     do_import(studio_root, make_inbox(tmp_path))
     assert (stg / name / "n.txt").exists()
+
+
+def test_sweep_that_cannot_list_staging_warns_and_closes_its_descriptor(
+    studio_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staging directory the sweep cannot list skips the sweep with a
+    warning: the import still succeeds and no descriptor is leaked."""
+    real_scandir = os.scandir
+
+    def refusing(path: Any = ".") -> Any:
+        if isinstance(path, int) or str(path).endswith(".staging"):
+            raise PermissionError(errno.EACCES, "denied")
+        return real_scandir(path)
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def tracking_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path).endswith(".staging"):
+            opened.append(fd)
+        return fd
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(inbox_mod.os, "scandir", refusing)
+    monkeypatch.setattr(inbox_mod.os, "open", tracking_open)
+    monkeypatch.setattr(inbox_mod.os, "close", tracking_close)
+    outcome = do_import(studio_root, make_inbox(tmp_path))
+    assert len(outcome.imported) == 1
+    assert any("cannot be listed (EACCES)" in w for w in outcome.warnings), outcome.warnings
+    assert opened and set(opened) <= set(closed)

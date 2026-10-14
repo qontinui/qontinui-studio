@@ -18,6 +18,7 @@ from PIL import features
 
 from qontinui_studio.errors import StudioError
 from qontinui_studio.launch.product import LaunchProduct
+from qontinui_studio.library import Library
 from qontinui_studio.pipeline import Context, run_brief
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.publish import MANIFEST
@@ -64,8 +65,13 @@ def generate(ctx: Context, product: LaunchProduct) -> list[str]:
     return notes
 
 
-def collect(product: LaunchProduct, sites: dict[str, Site]) -> DecorOutcome:
-    """The assets the Phase 2 gates published on the product's assets site."""
+def collect(
+    product: LaunchProduct, sites: dict[str, Site], library: Library | None = None
+) -> DecorOutcome:
+    """The assets the Phase 2 gates published on the product's assets site.
+    With a ``library``, an asset the operator rejected (``studio library
+    reject``) is skipped with a note: publication happened on the automated
+    gates (D7), but a rejected asset is one consumers must not use."""
     out = DecorOutcome()
     if product.assets_site is None:
         out.notes.append("no assets_site configured")
@@ -111,12 +117,17 @@ def collect(product: LaunchProduct, sites: dict[str, Site]) -> DecorOutcome:
                 f"slot {slot}: no published file matching its manifest sha256 (skipped)"
             )
             continue
+        uid = str(entry.get("asset_uid") or "")
+        rejected = library.rejection(uid) if library is not None else None
+        if rejected is not None:
+            out.notes.append(f"slot {slot}: skipped, {rejected}")
+            continue
         out.assets.append(
             DecorAsset(
                 slot=slot,
                 path=chosen,
                 label=label,
-                asset_uid=str(entry.get("asset_uid") or ""),
+                asset_uid=uid,
                 batch_id=str(entry.get("batch_id") or ""),
                 provider=str(entry.get("provider") or ""),
                 model=str(entry.get("model") or ""),

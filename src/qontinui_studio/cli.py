@@ -34,7 +34,7 @@ from qontinui_studio.launch.publish import (
 from qontinui_studio.launch.record import WEB_BASE, BuildRecordClient, NoBuildRecord
 from qontinui_studio.launch.trigger import TriggerError, register_trigger
 from qontinui_studio.launch.video import FileReplaySegment
-from qontinui_studio.library import Library, export_yaml
+from qontinui_studio.library import APPROVAL_STATUSES, Library, export_yaml
 from qontinui_studio.notify import COORD_BASE, CoordFindingNotifier, FileNotifier
 from qontinui_studio.pipeline import BatchOutcome, Context, resume_all, run_brief
 from qontinui_studio.providers import load_providers
@@ -228,12 +228,34 @@ def library() -> None:
 
 @library.command("list")
 @click.option("--batch", "batch_id", default=None)
+@click.option(
+    "--status",
+    "statuses",
+    multiple=True,
+    type=click.Choice(APPROVAL_STATUSES),
+    help="Only assets with this approval status (repeatable).",
+)
+@click.option(
+    "--origin",
+    type=click.Choice(["generated", "imported"]),
+    default=None,
+    help="Only generated or only imported assets.",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def library_list(obj: Obj, batch_id: str | None, as_json: bool) -> None:
+def library_list(
+    obj: Obj, batch_id: str | None, statuses: tuple[str, ...], origin: str | None, as_json: bool
+) -> None:
+    """List library assets; filters combine (e.g. ``--status approved --json``
+    is what a consumer project may use)."""
     ws = Workspace(obj.root)
     lib = Library(connect(ws.db_path))
-    assets = lib.assets(batch_id)
+    assets = [
+        a
+        for a in lib.assets(batch_id)
+        if (not statuses or a.approval_status in statuses)
+        and (origin is None or a.origin == origin)
+    ]
     if as_json:
         click.echo(
             json.dumps(

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -27,6 +28,7 @@ from qontinui_studio.launch.publish import (
     unpublish_launch,
 )
 from qontinui_studio.launch.record import ALLOWED_PATHS, NoBuildRecord
+from qontinui_studio.library import Library
 from qontinui_studio.pipeline import Context
 
 from .conftest import notice_text
@@ -1060,3 +1062,56 @@ def test_eleventh_manifest_url_must_share_the_preview_origin(studio_root: Path) 
     )
     with pytest.raises(ConfigError, match="same origin as preview_url"):
         load_product(product_path)
+
+
+def _reject_hero(ctx: Context) -> str:
+    lib = Library(ctx.conn)
+    uid = next(a.uid for a in lib.assets() if a.origin == "generated")
+    lib.decide(uid, "rejected", "josh", date(2026, 10, 14))
+    return uid
+
+
+def test_rejected_decor_is_skipped_and_the_launch_still_publishes(
+    make_context: Callable[..., Context], studio_root: Path, record_file: Path
+) -> None:
+    """``library reject`` means consumers must not use the asset: the kit
+    leaves a rejected published asset out (decoration is optional, D1) and
+    says so in an operator note."""
+    write_launch_decor(studio_root)
+    ctx = make_context(**preview_ctx(studio_root))
+    product_path = write_product(studio_root, capture=False, brief=True)
+    run_kit(ctx, product_path, KitOptions(video=False), public_client())
+    uid = _reject_hero(ctx)
+    run = run_kit(
+        ctx,
+        product_path,
+        KitOptions(video=False, generate_decor=False),
+        public_client(),
+        publish=True,
+    )
+    assert not [i for i in run.bundle.manifest["images"] if i.get("kind") == "decorative"]
+    assert any(f"asset {uid} was rejected in the library by josh" in n for n in run.bundle.notes)
+    assert run.publish is not None and run.publish.published, run.publish.failures
+
+
+def test_decor_rejected_after_assembly_is_refused_at_publish(
+    make_context: Callable[..., Context], studio_root: Path, record_file: Path
+) -> None:
+    write_launch_decor(studio_root)
+    ctx = make_context(**preview_ctx(studio_root))
+    product_path = write_product(studio_root, capture=False, brief=True)
+    run = run_kit(ctx, product_path, KitOptions(video=False), public_client())
+    assert [i for i in run.bundle.manifest["images"] if i.get("kind") == "decorative"]
+    uid = _reject_hero(ctx)
+    result = publish_launch(
+        ctx.conn,
+        run.launch_id,
+        load_product(product_path),
+        ctx.notifier,
+        ctx.clock,
+        ctx.bridge,
+        ctx.fetch,
+    )
+    assert not result.published
+    refused = [g for g in result.failures if g.gate == "library_approval"]
+    assert refused and uid in refused[0].subject and "rejected" in refused[0].detail

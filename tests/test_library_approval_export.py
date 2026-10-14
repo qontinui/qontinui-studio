@@ -246,3 +246,43 @@ def test_cli_export_is_byte_identical_on_rerun(populated: Context, studio_root: 
 def test_export_of_an_empty_library(studio_root: Path) -> None:
     doc = yaml.safe_load(export_yaml(connect(Workspace(studio_root).db_path)))
     assert doc == {"assets": [], "format": "qontinui-studio/library-export", "version": 1}
+
+
+def test_cli_list_filters_by_approval_status_and_origin(
+    studio_root: Path,
+    tmp_path: Path,
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+) -> None:
+    """A consumer project picks usable assets with ``--status``/``--origin``."""
+    approved = _import_one(studio_root, tmp_path)
+    rejected = _import_one(studio_root, tmp_path, asset_id="nc", commercial_use="no")
+    candidate = _import_one(studio_root, tmp_path, asset_id="later")
+    lib = _lib(studio_root)
+    lib.decide(approved, "approved", "josh", TODAY)
+    lib.decide(rejected, "rejected", "josh", TODAY)
+    ctx = make_context()
+    run_brief(ctx, write_brief(), publish=False)
+    generated = {a.uid for a in Library(ctx.conn).assets() if a.origin == "generated"}
+    assert generated
+
+    runner = CliRunner()
+    root = ["--root", str(studio_root)]
+
+    def uids(*args: str) -> set[str]:
+        r = runner.invoke(main, [*root, "library", "list", *args])
+        assert r.exit_code == 0, r.output
+        return {line.split()[0] for line in r.output.splitlines() if line.strip()}
+
+    assert uids("--status", "approved") == {approved}
+    assert uids("--status", "rejected") == {rejected}
+    assert uids("--status", "approved", "--status", "candidate") == {
+        approved,
+        candidate,
+        *generated,
+    }
+    assert uids("--origin", "imported") == {approved, rejected, candidate}
+    assert uids("--origin", "generated") == generated
+    assert uids("--origin", "generated", "--status", "approved") == set()
+    r = runner.invoke(main, [*root, "library", "list", "--status", "maybe"])
+    assert r.exit_code == 2

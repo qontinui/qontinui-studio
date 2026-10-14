@@ -250,7 +250,7 @@ poetry run studio providers list
 poetry run studio brief validate briefs/example-hero.yaml
 poetry run studio brief run briefs/example-hero.yaml     # generate -> crop -> gate -> publish
 poetry run studio jobs run                               # resume batches deferred by quota/backoff
-poetry run studio library list [--json] [--batch ID]
+poetry run studio library list [--json] [--batch ID] [--status S]... [--origin O]
 poetry run studio library import INBOX_DIR               # images made elsewhere -> library (never published)
 poetry run studio library approve UID --by ALIAS         # consumer-facing approval (D5: commercial_use yes only)
 poetry run studio library reject UID --by ALIAS
@@ -369,6 +369,14 @@ refused unless the asset's licence is `commercial_use: yes` (D5, also a SQL
 consumers, not a publish gate**: generated batches still publish on the
 automated D5/D6/D7 gates alone, with the operator notified rather than asked
 (D7). Generated assets start as `candidate`.
+
+A **rejection** binds every consumer. The launch kit leaves a rejected asset
+out of a bundle and says so in an operator note (decoration is optional), and
+its publish refuses a bundle that still carries one (gate `library_approval`),
+for example one assembled before the rejection. `candidate` assets stay usable.
+`studio library list --status approved|candidate|rejected` (repeatable) and
+`--origin generated|imported` narrow the listing; with `--json` that is what a
+consumer project reads to pick assets.
 
 **Export.** `studio library export --out <path>` writes every asset as YAML:
 uid, asset_id, origin, batch, provider, model, account, prompt, reference images,

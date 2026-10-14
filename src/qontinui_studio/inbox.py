@@ -482,11 +482,20 @@ class _Staging:
             if "ENOENT" not in parent:
                 warnings.append(f"stale staging sweep skipped: the staging directory {parent}")
             return
-        if parent is None:  # Windows fallback: by name, after the lstat check above
-            entries = [(e.name, e) for e in os.scandir(self.parent)]
-        else:
-            entries = [(e.name, e) for e in os.scandir(parent)]
         try:
+            try:
+                # Windows fallback (parent is None): by name, after the lstat check above.
+                listing = os.scandir(self.parent if parent is None else parent)
+                with listing:
+                    entries = [(e.name, e) for e in listing]
+            except OSError as e:
+                # The sweep is housekeeping: a staging directory it cannot list
+                # skips it with a warning, never fails the import.
+                warnings.append(
+                    "stale staging sweep skipped: the staging directory cannot be listed "
+                    f"({_errno_name(e)})"
+                )
+                return
             for name, entry in entries:
                 if name == self.dir.name or not _RUN_NAME.fullmatch(name):
                     continue
