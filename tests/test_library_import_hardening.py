@@ -705,9 +705,10 @@ def test_sweep_that_cannot_list_staging_warns_and_closes_its_descriptor(
     # test; each one therefore acts only on the staging parent's descriptor.
     real_scandir = os.scandir
     opened: list[int] = []
+    live: set[int] = set()  # staging descriptors still open (fd numbers are reused)
 
     def refusing(path: Any = ".") -> Any:
-        if path in opened:
+        if isinstance(path, int) and path in live:
             raise PermissionError(errno.EACCES, "denied")
         return real_scandir(path)
 
@@ -718,10 +719,12 @@ def test_sweep_that_cannot_list_staging_warns_and_closes_its_descriptor(
         fd = real_open(path, flags, *args, **kwargs)
         if str(path).endswith(".staging"):
             opened.append(fd)
+            live.add(fd)
         return fd
 
     def tracking_close(fd: int) -> None:
         closed.append(fd)
+        live.discard(fd)
         real_close(fd)
 
     monkeypatch.setattr(inbox_mod.os, "scandir", refusing)
