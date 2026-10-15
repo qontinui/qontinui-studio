@@ -71,11 +71,10 @@ def _studio(studio_root: Path, base: str, write_brief: Callable[..., Path]) -> l
     return ["--root", str(studio_root), "brief", "run", "--no-publish", str(brief)]
 
 
-def _studio_cli(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
-    """Run the ``studio`` CLI exactly as its console script does (``main`` in
-    standalone mode, which ends in ``sys.exit``) and return (exit code, output)."""
-    with pytest.raises(SystemExit) as done:
-        main(args)
+def _exit(
+    done: pytest.ExceptionInfo[SystemExit], capsys: pytest.CaptureFixture[str]
+) -> tuple[int, str]:
+    """(exit code, output) of one ``studio`` run that ended in ``sys.exit``."""
     out = capsys.readouterr()
     code = done.value.code
     return (code if isinstance(code, int) else 0 if code is None else 1), out.out + out.err
@@ -111,7 +110,10 @@ def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
             imagehost.completed(b64_json=imagehost.png_b64(marked=False)),
         )
     )
-    code, output = _studio_cli(_studio(studio_root, host.base_url, write_brief), capsys)
+    # ``main`` in standalone mode, exactly as the ``studio`` console script runs it.
+    with pytest.raises(SystemExit) as done:
+        main(_studio(studio_root, host.base_url, write_brief))
+    code, output = _exit(done, capsys)
     assert code == 0, output
     written = sorted(
         p
@@ -122,9 +124,9 @@ def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
     assert len(written) == 6, written  # one raw + five derivatives
     for f in written:
         assert TRAINED in _xmp(f), f"{f.name} lacks the IPTC AI-generated marker"
-        sidecar = f.with_name(f.name + ".provenance.json")
-        assert sidecar.is_file(), f"{f.name} has no provenance sidecar"
-        record = json.loads(sidecar.read_text())
+        beside = f.with_name(f.name + ".provenance.json")
+        assert beside.is_file(), f"{f.name} has no provenance sidecar"
+        record = json.loads(beside.read_text())
         assert record["ai_generated"] is True and record["provider"]["id"] == "local-gpu"
         assert record["qontinui_provenance"] == imagehost.facade_provenance()
 
@@ -140,7 +142,10 @@ def test_a_transport_drop_after_the_request_was_sent_is_unknown_and_retried(
         imagehost.sse_reply(*imagehost.progress(), drop_after=2),
         imagehost.sse_reply(imagehost.completed()),
     )
-    code, output = _studio_cli(_studio(studio_root, host.base_url, write_brief), capsys)
+    # ``main`` in standalone mode, exactly as the ``studio`` console script runs it.
+    with pytest.raises(SystemExit) as done:
+        main(_studio(studio_root, host.base_url, write_brief))
+    code, output = _exit(done, capsys)
     assert code == 0, output
     assert len(host.received) == 2, "the dropped job was retried"
     assert _attempts(studio_root) == [("local-gpu", "unknown"), ("local-gpu", "done")]
@@ -153,7 +158,9 @@ def test_a_refused_connection_is_a_retryable_busy(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     base = f"http://127.0.0.1:{imagehost.closed_port()}/v1"
-    code, output = _studio_cli(_studio(studio_root, base, write_brief), capsys)
+    with pytest.raises(SystemExit) as done:
+        main(_studio(studio_root, base, write_brief))
+    code, output = _exit(done, capsys)
     assert code == 3, output  # waiting, not failed
     assert "last attempt: busy from local-gpu" in output
     assert _attempts(studio_root) == [("local-gpu", "busy")]
