@@ -6,7 +6,9 @@ Exit codes: 0 ok; 1 config/usage error; 2 publication refused by a gate;
 factory's record route answered 404 or was unreachable); 5 a launch trigger was
 registered but its read-back did not confirm it; 6 image generation refused
 before any provider call (``gateway_has_no_image_route``: this install routes
-model calls through a gateway with no images route, or the runner cannot say).
+model calls through a gateway with no images route, or the runner cannot say) —
+from ``brief run``, ``jobs run``, and ``launch build``/``launch run`` unless
+``--no-generate``.
 """
 
 from __future__ import annotations
@@ -64,20 +66,33 @@ def _context(root: Path, generate: bool = False) -> Context:
     file_notifier = FileNotifier(ws.notices_dir)
     return Context(
         workspace=ws,
-        conn=connect(ws.db_path),
+        conn=connect(ws.db_path, inventory.adapter_kinds()),
         inventory=inventory,
         sites=load_sites(ws.sites_dir, root),
         adapters=build_adapters(inventory, gateway=read_gateway_state() if generate else None),
         notifier=CoordFindingNotifier(file_notifier),
+        on_wait=_print_wait,
     )
 
 
-def _refuse_on_gateway(ctx: Context) -> None:
+def _print_wait(seconds: float, why: str) -> None:
+    click.echo(f"waiting {seconds:.0f}s: {why}", err=True)
+
+
+def _refuse_on_gateway(ctx: Context, hint: str | None = None) -> None:
     """Exit 6 with the typed refusal when no image call may be made at all."""
     refusal: GatewayRefusal | None = ctx.adapters.refusal
     if refusal is not None:
         click.echo(f"refused: {refusal.code} (gateway state: {refusal.state}): {refusal}", err=True)
+        if hint:
+            click.echo(hint, err=True)
         sys.exit(6)
+
+
+_LAUNCH_HINT = (
+    "the launch kit generates its decoration first; rerun with --no-generate to assemble "
+    "the launch without it"
+)
 
 
 def _report(outcome: BatchOutcome) -> int:
@@ -91,7 +106,10 @@ def _report(outcome: BatchOutcome) -> int:
     for pid, why in sorted(outcome.unavailable_providers.items()):
         click.echo(f"  provider {pid} off: {why}")
     for j in outcome.failed_jobs:
-        click.echo(f"  job {j}: failed")
+        last = outcome.last_attempts.get(j)
+        click.echo(f"  job {j}: failed" + (f" (last attempt: {last})" if last else ""))
+    if outcome.stopped_waiting:
+        click.echo(f"  {outcome.stopped_waiting}")
     for j in outcome.deferred_jobs:
         last = outcome.last_attempts.get(j)
         click.echo(
@@ -556,6 +574,8 @@ def launch_build(
 ) -> None:
     """Assemble a launch bundle without publishing it."""
     ctx = _context(obj.root, generate=not no_generate)
+    if not no_generate:
+        _refuse_on_gateway(ctx, _LAUNCH_HINT)
     options = _kit_options(record_file, no_generate, no_capture, no_video, replay_clip, out)
     run = run_kit(ctx, product_path, options)
     _report_kit(run)
@@ -578,6 +598,8 @@ def launch_run(
 ) -> None:
     """Assemble a launch bundle and publish it if every gate passes."""
     ctx = _context(obj.root, generate=not no_generate)
+    if not no_generate:
+        _refuse_on_gateway(ctx, _LAUNCH_HINT)
     options = _kit_options(record_file, no_generate, no_capture, no_video, replay_clip, out)
     run = run_kit(ctx, product_path, options, publish=True)
     _report_kit(run)

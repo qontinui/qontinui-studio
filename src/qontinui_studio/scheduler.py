@@ -56,6 +56,7 @@ from qontinui_studio.errors import (
     ProviderRefusal,
     QuotaExhaustedError,
     TransientProviderError,
+    clamp_retry_after,
 )
 from qontinui_studio.library import TermsSnapshot
 from qontinui_studio.providers import ProviderInventory
@@ -95,7 +96,7 @@ class RetryPolicy:
     def backoff(self, attempts: int, retry_after_s: float | None) -> float:
         delay: float = min(self.max_backoff_s, self.base_backoff_s * 2.0 ** max(0, attempts - 1))
         if retry_after_s is not None:
-            delay = max(delay, retry_after_s)
+            delay = max(delay, clamp_retry_after(retry_after_s, delay))
         return delay
 
 
@@ -114,6 +115,9 @@ class StepReport:
     completed: list[CompletedJob] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     discarded: list[str] = field(default_factory=list)
+    # Set when ``run`` stopped because this run had already waited ``horizon``
+    # in total (e.g. a host answering ``busy`` again and again): why, typed.
+    stopped_waiting: str | None = None
 
 
 # A provider quota message from an adapter that raised a plain transient error.
@@ -260,22 +264,47 @@ class Scheduler:
 
     # ---- the step --------------------------------------------------------
 
-    def _pick_provider(self, preference: list[str], tried: list[str], now: datetime) -> str | None:
+    def _may_move_to(self, pid: str, template: GenerationRequest, tried: list[str]) -> bool:
+        """Whether a job may be (re)assigned to ``pid``. A BULK job that has
+        already been given up on a provider may move only to an unmetered local
+        provider: bulk work never spills onto a metered (paid) adapter, whatever
+        made it leave — ``disabled``, ``weights_unverified``, repeated
+        ``unknown``. Its first assignment follows the brief's own preference."""
+        if template.priority != "bulk" or not tried:
+            return True
+        return self.inventory.get(pid).capacity == "unmetered"
+
+    def _pick_provider(
+        self,
+        preference: list[str],
+        tried: list[str],
+        now: datetime,
+        template: GenerationRequest,
+        given_up: list[str] | None = None,
+    ) -> str | None:
+        """The first preferred provider that is not excluded (``tried``), has an
+        adapter, may take this job and has capacity now. ``given_up`` is the
+        job's own record of providers it left (defaults to ``tried``)."""
+        left = tried if given_up is None else given_up
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
+                continue
+            if not self._may_move_to(pid, template, left):
                 continue
             if self.has_capacity(pid, now):
                 return pid
         return None
 
     def _next_window(
-        self, preference: list[str], tried: list[str], now: datetime
+        self, preference: list[str], tried: list[str], now: datetime, template: GenerationRequest
     ) -> datetime | None:
         """When some untried preferred provider (adapter built, schedulable) gets
         quota again — the earliest of their resets — or None if none ever will."""
         times: list[datetime] = []
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
+                continue
+            if not self._may_move_to(pid, template, tried):
                 continue
             provider = self.inventory.get(pid)
             if provider.schedulable_reason() is not None or provider.capacity == "unmetered":
@@ -393,9 +422,11 @@ class Scheduler:
                 or provider_id not in self.adapters.adapters  # not built this run
                 or not self.has_capacity(provider_id, now)
             ):
-                provider_id = self._pick_provider(preference, [*tried, *excluded], now)
+                provider_id = self._pick_provider(
+                    preference, [*tried, *excluded], now, template, given_up=tried
+                )
             if provider_id is None:
-                window = self._next_window(preference, tried, now)
+                window = self._next_window(preference, tried, now, template)
                 if window is not None:
                     self._write(
                         row["id"],
@@ -411,8 +442,7 @@ class Scheduler:
                     row["claim"],
                     "queued",
                     status="failed",
-                    last_error=row["last_error"]
-                    or "no schedulable provider in the brief's preference",
+                    last_error=self._no_provider_reason(row, preference, tried, template),
                 ):
                     report.failed.append(row["id"])
                 return
@@ -430,6 +460,7 @@ class Scheduler:
                     "prompt": adapter.sent_prompt(request),
                     "model": adapter.model,
                     "adapter": adapter.kind,
+                    "sent_json": json.dumps(adapter.sent_parameters(request), sort_keys=True),
                     "terms_json": TermsSnapshot.of(self.inventory.get(provider_id)).to_json(),
                     "next_attempt_at": _iso(now + timedelta(seconds=lease)),
                     "updated_at": _iso(now),
@@ -545,15 +576,39 @@ class Scheduler:
             priority=template.priority,
         )
 
+    def _no_provider_reason(
+        self,
+        row: sqlite3.Row,
+        preference: list[str],
+        tried: list[str],
+        template: GenerationRequest,
+    ) -> str:
+        """Why a job with no provider left fails — typed when the bulk rule is
+        what closed the remaining doors."""
+        blocked = [
+            pid
+            for pid in preference
+            if pid not in tried
+            and pid in self.adapters.adapters
+            and not self._may_move_to(pid, template, tried)
+        ]
+        if blocked:
+            return (
+                f"bulk_no_spill: left {tried} and bulk work never moves to a metered provider "
+                f"({blocked}); last error: {row['last_error']}"
+            )
+        return str(row["last_error"] or "no schedulable provider in the brief's preference")
+
     def _fallback(
         self, preference: list[str], tried: list[str], current: str, template: GenerationRequest
     ) -> str | None:
         """The provider an INTERACTIVE job may fall back to after ``busy`` or
         ``unknown``: the next preferred provider with capacity now. A metered
-        one therefore only ever within its recorded quota. Bulk jobs never."""
+        one therefore only ever within its recorded quota. Bulk jobs never.
+        The provider it leaves joins ``tried``, so a job never ping-pongs."""
         if template.priority != "interactive":
             return None
-        return self._pick_provider(preference, [*tried, current], self.clock())
+        return self._pick_provider(preference, [*tried, current], self.clock(), template)
 
     def _requeue(self, job_id: str, claim: str, status: str, **fields: object) -> bool:
         return self._write(
@@ -584,7 +639,8 @@ class Scheduler:
         the unit, keep the attempt count (``attempts``, as it stood before this
         submission), and come back when the host says."""
         self._refund(provider_id, quota_day)
-        self._attempt(job_id, provider_id, refusal.kind, str(refusal), refusal.retry_after_s)
+        retry_after = clamp_retry_after(refusal.retry_after_s)
+        self._attempt(job_id, provider_id, refusal.kind, str(refusal), retry_after)
         now = self.clock()
         if refusal.kind == "busy":
             fallback = self._fallback(preference, tried, provider_id, template)
@@ -595,6 +651,7 @@ class Scheduler:
                     status,
                     provider=fallback,
                     attempts=0,
+                    tried_providers=json.dumps([*tried, provider_id]),
                     next_attempt_at=_iso(now),
                     last_error=f"{provider_id}: {refusal}; falling back to {fallback}",
                 )
@@ -605,8 +662,8 @@ class Scheduler:
             status,
             provider=provider_id,
             attempts=attempts,
-            next_attempt_at=_iso(now + timedelta(seconds=refusal.retry_after_s)),
-            last_error=f"{provider_id}: {refusal} (retry after {refusal.retry_after_s:.0f}s)",
+            next_attempt_at=_iso(now + timedelta(seconds=retry_after)),
+            last_error=f"{provider_id}: {refusal} (retry after {retry_after:.0f}s)",
         )
 
     def _after_unknown(
@@ -634,6 +691,7 @@ class Scheduler:
                 status,
                 provider=fallback,
                 attempts=0,
+                tried_providers=json.dumps([*tried, provider_id]),
                 next_attempt_at=_iso(now),
                 last_error=f"{provider_id}: unknown: {error}; falling back to {fallback}",
             )
@@ -895,10 +953,15 @@ class Scheduler:
         sleep: Callable[[float], None] = time.sleep,
         horizon: timedelta = timedelta(minutes=30),
         on_iteration: Callable[[], None] | None = None,
+        on_wait: Callable[[float, str], None] | None = None,
     ) -> StepReport:
-        """Step until every job of the given batches is terminal or deferred
-        beyond ``horizon`` (e.g. to tomorrow's quota)."""
+        """Step until every job of the given batches is terminal, deferred
+        beyond ``horizon`` (e.g. to tomorrow's quota), or this run has already
+        waited ``horizon`` IN TOTAL — so a host that keeps answering ``busy``
+        cannot hold a command forever. Each wait is reported to ``on_wait``
+        (seconds, why) before it is slept."""
         total = StepReport()
+        waited = 0.0
         while True:
             if on_iteration is not None:
                 on_iteration()  # e.g. renew the batch lease; raises to stop
@@ -910,9 +973,20 @@ class Scheduler:
             if not pending:
                 return total
             now = self.clock()
-            soonest = min(_parse(j["next_attempt_at"]) for j in pending)
+            due = min(pending, key=lambda j: _parse(j["next_attempt_at"]))
+            soonest = _parse(due["next_attempt_at"])
             if soonest - now > horizon:
                 return total
             wait = max(0.0, (soonest - now).total_seconds())
+            why = f"job {due['id']}: {due['last_error'] or due['status']}"
+            if waited + wait > horizon.total_seconds():
+                total.stopped_waiting = (
+                    f"stopped after waiting {waited:.0f}s this run (cap {horizon.total_seconds():.0f}s); "
+                    f"next {why}; resume with `studio jobs run`"
+                )
+                return total
             if wait > 0:
+                if on_wait is not None:
+                    on_wait(wait, why)
+                waited += wait
                 sleep(wait)

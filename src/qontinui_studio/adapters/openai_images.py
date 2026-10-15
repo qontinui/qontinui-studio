@@ -71,6 +71,10 @@ class OpenAIImageAdapter:
         self._http = http or httpx.Client(timeout=httpx.Timeout(180.0, connect=15.0))
         self._base = api_base.rstrip("/")
 
+    def sent_parameters(self, request: GenerationRequest) -> dict[str, Any]:
+        # This wire carries no seed, recipe or negative-prompt field.
+        return {}
+
     def sent_prompt(self, request: GenerationRequest) -> str:
         # The OpenAI Images API has no negative-prompt field.
         return fold_negative(request)

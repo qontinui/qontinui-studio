@@ -145,7 +145,8 @@ def test_a_refusal_requeues_at_retry_after_without_spending_quota_or_an_attempt(
         assert job["next_attempt_at"] == (clock.now + timedelta(seconds=120)).isoformat()
     assert job["status"] == "queued" and job["attempts"] == 0
     assert _used(ctx, "fake") == 0, "the refused submission's unit is refunded"
-    assert json.loads(str(job["tried_providers"])) == []
+    # A fallback leaves its provider behind for good (no ping-pong).
+    assert json.loads(str(job["tried_providers"])) == (["fake"] if moved else [])
     assert _ledger(ctx) == [("fake", refusal)]
     assert fake2.calls == 0
 
@@ -306,8 +307,17 @@ def test_an_unmetered_local_provider_is_scheduled_without_a_quota(
     [
         ("http://127.0.0.1:8100/v1", True),
         ("http://localhost:8100/v1", True),
-        ("http://spaceship:8100/v1", True),
-        ("http://spaceship.tail1234.ts.net:8100/v1", True),
+        # Names are not addresses: no single-label or *.ts.net pass by shape.
+        ("http://spaceship:8100/v1", False),
+        ("http://evil/", False),
+        ("http://spaceship.tail1234.ts.net:8100/v1", False),
+        ("http://metadata.google.internal/", False),
+        ("http://2130706433/", False),
+        ("http://10.1.2.3/v1", True),
+        ("http://172.16.0.9/v1", True),
+        ("http://169.254.1.1/v1", True),
+        ("http://[fd12::1]/v1", True),
+        ("http://172.32.0.1/v1", False),
         ("http://100.111.28.125:8100/v1", True),
         ("http://192.168.1.20:8100/v1", True),
         ("http://[::1]:8100/v1", True),
@@ -318,6 +328,16 @@ def test_an_unmetered_local_provider_is_scheduled_without_a_quota(
 )
 def test_unmetered_needs_a_local_network_host(url: str, local: bool) -> None:
     assert is_local_network(url) is local
+
+
+def test_an_operator_allow_list_admits_a_named_local_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STUDIO_LOCAL_NETWORK_HOSTS", "spaceship, gpu.lan")
+    assert is_local_network("http://spaceship:8100/v1")
+    assert is_local_network("http://GPU.lan./v1")
+    assert not is_local_network("http://evil/")
+    assert not is_local_network("http://spaceship:8100/v1", named_hosts=False)
 
 
 def test_an_unmetered_provider_on_a_public_host_is_not_schedulable(

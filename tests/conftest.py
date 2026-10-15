@@ -143,7 +143,10 @@ def _no_runner_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
 
         return GatewayState("not_declared", "no_runner", "test")
 
-    # By dotted name, so this fixture never imports the code under test.
+    # Patched by dotted name and with raising=False, so SETTING UP the fixture
+    # imports nothing from the gateway module and survives a build that has no
+    # ``read_gateway_state``. The stub itself DOES import ``GatewayState`` from
+    # the code under test, lazily, when the CLI calls it.
     monkeypatch.setattr("qontinui_studio.cli.read_gateway_state", no_runner, raising=False)
 
 

@@ -11,6 +11,7 @@ import io
 import json
 import socket
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.parser import BytesParser
@@ -249,3 +250,26 @@ def closed_port() -> int:
     port = int(s.getsockname()[1])
     s.close()
     return port
+
+
+def trickle_reply(events: int, interval_s: float) -> Reply:
+    """A chunked event stream that keeps sending ``qontinui.running`` progress
+    every ``interval_s`` and never completes within ``events`` ticks: a host
+    that is alive but never done."""
+
+    def reply(h: BaseHTTPRequestHandler) -> None:
+        h.send_response(200)
+        h.send_header("Content-Type", "text/event-stream")
+        h.send_header("Transfer-Encoding", "chunked")
+        h.end_headers()
+        try:
+            for i in range(events):
+                tick = {"type": "qontinui.running", "step": i, "total": events}
+                h.wfile.write(_chunk(sse_event("qontinui.running", tick)))
+                h.wfile.flush()
+                time.sleep(interval_s)
+            h.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass  # the client stopped reading: that is the point
+
+    return reply

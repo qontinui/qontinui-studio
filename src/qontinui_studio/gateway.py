@@ -11,7 +11,15 @@ inside the runner's ``{"data": ...}`` envelope::
 
     {"state": "not_declared" | "declared" | "unknown",
      "reason": "...",
-     "routes": {"images": "<base URL of an OpenAI-images-wire route>"}}
+     "routes": {"images": "<base URL of an OpenAI-images-wire route>",
+                "images_credential_env": "<env var holding the gateway's key>"}}
+
+The read is unauthenticated, so it is trusted only from a LOOPBACK runner
+(``$QONTINUI_RUNNER_URL`` naming another host reads as ``unknown``). A route is
+used only when it is https, or plain http to a LITERAL local address. Through a
+route, adapters authenticate with the gateway's own credential; a vendor key is
+never sent there, and an adapter that needs a key is refused when the gateway
+declares none.
 
 How each reading resolves:
 
@@ -19,7 +27,11 @@ How each reading resolves:
   declared gateway);
 * ``404`` -> ``not_declared``: the runner build serves no gateway read, and the
   only build that can declare a gateway (#2138) is the one the read is
-  proposed into. FRAGILE if #2138 lands without the read — see the finding;
+  proposed into. FRAGILE if #2138 lands without the read: studio cannot tell a
+  pre-#2138 build from a #2138 build that lacks the route (#2138 is unmerged,
+  so there is no merge commit to test ``/health`` ``gitSha`` against, and
+  studio holds no runner checkout) — coord findings ac6a63e9 and the 404
+  follow-up record it;
 * ``declared`` with ``routes.images`` -> image calls go through that route
   (every adapter speaking the OpenAI images wire is pointed at it; any other
   wire is unavailable);
@@ -30,14 +42,17 @@ How each reading resolves:
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlparse
 
 import httpx
 
 from qontinui_studio.errors import GatewayRefusal
+from qontinui_studio.providers import is_local_network
 
 RUNNER_URL_ENV = "QONTINUI_RUNNER_URL"
 # The runner binds IPv4 loopback only; ``localhost`` would pay a doomed ::1 connect.
@@ -55,6 +70,10 @@ class GatewayState:
     source: str
     reason: str = ""
     images_base_url: str | None = None
+    # The env var holding the GATEWAY's own credential for its images route,
+    # when the declaration names one. A vendor key (OPENAI_API_KEY, ...) is
+    # never sent to a gateway route.
+    images_credential_env: str | None = None
 
     def refusal(self) -> GatewayRefusal | None:
         """The typed refusal for this state, or None when image calls may proceed."""
@@ -79,9 +98,30 @@ def runner_url() -> str:
     return os.environ.get(RUNNER_URL_ENV, "").strip() or DEFAULT_RUNNER_URL
 
 
+def route_acceptable(url: str) -> bool:
+    """A gateway images route studio will send requests to: https anywhere, or
+    plain http only to a LITERAL local address (loopback, RFC 1918, link-local,
+    ULA, CGNAT/Tailscale) or ``localhost`` — never plain http to a name."""
+    scheme = urlparse(url).scheme.lower()
+    if scheme == "https":
+        return bool(urlparse(url).hostname)
+    return scheme == "http" and is_local_network(url, named_hosts=False)
+
+
 def read_gateway_state(base: str | None = None, http: httpx.Client | None = None) -> GatewayState:
-    """Read this install's model-gateway state from the local runner."""
-    url = f"{(base or runner_url()).rstrip('/')}/model-gateway"
+    """Read this install's model-gateway state from the local runner. The read
+    is unauthenticated, so it is trusted only from a LOOPBACK runner: a runner
+    URL pointing anywhere else reads as ``unknown`` and refuses."""
+    root = (base or runner_url()).rstrip("/")
+    host = (urlparse(root).hostname or "").lower()
+    if host != "localhost" and not _is_loopback_literal(host):
+        return GatewayState(
+            "unknown",
+            "untrusted_runner_url",
+            f"runner URL {root} is not loopback; an unauthenticated gateway read is "
+            "trusted only from this machine's runner",
+        )
+    url = f"{root}/model-gateway"
     client = http or httpx.Client(timeout=READ_TIMEOUT_S)
     try:
         resp = client.get(url)
@@ -114,9 +154,24 @@ def read_gateway_state(base: str | None = None, http: httpx.Client | None = None
     assert isinstance(body, dict)
     routes = body.get("routes")
     images = routes.get("images") if isinstance(routes, dict) else None
+    cred = routes.get("images_credential_env") if isinstance(routes, dict) else None
+    if isinstance(images, str) and images and not route_acceptable(images):
+        return GatewayState(
+            "unknown",
+            "unacceptable_route",
+            f"the declared images route {images} is neither https nor a literal local address",
+        )
     return GatewayState(
         state,
         "runner",
         str(body.get("reason") or ""),
-        images if isinstance(images, str) and images.startswith(("http://", "https://")) else None,
+        images if isinstance(images, str) and images else None,
+        cred if isinstance(cred, str) and cred else None,
     )
+
+
+def _is_loopback_literal(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False

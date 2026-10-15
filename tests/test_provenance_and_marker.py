@@ -120,6 +120,8 @@ def _run(
 
 
 def _check_every_file(root: Path, adapter_kind: str, facade: bool) -> int:
+    """``facade`` also means "the wire carried seed/recipe/negative prompt":
+    only the local facade's does, and a sidecar records only what was sent."""
     files = _written_images(root)
     # One raw file plus five derivatives (cafe webp+avif, barber webp+avif,
     # the campaign webp).
@@ -131,8 +133,14 @@ def _check_every_file(root: Path, adapter_kind: str, facade: bool) -> int:
         assert provenance.missing(record) == [], (f, provenance.missing(record))
         assert record["file"]["sha256"] == sha256_file(f)
         assert record["provider"]["adapter"] == adapter_kind
-        assert record["negative_prompt"] == "text, logos" and record["recipe"] == "hero"
-        assert record["seed"] == 7
+        if facade:
+            assert record["negative_prompt"] == "text, logos" and record["recipe"] == "hero"
+            assert record["seed"] == 7
+        else:
+            # The cloud wires never sent these (the negative prompt went into
+            # the prompt text as "Avoid: ..."), so the sidecar does not claim them.
+            assert record["negative_prompt"] is None and record["recipe"] is None
+            assert record["seed"] is None
         assert record["c2pa"]["signed"] is False
         assert ("qontinui_provenance" in record) is facade
         if record["file"]["role"] == "derivative":

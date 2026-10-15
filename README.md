@@ -48,7 +48,7 @@ lands.
 |---|---|---|
 | **D4** API first, GUI automation only where the terms allow it, one account per provider | An adapter is built only for a provider whose `providers.yaml` row has `tos_reviewed` set and `automation_allowed: "yes"`. `unknown` keeps it off. A duplicate provider row is a load error. | `providers.py` (`adapter_gate`), `adapters/__init__.py` |
 | **D5** every asset carries provenance and licence | Each library row stores provider, model, prompt, brief id (or, for an imported asset, account alias, reference images and terms URL), date and SHA-256. It also snapshots the licence terms as reviewed, and the watermark. `ai_generated` is pinned true by a SQL `CHECK`. An unreviewed licence is refused for every site; a non-commercial licence is refused for a commercial site. | `store.py`, `library.py`, `gates.py` (`d5_licence`, `d5_provenance`) |
-| **a5ec7670** every generated file is marked and provenanced (plan 2026-10-13 Phase 11) | Every image the studio generates or derives (raw download, every PNG/WebP/AVIF/JPEG variant) carries the IPTC `DigitalSourceType` = `trainedAlgorithmicMedia` XMP marker and a `<file>.provenance.json` sidecar: provider, adapter, model, terms as reviewed, the prompt sent, negative prompt, references (with sha256), seed when known, recipe, `created_at`, and — for the local provider — the facade's `qontinui_provenance` verbatim (SPDX licence, recipe hash, weight sha256s, seed). An incomplete sidecar is never written; D5 refuses a generated file without the marker or a matching sidecar. A published file is a byte-identical copy of its variant, and its sidecar travels in the site manifest per format. C2PA is not written: it needs a signing credential, which is a billing decision not taken. | `marker.py`, `provenance.py`, `pipeline.py` (`ingest`), `gates.py` (`d5_provenance`), `publish.py` |
+| **a5ec7670** every generated file is marked and provenanced (plan 2026-10-13 Phase 11) | Every image the studio generates or derives (raw download, every PNG/WebP/AVIF/JPEG variant) carries the IPTC `DigitalSourceType` = `trainedAlgorithmicMedia` XMP marker (merged into any XMP the provider wrote, read back before the file is staged, and read only from the format's real XMP container) and a `<file>.provenance.json` sidecar: provider, adapter, model, terms as reviewed, the prompt sent, the negative prompt / seed / recipe only when the wire carried them (a seed the facade reports is recorded too), references (with sha256), `created_at`, and — for the local provider — the facade's `qontinui_provenance` verbatim (SPDX licence, recipe hash, weight sha256s, seed). An incomplete sidecar is never written; D5 refuses a generated file without the marker or a matching sidecar. A published file is a byte-identical copy of its variant, and its sidecar travels in the site manifest per format. C2PA is not written: it needs a signing credential, which is a billing decision not taken. | `marker.py`, `provenance.py`, `pipeline.py` (`ingest`), `gates.py` (`d5_provenance`), `publish.py` |
 | **D6** AI imagery is never presented as the real thing | Refuses AI imagery in any `product_screenshot` slot, and in `food`/`premises` slots on a `real_business` site. Demo sites must carry an illustrative label. The label is written to the site's `studio-manifest.json` for the site build to render. | `gates.py` (`d6_not_the_real_thing`), `publish.py` |
 | **D7** automated gates decide; the operator is notified, not asked | A batch publishes only when every gate passes, including UI Bridge page health on a preview of the batch, which runs before anything goes live. Page health is **required, with no waiver**. The operator gets a notice carrying a one-step `studio --root <abs path> unpublish --batch <id>`. The review page is not an approval queue. | `publish.py`, `notify.py`, `review.py` |
 | **D3** public redaction is explicit | The launch kit runs qontinui-web's own validator on every build record. It is ported in `launch/allowlist.py`, and a parity test runs it over a shared fixture corpus. The validator checks key for key, per-slot value types and the `<path>: <reason_code>` grammar for unknowns. It also scans every string for private repo names, UUIDs and emails, after Unicode normalisation that defeats lookalike and invisible characters. It enforces the caps: strings of at most 512 characters (decomposed too, with at most 2× NFKD expansion) and documents of at most 256 KiB. Any repo the product declares but the record left out (at most 50 such repos) must not be named anywhere in the record. A record must belong to the product: matching slugs, and only repos the product declares. Only a versioned public snapshot can back a published launch. | `launch/allowlist.py`, `launch/record.py`, `launch/publish.py` |
@@ -230,8 +230,10 @@ see the verdicts. In summary:
   `openai_compatible_images` adapter. Its `capacity: unmetered` means it spends
   no quota: the host bounds itself with typed `busy`/`deferred` refusals. The
   loader allows `unmetered` only on that adapter kind, and the scheduler refuses
-  it unless the base URL is on the local network (loopback, private, tailnet), so
-  a public host can never be scheduled as free. Until the facade is deployed
+  it unless the base URL is on the local network: a LITERAL loopback, RFC 1918,
+  link-local, IPv6 unique-local or CGNAT/Tailscale IP, `localhost`, or a host
+  named in `STUDIO_LOCAL_NETWORK_HOSTS` (no other name passes by its shape). That
+  is an accident guard against billing, not a security boundary. Until the facade is deployed
   (plan Phase 10), a request is refused at connect and reported as a retryable
   `busy`.
 
@@ -416,6 +418,7 @@ upgraded in place the first time any command opens it.
 |---|---|
 | `GEMINI_API_KEY` | the `gemini` adapter. The env var name is set per row by `api_key_env`. |
 | `OPENAI_API_KEY` | the `openai` adapter |
+| `STUDIO_LOCAL_NETWORK_HOSTS` | comma-separated host names (e.g. a MagicDNS short name) the operator vouches for as local-network, for an `unmetered` row |
 | `STUDIO_LOCAL_GPU_BASE_URL` | the `local-gpu` row's facade address on this machine (`base_url_env`); unset means the row's loopback `base_url` |
 | `QONTINUI_RUNNER_URL` | where `brief run`, `jobs run`, `launch build` and `launch run` read the runner's model-gateway state (`GET /model-gateway`; default `http://127.0.0.1:9876`) |
 | `STUDIO_WEB_BEARER` or `STUDIO_WEB_BEARER_FILE` | the launch kit's authed build-record door (`record.door: authed`) |
@@ -446,16 +449,23 @@ recorded in `job_attempts` as `done | failed | unknown | deferred | busy`, and
 
 - `busy` (the host's card is taken, or nothing is listening — the job provably
   never started) and `deferred` (a `priority: bulk` brief outside the host's bulk
-  window) requeue the job at the host's `retry_after_s` **without spending a quota
-  unit or an attempt**. A `deferred`, or a `busy` answered to a bulk job, never
-  moves the job to another provider, so bulk work cannot spill onto a paid
-  adapter.
+  window) requeue the job at the host's `retry_after_s` (clamped to 1 s–24 h; a
+  non-finite value is ignored) **without spending a quota unit or an attempt**.
+  A `deferred`, or a `busy` answered to a bulk job, never moves the job to another
+  provider. A bulk job that is given up on its provider (`disabled`,
+  `weights_unverified`, repeated `unknown`) may move only to another unmetered
+  local provider; otherwise it fails with `bulk_no_spill`. Bulk work never spills
+  onto a paid adapter.
 - `unknown` — the transport failed after the request was sent, the answer was
   truncated, or the job id was lost — is never collapsed into `failed` or `done`.
   It is recorded as `unknown` and the job is retried as a counted attempt.
 - An interactive job whose provider answered `busy` or `unknown` may fall back to
   the next preferred provider, but only one with capacity now: a cloud adapter
-  only within its own `daily_quota`, which is unset today (no cloud work).
+  only within its own `daily_quota`, which is unset today (no cloud work). The
+  provider it leaves is never tried again for that job.
+- A command waits at most 30 minutes in total: every wait is printed
+  (`waiting 30s: job …`), and when the next one would pass the cap the command
+  stops with exit 3 and says to resume with `studio jobs run`.
 
 A brief's `negative_prompt` goes to a wire that has the field (the local facade)
 as its own field; a wire without one (Gemini, OpenAI) gets it folded in as
@@ -464,11 +474,15 @@ as its own field; a wire without one (Gemini, OpenAI) gets it folded in as
 `bulk`).
 
 **Gateway tenants.** Before generating, the CLI reads the runner's model-gateway
-state. No runner, or a runner build with no gateway read, means no declared
-gateway. A declared gateway with an images route carries every OpenAI-images-wire
-adapter; a declared gateway without one, or a runner that cannot say, refuses
-every image call with `gateway_has_no_image_route` (exit 6) and makes no vendor or
-local call (decision record
+state from a loopback runner only. No runner, or a runner build with no gateway
+read, means no declared gateway. A declared gateway with an images route (https,
+or plain http to a literal local address) carries every OpenAI-images-wire
+adapter, authenticated with the gateway's own credential: a vendor key is never
+sent to a gateway route, and an adapter that needs a key is refused when the
+gateway declares none. A declared gateway without a usable images route, or a
+runner that cannot say, refuses every image call with `gateway_has_no_image_route`
+(exit 6, from `brief run`, `jobs run`, and `launch build` / `launch run` unless
+`--no-generate`) and makes no vendor or local call (decision record
 `gateway-tenants-route-every-model-call-through-the-gateway`).
 
 ### Layout

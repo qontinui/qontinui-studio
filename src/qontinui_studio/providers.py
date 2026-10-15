@@ -36,25 +36,51 @@ Capacity = Literal["daily_quota", "unmetered"]
 UNMETERED_ADAPTERS = ("openai_compatible_images",)
 
 
-def is_local_network(url: str) -> bool:
-    """Whether ``url``'s host is on this machine or the local/tailnet network:
-    a loopback, private (RFC 1918 / ULA), link-local or CGNAT (tailnet) IP
-    literal, ``localhost``, a single-label name, or a ``.local``/``.lan``/
-    ``.internal``/``.ts.net`` name. An ``unmetered`` provider must sit on one —
-    a public host could bill per image, and spending is never a scheduler default."""
+# Literal address ranges that count as "this machine or the local network".
+LOCAL_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "127.0.0.0/8",  # loopback
+        "::1/128",
+        "10.0.0.0/8",  # RFC 1918
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",  # link-local
+        "fe80::/10",
+        "fc00::/7",  # IPv6 unique-local
+        "100.64.0.0/10",  # CGNAT, where Tailscale addresses live
+        "fd7a:115c:a1e0::/48",  # Tailscale's IPv6 range
+    )
+)
+# Hostnames an operator vouches for (e.g. a MagicDNS short name), comma-separated.
+LOCAL_HOSTS_ENV = "STUDIO_LOCAL_NETWORK_HOSTS"
+
+
+def is_local_network(url: str, *, named_hosts: bool = True) -> bool:
+    """Whether ``url``'s host is on this machine or the local network: a
+    LITERAL loopback, RFC 1918, link-local, IPv6 unique-local or CGNAT/Tailscale
+    IP, ``localhost``, or a hostname listed in ``$STUDIO_LOCAL_NETWORK_HOSTS``.
+    No other name passes — a name can resolve anywhere.
+
+    This is an ACCIDENT GUARD against billing, not a security boundary: it stops
+    an ``unmetered`` row (or a gateway route it would ride) from being pointed
+    at a public, possibly billed host by mistake. Anyone who can edit
+    providers.yaml or the environment can still point it anywhere.
+    ``named_hosts=False`` ignores the allow-list (literal addresses and
+    ``localhost`` only)."""
     host = (urlparse(url).hostname or "").lower().rstrip(".")
     if not host:
         return False
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return (
-            host == "localhost"
-            or "." not in host
-            or host.endswith((".local", ".lan", ".internal", ".ts.net"))
-        )
-    cgnat = ipaddress.ip_network("100.64.0.0/10")
-    return ip.is_loopback or ip.is_private or ip.is_link_local or (ip.version == 4 and ip in cgnat)
+        allowed = {
+            h.strip().lower().rstrip(".")
+            for h in os.environ.get(LOCAL_HOSTS_ENV, "").split(",")
+            if h.strip()
+        }
+        return host == "localhost" or (named_hosts and host in allowed)
+    return any(ip in net for net in LOCAL_NETWORKS if net.version == ip.version)
 
 
 def _coerce_verdict(value: Any) -> Any:
@@ -324,6 +350,10 @@ class ProviderInventory(BaseModel):
                     )
                 seen[kind][key] = p.id
         return self
+
+    def adapter_kinds(self) -> dict[str, str]:
+        """provider id -> adapter kind, for the store's inventory backfills."""
+        return {p.id: p.adapter for p in self.providers}
 
     def get(self, provider_id: str) -> Provider:
         for p in self.providers:

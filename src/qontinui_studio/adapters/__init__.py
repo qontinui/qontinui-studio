@@ -25,19 +25,25 @@ __all__ = [
 ]
 
 
-# Adapters whose wire is OpenAI's images API: the only wire a gateway's images
-# route is expected to speak.
-OPENAI_IMAGES_WIRE = ("openai_images", "openai_compatible_images")
-
-
-def build_adapter(provider: Provider, base_url: str | None = None) -> ProviderAdapter:
+def build_adapter(
+    provider: Provider,
+    gateway_route: str | None = None,
+    gateway_credential_env: str | None = None,
+) -> ProviderAdapter:
     """Construct one adapter, refusing with a typed error when D4 keeps it off.
-    ``base_url`` (a gateway's images route) overrides the row's own."""
+
+    With a ``gateway_route`` (a declared gateway's images route) an
+    OpenAI-images-wire adapter is pointed at it and authenticates with the
+    GATEWAY's own credential (``gateway_credential_env``) — never with the
+    row's vendor or facade key. An adapter that needs a key gets none when the
+    gateway declares none: it is refused, not handed the vendor key."""
     gate = provider.adapter_gate()
     if gate is not None:
         raise AdapterDisabledError(f"{provider.id}: {gate}")
     model = provider.model or ""
-    base = base_url or provider.resolved_base_url()
+    if gateway_route is not None:
+        return _through_gateway(provider, model, gateway_route, gateway_credential_env)
+    base = provider.resolved_base_url()
     if provider.adapter == "gemini_api":
         from qontinui_studio.adapters.gemini import GeminiImageAdapter
 
@@ -63,6 +69,30 @@ def build_adapter(provider: Provider, base_url: str | None = None) -> ProviderAd
 
         return FakeImageAdapter(provider.id, model or "fake-v1")
     raise AdapterDisabledError(f"{provider.id}: no adapter for kind '{provider.adapter}'")
+
+
+def _through_gateway(
+    provider: Provider, model: str, route: str, credential_env: str | None
+) -> ProviderAdapter:
+    if provider.adapter == "openai_images":
+        from qontinui_studio.adapters.openai_images import OpenAIImageAdapter
+
+        if credential_env is None:
+            raise AdapterDisabledError(
+                f"{provider.id}: the gateway declares no credential for its images route, and a "
+                "vendor key is never sent to a gateway route"
+            )
+        return OpenAIImageAdapter(provider.id, model, credential_env, api_base=route)
+    if provider.adapter == "openai_compatible_images":
+        from qontinui_studio.adapters.openai_compatible_images import (
+            OpenAICompatibleImageAdapter,
+        )
+
+        return OpenAICompatibleImageAdapter(provider.id, model, route, credential_env)
+    raise AdapterDisabledError(
+        f"{provider.id}: the declared gateway's images route speaks the OpenAI images wire; "
+        f"a '{provider.adapter}' adapter cannot go through it"
+    )
 
 
 @dataclass
@@ -95,12 +125,6 @@ def build_adapters(
         if refusal is not None:
             result.unavailable[provider.id] = str(refusal)
             continue
-        if route is not None and provider.adapter not in OPENAI_IMAGES_WIRE:
-            result.unavailable[provider.id] = (
-                f"{provider.id}: the declared gateway's images route speaks the OpenAI images "
-                f"wire; a '{provider.adapter}' adapter cannot go through it"
-            )
-            continue
         if route is not None and provider.capacity == "unmetered" and not is_local_network(route):
             # Unmetered means "costs nothing per image": only true on the local
             # network. Through a remote gateway it is not, so the row is off.
@@ -110,7 +134,13 @@ def build_adapters(
             )
             continue
         try:
-            result.adapters[provider.id] = build_adapter(provider, base_url=route)
+            result.adapters[provider.id] = build_adapter(
+                provider,
+                gateway_route=route,
+                gateway_credential_env=gateway.images_credential_env
+                if gateway is not None and route is not None
+                else None,
+            )
         except (AdapterDisabledError, MissingCredentialError) as e:
             result.unavailable[provider.id] = str(e)
     result.refusal = refusal

@@ -3,6 +3,8 @@ caller (or the CLI) can branch on it rather than on message text."""
 
 from __future__ import annotations
 
+import math
+
 
 class StudioError(Exception):
     """Base class for every studio error."""
@@ -41,6 +43,26 @@ class ProviderDisabled(PermanentProviderError):
     the switch is turned back on."""
 
 
+# A host's "come back in N seconds" is bounded: at most a day (a value past it
+# would only park the job beyond any useful horizon, and an unbounded one
+# overflows ``timedelta``), at least a second (a zero would spin the scheduler).
+MAX_RETRY_AFTER_S = 24 * 3600.0
+MIN_RETRY_AFTER_S = 1.0
+DEFAULT_RETRY_AFTER_S = 30.0
+
+
+def clamp_retry_after(value: object, default: float = DEFAULT_RETRY_AFTER_S) -> float:
+    """A usable retry delay from ``value``: a non-number, a non-finite number
+    (``inf``, ``nan``) or a negative one is INVALID and yields ``default``; a
+    valid one is clamped to [``MIN_RETRY_AFTER_S``, ``MAX_RETRY_AFTER_S``]."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    v = float(value)
+    if not math.isfinite(v) or v < 0:
+        return default
+    return min(MAX_RETRY_AFTER_S, max(MIN_RETRY_AFTER_S, v))
+
+
 class ProviderRefusal(ProviderError):
     """A host's typed refusal: the job was NOT run and the host says when to
     come back. The scheduler requeues the job at ``retry_after_s`` without
@@ -52,7 +74,7 @@ class ProviderRefusal(ProviderError):
         self, message: str, retry_after_s: float, *, code: str | None = None, **detail: object
     ) -> None:
         super().__init__(message)
-        self.retry_after_s = retry_after_s
+        self.retry_after_s = clamp_retry_after(retry_after_s)
         self.code = code
         self.detail = detail
 

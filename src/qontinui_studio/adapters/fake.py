@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import io
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageDraw
 
@@ -43,6 +44,10 @@ class FakeImageAdapter:
         self._pending_polls = pending_polls
         self._polls: dict[str, int] = {}
         self.submitted: list[GenerationRequest] = []
+
+    def sent_parameters(self, request: GenerationRequest) -> dict[str, Any]:
+        # This wire carries no seed, recipe or negative-prompt field.
+        return {}
 
     def sent_prompt(self, request: GenerationRequest) -> str:
         return fold_negative(request)

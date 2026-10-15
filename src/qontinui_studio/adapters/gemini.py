@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+from typing import Any
 
 import httpx
 from google import genai
@@ -67,6 +68,10 @@ class GeminiImageAdapter:
                 ),
             )
         self._client = client
+
+    def sent_parameters(self, request: GenerationRequest) -> dict[str, Any]:
+        # This wire carries no seed, recipe or negative-prompt field.
+        return {}
 
     def sent_prompt(self, request: GenerationRequest) -> str:
         # The Gemini image API has no negative-prompt field.

@@ -48,6 +48,7 @@ import binascii
 import json
 import math
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -66,24 +67,32 @@ from qontinui_studio.adapters.base import (
     write_staged,
 )
 from qontinui_studio.errors import (
+    DEFAULT_RETRY_AFTER_S,
     MissingCredentialError,
     PermanentProviderError,
     ProviderBusy,
     ProviderDeferred,
     ProviderDisabled,
     ProviderOutcomeUnknown,
+    clamp_retry_after,
 )
 
-# Used when a refusal names no retry time.
-DEFAULT_RETRY_AFTER_S = 30.0
 # A refused connection means no host is listening at all — not a busy card.
 # The job is parked past the scheduler's run horizon (30 min), so ``brief run``
 # returns at once and reports it instead of re-dialling a dead port for as long
 # as the command runs; ``studio jobs run`` resumes it once it is due.
 CONNECT_REFUSED_RETRY_AFTER_S = 3600.0
-# The facade bounds an interactive job (wait + run) well under 300 s; reads are
-# per chunk, so a long SSE stream with progress events never trips this.
-READ_TIMEOUT_S = 300.0
+# The longest SILENT gap allowed while a job runs (httpx read timeouts are per
+# chunk, so a stream sending progress events never trips it).
+READ_TIMEOUT_S = 120.0
+# The wall-clock deadline across the WHOLE request, progress events included.
+# The facade bounds an interactive job (wait + run) well under 300 s. Checked
+# per event, so the worst case is this plus one silent gap plus the connect —
+# which ``hard_timeout_s`` covers, keeping the call inside the scheduler's
+# claim lease (hard timeout + 60 s): a live request is never reclaimed and
+# resubmitted.
+STREAM_DEADLINE_S = 480.0
+CONNECT_TIMEOUT_S = 10.0
 # About one megapixel, sides a multiple of 64 — what the D8 diffusion models take.
 TARGET_PIXELS = 1024 * 1024
 SIDE_MULTIPLE = 64
@@ -103,15 +112,19 @@ def size_for_ratio(aspect_ratio: str) -> str:
 
 
 def _retry_after(resp_headers: httpx.Headers | None, err: dict[str, Any], default: float) -> float:
-    value = err.get("retry_after_s")
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-        return float(value)
+    """The host's retry delay: the envelope's ``retry_after_s``, else the
+    ``Retry-After`` header, else ``default``. A non-finite or negative value is
+    invalid and skipped; a valid one is clamped (``clamp_retry_after``)."""
+    candidates: list[object] = [err.get("retry_after_s")]
     header = resp_headers.get("retry-after") if resp_headers is not None else None
     if header:
         try:
-            return max(0.0, float(header))
+            candidates.append(float(header))
         except ValueError:
             pass
+    for value in candidates:
+        if clamp_retry_after(value, default=-1.0) >= 0:
+            return clamp_retry_after(value)
     return default
 
 
@@ -185,12 +198,13 @@ class OpenAICompatibleImageAdapter:
         base_url: str,
         api_key_env: str | None = None,
         http: httpx.Client | None = None,
+        deadline_s: float = STREAM_DEADLINE_S,
     ) -> None:
         self.provider_id = provider_id
         self.model = model
         self.kind = provenance.LOCAL_ADAPTER
-        # Per-phase httpx timeouts: connect + upload + the longest silent gap.
-        self.hard_timeout_s = READ_TIMEOUT_S * 2
+        self._deadline_s = deadline_s
+        self.hard_timeout_s = deadline_s + READ_TIMEOUT_S + CONNECT_TIMEOUT_S
         self._base = base_url.rstrip("/")
         self._headers: dict[str, str] = {}
         if api_key_env:
@@ -198,7 +212,9 @@ class OpenAICompatibleImageAdapter:
             if not key:
                 raise MissingCredentialError(f"{provider_id}: env var {api_key_env} is unset")
             self._headers["Authorization"] = f"Bearer {key}"
-        self._http = http or httpx.Client(timeout=httpx.Timeout(READ_TIMEOUT_S, connect=10.0))
+        self._http = http or httpx.Client(
+            timeout=httpx.Timeout(READ_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
+        )
 
     @property
     def base_url(self) -> str:
@@ -207,6 +223,10 @@ class OpenAICompatibleImageAdapter:
     def sent_prompt(self, request: GenerationRequest) -> str:
         # The negative prompt travels in its own field.
         return request.prompt
+
+    def sent_parameters(self, request: GenerationRequest) -> dict[str, Any]:
+        """The generation parameters this wire actually carries."""
+        return self._extra_body(request)
 
     def _extra_body(self, request: GenerationRequest) -> dict[str, Any]:
         extra: dict[str, Any] = {"priority": request.priority}
@@ -241,6 +261,7 @@ class OpenAICompatibleImageAdapter:
         else:
             url = f"{self._base}/images/generations"
             kwargs = {"json": body}
+        deadline = time.monotonic() + self._deadline_s
         try:
             with self._http.stream("POST", url, headers=self._headers, **kwargs) as resp:
                 if resp.status_code >= 400:
@@ -249,9 +270,9 @@ class OpenAICompatibleImageAdapter:
                     raise _refusal(err, resp.status_code, resp.headers)
                 ctype = resp.headers.get("content-type", "")
                 if ctype.startswith("text/event-stream"):
-                    items = self._read_stream(resp)
+                    items = self._read_stream(resp, deadline)
                 else:
-                    items = self._read_json(resp.read())
+                    items = self._read_json(self._read_body(resp, deadline))
         except httpx.TransportError as e:
             if never_sent(e):
                 raise ProviderBusy(
@@ -264,8 +285,27 @@ class OpenAICompatibleImageAdapter:
             ) from e
         return self._stage(request, staging_dir, items)
 
-    def _read_stream(self, resp: httpx.Response) -> list[dict[str, Any]]:
-        for event, data in _sse_events(resp.iter_lines()):
+    def _past(self, deadline: float) -> None:
+        if time.monotonic() > deadline:
+            raise ProviderOutcomeUnknown(
+                f"{self.provider_id}: still running after the {self._deadline_s:.0f}s deadline; "
+                "stopped reading (the host may still finish the job)"
+            )
+
+    def _lines(self, resp: httpx.Response, deadline: float) -> Iterator[str]:
+        for line in resp.iter_lines():
+            self._past(deadline)
+            yield line
+
+    def _read_body(self, resp: httpx.Response, deadline: float) -> bytes:
+        chunks: list[bytes] = []
+        for chunk in resp.iter_bytes():
+            self._past(deadline)
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _read_stream(self, resp: httpx.Response, deadline: float) -> list[dict[str, Any]]:
+        for event, data in _sse_events(self._lines(resp, deadline)):
             try:
                 payload = json.loads(data)
             except ValueError:

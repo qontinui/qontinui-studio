@@ -64,6 +64,9 @@ class BatchOutcome:
     # Each unfinished or failed job's latest provider-side outcome
     # (``job_attempts``): ``busy``/``deferred``/``unknown``/``failed`` and why.
     last_attempts: dict[str, str] = field(default_factory=dict)
+    # Set when generation stopped because this run had waited its cap in total
+    # (a host answering ``busy`` again and again): why, and how to resume.
+    stopped_waiting: str | None = None
     unavailable_providers: dict[str, str] = field(default_factory=dict)
     publish: PublishResult | None = None
     error: str | None = None
@@ -86,6 +89,8 @@ class Context:
     policy: RetryPolicy = field(default_factory=RetryPolicy)
     bridge: BridgeFactory = HttpUiBridge
     fetch: ManifestFetch = http_manifest_fetch
+    # Told about every wait before it is slept (seconds, why) — the CLI prints it.
+    on_wait: Callable[[float, str], None] | None = None
 
     def scheduler(self) -> Scheduler:
         return Scheduler(
@@ -145,6 +150,19 @@ def _request_for(loaded: LoadedBrief) -> tuple[list[str], GenerationRequest]:
     )
 
 
+def _adapter_kind(ctx: Context, job: sqlite3.Row) -> str:
+    """The adapter kind the job was claimed for. A job claimed before schema v2
+    recorded none and the migration had no inventory to backfill it from:
+    resolve it from the inventory now (a pre-v2 job can only have used an
+    adapter that existed then — never the local one), or say it is unrecorded."""
+    if job["adapter"]:
+        return str(job["adapter"])
+    try:
+        return ctx.inventory.get(str(job["provider"])).adapter
+    except ConfigError:
+        return "unrecorded (claimed before schema v2)"
+
+
 INGEST_LEASE_S = 600.0
 # Renewed on every scheduler iteration and before ingest, so it only has to
 # outlast one iteration (a sleep up to the 30 min horizon + one provider call).
@@ -190,6 +208,10 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
     brief = loaded.brief
     out_dir = ctx.workspace.variants_dir / job["batch_id"]
     created_at = ctx.clock().isoformat()
+    adapter_kind = _adapter_kind(ctx, job)
+    # Only the parameters the wire actually carried (none for a job claimed
+    # before schema v2, which recorded none).
+    sent: dict[str, Any] = json.loads(job["sent_json"] or "{}")
 
     def sidecar(
         path: Path,
@@ -206,16 +228,16 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
                 role=role,
                 provider_id=terms.provider,
                 provider_name=terms.provider_name,
-                adapter=str(job["adapter"] or ""),
+                adapter=adapter_kind,
                 model=model,
                 terms=asdict(terms),
                 prompt=prompt,
-                negative_prompt=brief.negative_prompt,
+                negative_prompt=sent.get("negative_prompt"),
                 references=[
                     {"path": str(ref), "sha256": sha256_file(ref)} for ref in brief.reference_images
                 ],
-                seed=brief.seed,
-                recipe=brief.recipe,
+                seed=sent.get("seed"),
+                recipe=sent.get("recipe"),
                 created_at=created_at,
                 job_id=str(job["id"]),
                 batch_id=str(job["batch_id"]),
@@ -511,7 +533,13 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
         raise ConfigError(reason)
     outcome = BatchOutcome(batch_id=batch_id, status=row["status"])
     outcome.unavailable_providers = dict(ctx.adapters.unavailable)
-    ctx.scheduler().run({batch_id: _request_for(loaded)}, sleep=ctx.sleep, on_iteration=lease.renew)
+    report = ctx.scheduler().run(
+        {batch_id: _request_for(loaded)},
+        sleep=ctx.sleep,
+        on_iteration=lease.renew,
+        on_wait=ctx.on_wait,
+    )
+    outcome.stopped_waiting = report.stopped_waiting
     lease.renew()
 
     # An ingest whose process died is reclaimable once its lease lapses.
