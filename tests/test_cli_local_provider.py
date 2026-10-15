@@ -87,7 +87,7 @@ def _xmp(path: Path) -> str:
 
 
 def _ledger(studio_root: Path) -> list[tuple[str, str]]:
-    db = sqlite3.connect(studio_root / ".studio" / "studio.db")
+    db = sqlite3.Connection(studio_root / ".studio" / "studio.db")
     try:
         return [
             tuple(r) for r in db.execute("SELECT provider, outcome FROM job_attempts ORDER BY id")
@@ -152,7 +152,7 @@ def test_a_refused_connection_is_a_retryable_busy(studio_root: Path, write_brief
     assert code == 3, output  # waiting, not failed
     assert "last attempt: busy from local-gpu" in output
     assert _ledger(studio_root) == [("local-gpu", "busy")]
-    db = sqlite3.connect(studio_root / ".studio" / "studio.db")
+    db = sqlite3.Connection(studio_root / ".studio" / "studio.db")
     status, tries = db.execute("SELECT status, attempts FROM jobs").fetchone()
     db.close()
     assert (status, tries) == ("queued", 0)
