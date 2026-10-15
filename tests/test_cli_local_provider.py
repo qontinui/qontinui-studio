@@ -96,13 +96,12 @@ def _attempts(studio_root: Path) -> list[tuple[str, str]]:
         db.close()
 
 
-def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
-    host: ImageHost,
-    studio_root: Path,
-    write_brief: Callable[..., Path],
-    fake_time: FakeClock,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+# The test signatures stay on one line (``fmt: skip``): these are the Phase 11
+# arming tests, and the arming prover's Python extractor ends a definition at
+# the close of a multi-line signature, so it would read none of the body.
+
+
+def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(host: ImageHost, studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock, capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
     # The host sends UNMARKED bytes: the studio's own writer must mark them.
     host.queue(
         imagehost.sse_reply(
@@ -131,13 +130,7 @@ def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
         assert record["qontinui_provenance"] == imagehost.facade_provenance()
 
 
-def test_a_transport_drop_after_the_request_was_sent_is_unknown_and_retried(
-    host: ImageHost,
-    studio_root: Path,
-    write_brief: Callable[..., Path],
-    fake_time: FakeClock,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_a_transport_drop_after_the_request_was_sent_is_unknown_and_retried(host: ImageHost, studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock, capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
     host.queue(
         imagehost.sse_reply(*imagehost.progress(), drop_after=2),
         imagehost.sse_reply(imagehost.completed()),
@@ -151,12 +144,7 @@ def test_a_transport_drop_after_the_request_was_sent_is_unknown_and_retried(
     assert _attempts(studio_root) == [("local-gpu", "unknown"), ("local-gpu", "done")]
 
 
-def test_a_refused_connection_is_a_retryable_busy(
-    studio_root: Path,
-    write_brief: Callable[..., Path],
-    fake_time: FakeClock,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_a_refused_connection_is_a_retryable_busy(studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock, capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
     base = f"http://127.0.0.1:{imagehost.closed_port()}/v1"
     with pytest.raises(SystemExit) as done:
         main(_studio(studio_root, base, write_brief))
