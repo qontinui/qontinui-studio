@@ -137,12 +137,14 @@ def _no_runner_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests never reach a real runner: by default there is none (``not_declared``,
     the no-runner reading). Gateway tests patch this again or call
     ``gateway.read_gateway_state`` against their own loopback server."""
-    from qontinui_studio import cli
-    from qontinui_studio.gateway import GatewayState
 
-    monkeypatch.setattr(
-        cli, "read_gateway_state", lambda: GatewayState("not_declared", "no_runner", "test")
-    )
+    def no_runner() -> object:
+        from qontinui_studio.gateway import GatewayState
+
+        return GatewayState("not_declared", "no_runner", "test")
+
+    # By dotted name, so this fixture never imports the code under test.
+    monkeypatch.setattr("qontinui_studio.cli.read_gateway_state", no_runner, raising=False)
 
 
 def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:

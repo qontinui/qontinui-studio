@@ -18,9 +18,7 @@ from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from PIL import Image
-
-from qontinui_studio import marker
+from PIL import Image, PngImagePlugin
 
 WEIGHT_SHA = "a" * 64
 RECIPE_SHA = "b" * 64
@@ -46,9 +44,25 @@ def facade_provenance(seed: int = 1234, **overrides: Any) -> dict[str, Any]:
     return record
 
 
+# The facade marks its own PNGs (plan Phase 10). Spelled out here rather than
+# imported, so this host stays independent of the code under test.
+FACADE_XMP = (
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+    'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" '
+    'xmlns:Iptc4xmpExt="http://iptc.org/std/Iptc4xmpExt/2008-02-29/" '
+    "Iptc4xmpExt:DigitalSourceType="
+    '"http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"/>'
+    "</rdf:RDF></x:xmpmeta>"
+)
+
+
 def png_b64(marked: bool = True, size: tuple[int, int] = (96, 54)) -> str:
     buf = io.BytesIO()
-    kwargs = marker.save_options("png") if marked else {}
+    kwargs: dict[str, Any] = {}
+    if marked:
+        info = PngImagePlugin.PngInfo()
+        info.add_itxt("XML:com.adobe.xmp", FACADE_XMP, zip=False)
+        kwargs["pnginfo"] = info
     Image.new("RGB", size, (30, 90, 160)).save(buf, "PNG", **kwargs)
     return base64.b64encode(buf.getvalue()).decode()
 
