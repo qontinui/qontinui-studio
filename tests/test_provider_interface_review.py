@@ -574,3 +574,27 @@ def test_low1_cloud_wires_report_no_sent_parameters(monkeypatch: pytest.MonkeyPa
         "recipe": "hero",
         "negative_prompt": "n",
     }
+
+
+# ---- a bulk busy never moves, not even to another free local host ---------------
+
+
+def test_a_bulk_busy_stays_on_its_host_even_with_another_unmetered_host(
+    studio_root: Path, make_context: Callable[..., Context], write_brief: Callable[..., Path]
+) -> None:
+    second = (
+        LOCAL_ROW.replace("id: local-gpu", "id: local-gpu2")
+        .replace("local.test", "local2.test")
+        .replace("provider: Local image facade", "provider: Second local facade")
+        .replace("    api_key_env: STUDIO_TEST_FACADE_KEY\n", "")
+    )
+    _with(studio_root, LOCAL_ROW, second)
+    path = write_brief(providers="local-gpu, local-gpu2")
+    path.write_text(path.read_text() + "priority: bulk\n")
+    first = Scripted("local-gpu", ProviderBusy("busy", 120.0))
+    other = Scripted("local-gpu2")
+    ctx = make_context(adapters=AdapterSet(adapters={"local-gpu": first, "local-gpu2": other}))
+    batch = new_batch(ctx, load_brief(path))
+    ctx.scheduler().step({batch: _request_for(load_brief(path))})
+    row = ctx.conn.execute("SELECT provider, tried_providers FROM jobs").fetchone()
+    assert (row["provider"], row["tried_providers"], other.calls) == ("local-gpu", "[]", 0)
