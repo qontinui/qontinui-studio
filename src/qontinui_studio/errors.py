@@ -35,6 +35,63 @@ class PermanentProviderError(ProviderError):
     """A failure retrying will not fix (4xx other than 429, safety refusal, no image)."""
 
 
+class ProviderDisabled(PermanentProviderError):
+    """The host answered the typed refusal ``disabled``: image generation is
+    switched off on that machine. Nothing ran; this provider is unusable until
+    the switch is turned back on."""
+
+
+class ProviderRefusal(ProviderError):
+    """A host's typed refusal: the job was NOT run and the host says when to
+    come back. The scheduler requeues the job at ``retry_after_s`` without
+    spending a quota unit or an attempt (plan 2026-10-13 Phase 11 step 1)."""
+
+    kind: str = "refusal"
+
+    def __init__(
+        self, message: str, retry_after_s: float, *, code: str | None = None, **detail: object
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+        self.code = code
+        self.detail = detail
+
+
+class ProviderBusy(ProviderRefusal):
+    """``busy``: the host's one-job-at-a-time card is taken (or its VRAM is
+    held out of band), or the connection was refused — in every case the job
+    provably never started."""
+
+    kind = "busy"
+
+
+class ProviderDeferred(ProviderRefusal):
+    """``deferred``: a bulk job asked outside the host's bulk window."""
+
+    kind = "deferred"
+
+
+class ProviderOutcomeUnknown(ProviderError):
+    """The transport failed AFTER the request was sent (a drop mid-flight, a
+    truncated or unreadable answer, a lost job id): the job may or may not have
+    run. Never collapsed into failed or done; the scheduler records it as
+    ``unknown`` and retries as a fresh attempt."""
+
+
+class GatewayRefusal(StudioError):
+    """Image calls refused because this install routes model calls through a
+    gateway that declares no images-capable route, or the runner cannot say
+    whether a gateway is declared (decision record
+    ``gateway-tenants-route-every-model-call-through-the-gateway``). No vendor
+    or local call is made."""
+
+    code = "gateway_has_no_image_route"
+
+    def __init__(self, message: str, state: str) -> None:
+        super().__init__(message)
+        self.state = state
+
+
 class MissingCredentialError(ProviderError):
     """The adapter's API key env var is unset."""
 

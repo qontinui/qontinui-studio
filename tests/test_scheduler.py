@@ -116,7 +116,7 @@ class NeverFinishes(FakeImageAdapter):
     def poll(self, job):  # type: ignore[no-untyped-def]
         from qontinui_studio.adapters import PollResult
 
-        return PollResult(status="pending")
+        return PollResult(status="running")
 
 
 def test_poll_deadline_moves_the_job_to_the_next_provider(

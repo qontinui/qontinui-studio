@@ -24,8 +24,8 @@ def _fake_preview(monkeypatch: pytest.MonkeyPatch, preview: FakePreview) -> None
     """The CLI's Context talks to the fake preview server instead of HTTP."""
     real = cli._context
 
-    def with_preview(root: Path) -> pipeline.Context:
-        ctx = real(root)
+    def with_preview(root: Path, generate: bool = False) -> pipeline.Context:
+        ctx = real(root, generate)
         ctx.bridge = preview.bridge
         ctx.fetch = preview.fetch
         return ctx
@@ -141,7 +141,9 @@ def test_cli_brief_run_backs_off_through_transient_failures(
 ) -> None:
     slept: list[float] = []
     flaky = FakeImageAdapter("fake", "fake-v1", fail_first=2)
-    monkeypatch.setattr(cli, "build_adapters", lambda inv: AdapterSet(adapters={"fake": flaky}))
+    monkeypatch.setattr(
+        cli, "build_adapters", lambda inv, **kw: AdapterSet(adapters={"fake": flaky})
+    )
     # Fake time advances with each sleep so the backoff is observable.
     clock = FakeClock()
 

@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlun
 
 import httpx
 
+from qontinui_studio import marker, provenance
 from qontinui_studio.library import AssetRecord, VariantRecord
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site, Slot
@@ -79,7 +80,41 @@ def d5_provenance(asset: AssetRecord, variant: VariantRecord) -> GateResult:
                 "fail",
                 f"{label} file {path} does not match its recorded sha256",
             )
-    return GateResult("d5_provenance", subject, "pass", "provenance complete; digests match")
+        if asset.origin != "generated":
+            continue
+        # Plan 2026-10-13 Phase 11 step 4 / a5ec7670: every generated file and
+        # derivative carries the IPTC AI-generated marker and a complete
+        # provenance sidecar describing exactly these bytes.
+        if not marker.is_marked(path):
+            return GateResult(
+                "d5_provenance",
+                subject,
+                "fail",
+                f"{label} file {path} lacks the AI-generated marker",
+            )
+        record = provenance.read(path)
+        if record is None:
+            return GateResult(
+                "d5_provenance", subject, "fail", f"{label} file {path} has no provenance sidecar"
+            )
+        gaps = provenance.missing(record)
+        if gaps:
+            return GateResult(
+                "d5_provenance",
+                subject,
+                "fail",
+                f"{label} file {path}: provenance sidecar incomplete: {gaps}",
+            )
+        if record["file"]["sha256"] != digest:
+            return GateResult(
+                "d5_provenance",
+                subject,
+                "fail",
+                f"{label} file {path}: provenance sidecar describes other bytes",
+            )
+    return GateResult(
+        "d5_provenance", subject, "pass", "provenance complete; digests match; marker present"
+    )
 
 
 def d5_licence(asset: AssetRecord, variant: VariantRecord, site: Site) -> GateResult:

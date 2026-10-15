@@ -58,6 +58,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from qontinui_studio import provenance
 from qontinui_studio.commands import studio_command
 from qontinui_studio.errors import ConfigError, JournalError, PublicationRefused, StudioError
 from qontinui_studio.gates import (
@@ -75,6 +76,7 @@ from qontinui_studio.gates import (
 )
 from qontinui_studio.library import AssetRecord, Library, VariantRecord
 from qontinui_studio.locks import site_locks
+from qontinui_studio.marker import DIGITAL_SOURCE_TYPE
 from qontinui_studio.notify import Delivery, Notice, Notifier
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site
@@ -169,15 +171,23 @@ def _manifest_entry(
     label: str,
     batch_id: str,
     published_at: str,
+    sources: dict[str, Path],
 ) -> dict[str, Any]:
     """One slot's manifest entry. ``sha256`` (format -> digest) is what a site
     template appends as ``?sha=`` to each file URL: a cache-buster, and the
-    proof D7 checks that the page shows THIS batch's bytes."""
+    proof D7 checks that the page shows THIS batch's bytes.
+
+    A published file is a byte-identical copy of its variant, so it carries the
+    variant's IPTC marker; its provenance sidecar travels HERE, per format
+    (``provenance``), rather than as a loose file in the publish dir that the
+    journalled swap would have to move with it."""
     return {
         "files": files,
         "sha256": shas,
         "label": label,
         "ai_generated": True,
+        "digital_source_type": DIGITAL_SOURCE_TYPE,
+        "provenance": {fmt: provenance.read(path) for fmt, path in sorted(sources.items())},
         "asset_uid": asset.uid,
         "batch_id": batch_id,
         "provider": asset.provider,
@@ -699,6 +709,7 @@ def _plan(
             site.label_for_ai(),
             batch_id,
             now_iso,
+            {variant.format: Path(variant.path) for _, variant, _ in rows},
         )
     return list(plans.values())
 
@@ -1250,6 +1261,7 @@ def _unpublish_locked(
                     site.label_for_ai(),
                     prev_batch,
                     prev[0]["published_at"],
+                    {r["vformat"]: Path(r["vpath"]) for r in prev},
                 )
             # ---- D7 on the post-unpublish state of this site ----------------
             if restores:

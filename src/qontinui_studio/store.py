@@ -203,9 +203,21 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   (``approval_status``/``approval_by``/``approval_on``). An approved asset
 #   must have ``licence_commercial_use = 'yes'`` (D5), enforced by a CHECK.
 #   ``ai_generated = 1`` stays pinned.
+#
+# Version 2 — typed job states (plan 2026-10-13 Phase 11):
+#
+# * ``job_attempts``: one row per provider-side outcome of a job — ``done``,
+#   ``failed``, ``unknown``, ``deferred`` or ``busy`` (a CHECK). ``unknown``
+#   (the transport failed mid-flight, or the job id was lost) is recorded as
+#   itself, never collapsed into ``failed`` or ``done``; the job is retried.
+# * ``jobs.quota_day``: the quota day a submission's unit was spent from, so a
+#   host refusal (``deferred``/``busy``) can refund exactly that unit. NULL for
+#   an unmetered provider (nothing is spent).
+# * ``jobs.adapter``: the adapter kind the job was claimed for, recorded in
+#   every provenance sidecar (the local kind must carry the facade's record).
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _BATCHES_V1 = """
 CREATE TABLE batches_v1 (
@@ -311,7 +323,30 @@ def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
     )
 
 
-_MIGRATIONS = {0: _migrate_v0_to_v1}
+ATTEMPT_OUTCOMES = ("done", "failed", "unknown", "deferred", "busy")
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE jobs ADD COLUMN quota_day TEXT")
+    conn.execute("ALTER TABLE jobs ADD COLUMN adapter TEXT")
+    conn.execute(
+        """
+        CREATE TABLE job_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(id),
+            provider TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN
+                ('done', 'failed', 'unknown', 'deferred', 'busy')),
+            detail TEXT,
+            retry_after_s REAL,
+            at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX job_attempts_job ON job_attempts (job_id, id)")
+
+
+_MIGRATIONS = {0: _migrate_v0_to_v1, 1: _migrate_v1_to_v2}
 
 
 def _dangling(conn: sqlite3.Connection) -> Counter[tuple[str, str]]:

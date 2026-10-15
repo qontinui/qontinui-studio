@@ -9,6 +9,7 @@ import httpx
 import pytest
 from PIL import Image
 
+from qontinui_studio import marker, provenance
 from qontinui_studio.gates import (
     d5_licence,
     d5_provenance,
@@ -23,12 +24,37 @@ from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site, Slot
 
 
+def _sidecar(path: Path) -> dict[str, object]:
+    return provenance.build(
+        file_sha256=sha256_file(path),
+        file_name=path.name,
+        role="raw",
+        provider_id="p",
+        provider_name="P",
+        adapter="fake",
+        model="m",
+        terms={"commercial_use": "yes"},
+        prompt="x",
+        negative_prompt=None,
+        references=[],
+        seed=None,
+        recipe=None,
+        created_at="2026-10-09T00:00:00+00:00",
+        job_id="b-v0",
+        batch_id="b",
+        brief_id="a",
+        facade=None,
+    )
+
+
 @pytest.fixture
 def records(tmp_path: Path) -> tuple[AssetRecord, VariantRecord]:
     raw = tmp_path / "raw.png"
     var = tmp_path / "v.webp"
-    Image.new("RGB", (8, 8)).save(raw)
-    Image.new("RGB", (4, 4)).save(var)
+    Image.new("RGB", (8, 8)).save(raw, "PNG", **marker.save_options("png"))
+    Image.new("RGB", (4, 4)).save(var, "WEBP", **marker.save_options("webp"))
+    for path in (raw, var):
+        provenance.write(path, _sidecar(path))
     asset = AssetRecord(
         uid="b-v0-0",
         asset_id="a",
@@ -88,6 +114,31 @@ def test_provenance_passes_and_detects_tampering(
     Path(variant.path).write_bytes(b"tampered")
     assert "does not match" in d5_provenance(asset, variant).detail
     assert d5_provenance(replace(asset, model=""), variant).failed
+
+
+def test_provenance_requires_the_marker_and_a_matching_sidecar(
+    records: tuple[AssetRecord, VariantRecord], tmp_path: Path
+) -> None:
+    """Plan 2026-10-13 Phase 11 step 4: a generated file without the IPTC
+    marker, without a sidecar, or with a sidecar for other bytes fails D5."""
+    asset, variant = records
+    var = Path(variant.path)
+    # An unmarked variant (same recorded digest, so only the marker differs).
+    unmarked = tmp_path / "unmarked.webp"
+    Image.new("RGB", (4, 4)).save(unmarked, "WEBP")
+    provenance.write(unmarked, _sidecar(unmarked))
+    bare = replace(variant, path=str(unmarked), sha256=sha256_file(unmarked))
+    assert "lacks the AI-generated marker" in d5_provenance(asset, bare).detail
+    # No sidecar.
+    provenance.sidecar_path(var).unlink()
+    assert "no provenance sidecar" in d5_provenance(asset, variant).detail
+    # A sidecar that describes other bytes.
+    other = _sidecar(var)
+    other["file"] = {"name": var.name, "sha256": "0" * 64, "role": "raw"}
+    provenance.write(var, other)
+    assert "describes other bytes" in d5_provenance(asset, variant).detail
+    # An imported asset is not held to it (its file was not made by the studio).
+    assert d5_provenance(replace(asset, origin="imported"), bare).outcome == "pass"
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,12 @@
 """``studio`` — the command line.
 
 Exit codes: 0 ok; 1 config/usage error; 2 publication refused by a gate;
-3 generation deferred (quota spent) or failed; 4 no build record yet (the
+3 generation deferred (quota spent, a host's ``busy``/``deferred``, an
+``unknown`` outcome being retried) or failed; 4 no build record yet (the
 factory's record route answered 404 or was unreachable); 5 a launch trigger was
-registered but its read-back did not confirm it.
+registered but its read-back did not confirm it; 6 image generation refused
+before any provider call (``gateway_has_no_image_route``: this install routes
+model calls through a gateway with no images route, or the runner cannot say).
 """
 
 from __future__ import annotations
@@ -19,7 +22,8 @@ import click
 from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.briefs import load_brief, validate_brief
-from qontinui_studio.errors import ImportRefused, PublicationRefused, StudioError
+from qontinui_studio.errors import GatewayRefusal, ImportRefused, PublicationRefused, StudioError
+from qontinui_studio.gateway import read_gateway_state
 from qontinui_studio.inbox import import_inbox
 from qontinui_studio.launch.facts import derive_facts
 from qontinui_studio.launch.kit import KitOptions, KitRun, run_capture, run_kit
@@ -51,7 +55,10 @@ class Obj:
     root: Path
 
 
-def _context(root: Path) -> Context:
+def _context(root: Path, generate: bool = False) -> Context:
+    """The command context. ``generate`` reads the runner's model-gateway state
+    first (plan 2026-10-13 Phase 11 step 3): only a command that calls image
+    providers needs it, and it decides which adapters may be built."""
     ws = Workspace(root)
     inventory = load_providers(ws.providers_path)
     file_notifier = FileNotifier(ws.notices_dir)
@@ -60,9 +67,17 @@ def _context(root: Path) -> Context:
         conn=connect(ws.db_path),
         inventory=inventory,
         sites=load_sites(ws.sites_dir, root),
-        adapters=build_adapters(inventory),
+        adapters=build_adapters(inventory, gateway=read_gateway_state() if generate else None),
         notifier=CoordFindingNotifier(file_notifier),
     )
+
+
+def _refuse_on_gateway(ctx: Context) -> None:
+    """Exit 6 with the typed refusal when no image call may be made at all."""
+    refusal: GatewayRefusal | None = ctx.adapters.refusal
+    if refusal is not None:
+        click.echo(f"refused: {refusal.code} (gateway state: {refusal.state}): {refusal}", err=True)
+        sys.exit(6)
 
 
 def _report(outcome: BatchOutcome) -> int:
@@ -78,7 +93,10 @@ def _report(outcome: BatchOutcome) -> int:
     for j in outcome.failed_jobs:
         click.echo(f"  job {j}: failed")
     for j in outcome.deferred_jobs:
-        click.echo(f"  job {j}: deferred (quota or backoff)")
+        last = outcome.last_attempts.get(j)
+        click.echo(
+            f"  job {j}: deferred" + (f" (last attempt: {last})" if last else " (quota or backoff)")
+        )
     if outcome.publish is not None:
         for g in outcome.publish.gate_results:
             if g.outcome != "pass":
@@ -138,7 +156,8 @@ def brief_validate(obj: Obj, paths: tuple[Path, ...]) -> None:
 @click.pass_obj
 def brief_run(obj: Obj, path: Path, no_publish: bool) -> None:
     """Generate, post-process and (gate-)publish one brief."""
-    ctx = _context(obj.root)
+    ctx = _context(obj.root, generate=True)
+    _refuse_on_gateway(ctx)
     try:
         outcome = run_brief(ctx, path, publish=not no_publish)
     except StudioError as e:
@@ -156,7 +175,8 @@ def jobs() -> None:
 @click.pass_obj
 def jobs_run(obj: Obj, no_publish: bool) -> None:
     """Resume every batch still generating (e.g. deferred to today's quota)."""
-    ctx = _context(obj.root)
+    ctx = _context(obj.root, generate=True)
+    _refuse_on_gateway(ctx)
     outcomes = resume_all(ctx, publish=not no_publish)
     if not outcomes:
         click.echo("no batches are generating")
@@ -535,7 +555,7 @@ def launch_build(
     out: Path | None,
 ) -> None:
     """Assemble a launch bundle without publishing it."""
-    ctx = _context(obj.root)
+    ctx = _context(obj.root, generate=not no_generate)
     options = _kit_options(record_file, no_generate, no_capture, no_video, replay_clip, out)
     run = run_kit(ctx, product_path, options)
     _report_kit(run)
@@ -557,7 +577,7 @@ def launch_run(
     out: Path | None,
 ) -> None:
     """Assemble a launch bundle and publish it if every gate passes."""
-    ctx = _context(obj.root)
+    ctx = _context(obj.root, generate=not no_generate)
     options = _kit_options(record_file, no_generate, no_capture, no_video, replay_clip, out)
     run = run_kit(ctx, product_path, options, publish=True)
     _report_kit(run)

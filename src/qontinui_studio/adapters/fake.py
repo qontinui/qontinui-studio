@@ -9,6 +9,7 @@ shipped providers.yaml has none.
 from __future__ import annotations
 
 import hashlib
+import io
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -18,6 +19,8 @@ from qontinui_studio.adapters.base import (
     PollResult,
     SubmittedJob,
     copy_staged,
+    fold_negative,
+    write_staged,
 )
 from qontinui_studio.errors import TransientProviderError
 
@@ -34,11 +37,15 @@ class FakeImageAdapter:
     ) -> None:
         self.provider_id = provider_id
         self.model = model
+        self.kind = "fake"
         self.hard_timeout_s = 0.0
         self._fail_remaining = fail_first
         self._pending_polls = pending_polls
         self._polls: dict[str, int] = {}
         self.submitted: list[GenerationRequest] = []
+
+    def sent_prompt(self, request: GenerationRequest) -> str:
+        return fold_negative(request)
 
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
         if self._fail_remaining > 0:
@@ -50,24 +57,24 @@ class FakeImageAdapter:
             size = (LONG_EDGE, max(1, round(LONG_EDGE * h / w)))
         else:
             size = (max(1, round(LONG_EDGE * w / h)), LONG_EDGE)
-        digest = hashlib.sha256(request.prompt.encode()).digest()
+        digest = hashlib.sha256(self.sent_prompt(request).encode()).digest()
         img = Image.new("RGB", size, (digest[0], digest[1], digest[2]))
         draw = ImageDraw.Draw(img)
         draw.ellipse(
             (size[0] // 4, size[1] // 4, 3 * size[0] // 4, 3 * size[1] // 4),
             fill=(digest[3], digest[4], digest[5]),
         )
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        path = staging_dir / f"{request.job_id}-0.png"
-        img.save(path, "PNG")
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        path = write_staged(staging_dir, f"{request.job_id}-0", buf.getvalue())
         return SubmittedJob(external_id=f"fake-{request.job_id}", data={"staged": [str(path)]})
 
     def poll(self, job: SubmittedJob) -> PollResult:
-        # The first ``pending_polls`` polls report pending, which exercises the
+        # The first ``pending_polls`` polls report running, which exercises the
         # scheduler's poll loop the way an asynchronous provider would.
         n = self._polls.get(job.external_id, 0)
         self._polls[job.external_id] = n + 1
-        return PollResult(status="pending" if n < self._pending_polls else "succeeded")
+        return PollResult(status="running" if n < self._pending_polls else "done")
 
     def download(self, job: SubmittedJob, dest_dir: Path) -> list[Path]:
         return copy_staged(job, dest_dir)

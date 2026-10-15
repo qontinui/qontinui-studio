@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from qontinui_studio import postprocess
+from qontinui_studio import marker, postprocess
 from qontinui_studio.errors import (
     BackgroundRemovalUnavailable,
     FfmpegFailed,
@@ -37,15 +37,18 @@ def test_resize_and_upscale() -> None:
 @pytest.mark.parametrize("fmt", ["webp", "avif", "png", "jpeg"])
 def test_export_formats(tmp_path: Path, fmt: str) -> None:
     img = Image.new("RGBA", (64, 48), (1, 2, 3, 255))
-    out = postprocess.export(img, tmp_path / "x", fmt)
+    out = postprocess.export(img, tmp_path / "x", fmt, ai_generated=True)
     with Image.open(out) as back:
         assert back.size == (64, 48)
+    assert marker.is_marked(out)
+    plain = postprocess.export(img, tmp_path / "plain", fmt, ai_generated=False)
+    assert not marker.is_marked(plain)
 
 
 def test_export_avif_unsupported_is_typed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(postprocess.features, "check", lambda name: False)
     with pytest.raises(FormatUnsupported):
-        postprocess.export(Image.new("RGB", (4, 4)), tmp_path / "x", "avif")
+        postprocess.export(Image.new("RGB", (4, 4)), tmp_path / "x", "avif", ai_generated=True)
 
 
 def test_background_removal_without_rembg_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:

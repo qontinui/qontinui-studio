@@ -269,8 +269,8 @@ def test_cli_launch_run_publishes(
     fake = launch_preview(studio_root)
     real = cli._context
 
-    def _ctx(root: Path) -> Context:
-        ctx = real(root)
+    def _ctx(root: Path, generate: bool = False) -> Context:
+        ctx = real(root, generate)
         ctx.bridge, ctx.fetch = fake.bridge, fake.fetch
         return ctx
 

@@ -118,7 +118,16 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
     db = tmp_path / ".studio" / "studio.db"
     _v0_db(db, write_image(tmp_path / "raw.png"))
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    # v2: typed job states and the refundable quota day.
+    job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert {"quota_day", "adapter"} <= job_cols
+    assert conn.execute("SELECT COUNT(*) FROM job_attempts").fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO job_attempts (job_id, provider, outcome, at) VALUES (?, 'p', 'pending', 't')",
+            (conn.execute("SELECT id FROM jobs").fetchone()[0],),
+        )
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert not conn.execute("PRAGMA foreign_key_check").fetchall()
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -147,7 +156,7 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
 
     # A second connect is a no-op.
     again = connect(db)
-    assert again.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert again.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert again.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
 
 
@@ -209,7 +218,7 @@ def test_a_dangling_reference_that_predates_the_migration_does_not_block_it(
     raw.commit()
     raw.close()
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
 
 
@@ -221,7 +230,7 @@ def test_concurrent_connects_migrate_exactly_once(tmp_path: Path) -> None:
     def worker() -> None:
         try:
             c = connect(db)
-            assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+            assert c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
             c.close()
         except BaseException as e:  # surfaced below
             errors.append(e)

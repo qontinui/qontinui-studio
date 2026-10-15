@@ -14,5 +14,5 @@ prompt: >-
 negative_prompt: text, logos, people, watermarks
 style_guide: ../style/warm-minimal.md
 reference_images: []
-provider_preference: [gemini, openai]
+provider_preference: [local-gpu, gemini, openai]
 variants: 2

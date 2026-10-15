@@ -29,6 +29,7 @@ from qontinui_studio.sites import load_sites
 from qontinui_studio.store import connect
 from qontinui_studio.workspace import Workspace
 
+from .imagehost import closed_port
 from .launch_support import (
     document,
     launch_preview,
@@ -129,9 +130,15 @@ def test_walkthrough_from_stills_when_recording_is_off(
 
 
 @needs_playwright
-def test_self_launch_with_the_shipped_product_definition(tmp_path: Path, record_file: Path) -> None:
+@pytest.mark.local_http
+def test_self_launch_with_the_shipped_product_definition(
+    tmp_path: Path, record_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The kit launches ITSELF: the repo's own products/qontinui-studio.yaml,
     capturing the studio's own UI (its review page), on a fixture record."""
+    # The shipped local-gpu row points at a loopback facade; here none listens
+    # (a port nothing is bound to), so the local GPU answers a typed busy.
+    monkeypatch.setenv("STUDIO_LOCAL_GPU_BASE_URL", f"http://127.0.0.1:{closed_port()}/v1")
     root = tmp_path / "self"
     for name in ("products", "sites", "briefs", "style"):
         shutil.copytree(REPO / name, root / name)
@@ -157,9 +164,11 @@ def test_self_launch_with_the_shipped_product_definition(tmp_path: Path, record_
     # page health cannot be waived: the gates REFUSE, nothing is copied.
     assert r.exit_code == 2, r.output
     assert "not_configured  d7_page_health" in r.output
-    # No generator has a quota in the shipped inventory: decoration is skipped
-    # with a note, and the launch still assembles (D1).
-    assert "decorative assets not generated" in r.output
+    # The local GPU is the only schedulable generator and no facade is
+    # listening: the decoration batch waits on a typed busy, and the launch
+    # still assembles without it (D1).
+    assert "brief qontinui-studio-launch.yaml: batch qontinui-studio-launch-" in r.output
+    assert "generating" in r.output
     published = root / ".studio" / "published" / "qontinui-studio"
     assert not (published / "index.html").exists()  # only the publish lock was taken
 
@@ -199,10 +208,10 @@ def test_shipped_product_definition_is_valid() -> None:
     assert product.capture is not None and product.capture.script.is_file()
     assert product.brief is not None and product.brief.is_file()
     r = CliRunner().invoke(main, ["--root", str(REPO), "brief", "validate", str(product.brief)])
-    # The brief itself is well-formed; the only problem allowed is that no
-    # provider has a quota yet (the operator's paid-API decision).
-    problems = [ln for ln in r.output.splitlines() if ln.strip()]
-    assert all("no preferred provider is schedulable" in ln for ln in problems), problems
+    # The brief is well-formed and runnable: its first preference is the
+    # unmetered local GPU.
+    assert r.exit_code == 0, r.output
+    assert r.output.strip().endswith(": ok"), r.output
 
 
 def test_cli_build_exits_4_without_a_record(

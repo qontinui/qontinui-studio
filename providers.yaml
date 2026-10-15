@@ -23,6 +23,57 @@ note: >-
 operator_accounts_owed: true
 
 providers:
+  # The fleet's own GPU (plan 2026-10-13-image-generation-and-visual-judgment,
+  # Phases 10-11; D5: spaceship is this tenant's default provider). Not an
+  # account and not a cloud: a self-hosted, OpenAI-compatible image facade
+  # behind llama-swap. `capacity: unmetered` — it costs nothing per image and
+  # bounds itself with typed busy/deferred refusals; the loader refuses
+  # `unmetered` on anything but this adapter kind, and the scheduler refuses it
+  # unless the base URL is on the local network.
+  - id: local-gpu
+    provider: Qontinui local image facade (self-hosted, spaceship RTX 5090)
+    plan: >-
+      Self-hosted on the fleet's own GPU; no account, no per-image cost. Weights
+      are admitted only under decision record a5ec7670 (Apache-2.0, MIT,
+      BSD-family) and verified by sha256 before they are served.
+    api_available:
+      value: "yes"
+      source: https://github.com/qontinui/qontinui
+      note: >-
+        the facade (docker/imagegen, plan Phase 10) serves the OpenAI images wire
+        behind llama-swap on 127.0.0.1:8100; until it is deployed a request is
+        refused at connect, which the adapter reports as a retryable busy
+    automation_allowed:
+      value: "yes"
+      source: https://github.com/qontinui/qontinui
+      note: 'self-hosted inference; no third-party service terms govern calling it'
+    commercial_use:
+      value: "yes"
+      source: https://huggingface.co/Tongyi-MAI/Z-Image-Turbo
+      note: >-
+        the model card's licence is apache-2.0 (read 2026-10-13; plan Phase 0
+        RESULT: Qwen-Image-2512, Qwen-Image-Edit-2511 and Z-Image-Turbo all
+        apache-2.0, ungated). Each result also carries its own SPDX id in
+        qontinui_provenance, and the adapter refuses one outside a5ec7670's set.
+    watermark: IPTC DigitalSourceType trainedAlgorithmicMedia (XMP, invisible)
+    watermark_visible: false
+    media: [image]
+    adapter: openai_compatible_images
+    model: z-image-turbo
+    # Loopback on spaceship. Elsewhere set STUDIO_LOCAL_GPU_BASE_URL to the
+    # facade's address on the local network (tailnet exposure waits on the
+    # device-JWT front door, D1.6).
+    base_url: http://127.0.0.1:8100/v1
+    base_url_env: STUDIO_LOCAL_GPU_BASE_URL
+    capacity: unmetered
+    tos_reviewed: 2026-10-15
+    domains: [github.com/qontinui, huggingface.co/Tongyi-MAI, huggingface.co/Qwen]
+    sources:
+      - https://github.com/qontinui/qontinui
+      - https://huggingface.co/Tongyi-MAI/Z-Image-Turbo
+      - https://huggingface.co/Qwen/Qwen-Image-2512
+      - https://huggingface.co/Qwen/Qwen-Image-Edit-2511
+
   - id: gemini
     provider: Google Gemini API (Nano Banana image models)
     plan: >-

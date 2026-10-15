@@ -23,13 +23,16 @@ from qontinui_studio.adapters.base import (
     PollResult,
     SubmittedJob,
     copy_staged,
+    fold_negative,
     is_daily_quota,
+    never_sent,
     read_reference,
     write_staged,
 )
 from qontinui_studio.errors import (
     MissingCredentialError,
     PermanentProviderError,
+    ProviderOutcomeUnknown,
     QuotaExhaustedError,
     TransientProviderError,
 )
@@ -44,23 +47,33 @@ class GeminiImageAdapter:
         model: str,
         api_key_env: str = "GEMINI_API_KEY",
         client: genai.Client | None = None,
+        base_url: str | None = None,
     ) -> None:
         self.provider_id = provider_id
         self.model = model
+        self.kind = "gemini_api"
         # One request timeout, with headroom for the SDK's own handling.
         self.hard_timeout_s = REQUEST_TIMEOUT_S * 2
         if client is None:
             key = os.environ.get(api_key_env)
             if not key:
                 raise MissingCredentialError(f"{provider_id}: env var {api_key_env} is unset")
+            # ``base_url`` routes the API through a gateway or proxy (plan
+            # 2026-10-13 Phase 11 step 3); None keeps the SDK's vendor host.
             client = genai.Client(
                 api_key=key,
-                http_options=types.HttpOptions(timeout=int(REQUEST_TIMEOUT_S * 1000)),
+                http_options=types.HttpOptions(
+                    timeout=int(REQUEST_TIMEOUT_S * 1000), base_url=base_url
+                ),
             )
         self._client = client
 
+    def sent_prompt(self, request: GenerationRequest) -> str:
+        # The Gemini image API has no negative-prompt field.
+        return fold_negative(request)
+
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
-        contents: list[str | Image.Image] = [request.prompt]
+        contents: list[str | Image.Image] = [self.sent_prompt(request)]
         for ref in request.reference_images:
             # Decode fully and close the file; the SDK gets an in-memory copy.
             with Image.open(io.BytesIO(read_reference(ref))) as img:
@@ -82,10 +95,13 @@ class GeminiImageAdapter:
                 raise TransientProviderError(f"gemini {e.code}: {e.message}") from e
             raise PermanentProviderError(f"gemini {e.code}: {e.message}") from e
         except httpx.TransportError as e:
-            raise TransientProviderError(f"gemini transport: {e}") from e
+            if never_sent(e):
+                raise TransientProviderError(f"gemini transport (not sent): {e}") from e
+            raise ProviderOutcomeUnknown(f"gemini transport dropped mid-flight: {e}") from e
         except (genai_errors.UnknownApiResponseError, ValueError) as e:
-            # A 2xx whose body did not parse (truncated JSON, bad base64, schema).
-            raise TransientProviderError(f"gemini unreadable response: {e}") from e
+            # A 2xx whose body did not parse (truncated JSON, bad base64,
+            # schema): the request ran, its result is lost.
+            raise ProviderOutcomeUnknown(f"gemini unreadable response: {e}") from e
 
         staged: list[str] = []
         for candidate in response.candidates or []:
@@ -107,7 +123,7 @@ class GeminiImageAdapter:
         )
 
     def poll(self, job: SubmittedJob) -> PollResult:
-        return PollResult(status="succeeded")
+        return PollResult(status="done")
 
     def download(self, job: SubmittedJob, dest_dir: Path) -> list[Path]:
         return copy_staged(job, dest_dir)

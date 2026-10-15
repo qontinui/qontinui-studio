@@ -67,7 +67,9 @@ def test_billed_apis_are_not_scheduled_without_an_operator_quota(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     built = build_adapters(inv)
-    assert not built.adapters
+    # The only adapter built is the unmetered local GPU; no billed API is.
+    assert set(built.adapters) == {"local-gpu"}
+    assert inv.get("local-gpu").capacity == "unmetered"
     assert "env var GEMINI_API_KEY is unset" in built.unavailable["gemini"]
     assert "automation_allowed is 'no'" in built.unavailable["bing"]
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -52,6 +52,13 @@ class Brief(BaseModel):
     reference_images: list[Path] = Field(default_factory=list)
     provider_preference: list[str] = Field(min_length=1)
     variants: int = Field(default=1, ge=1, le=8)
+    # Sent to providers whose wire takes them (the local facade); recorded in
+    # every provenance sidecar.
+    seed: int | None = Field(default=None, ge=0)
+    recipe: str | None = Field(default=None, pattern=ID_PATTERN)
+    # ``bulk`` work waits for the host's bulk window and never spills onto
+    # another provider when the host refuses it.
+    priority: Literal["interactive", "bulk"] = "interactive"
 
     @field_validator("targets")
     @classmethod
@@ -85,12 +92,14 @@ class Brief(BaseModel):
         return int(w) / int(h)
 
     def full_prompt(self) -> str:
-        """The prompt actually sent: brief prompt plus the style guide text."""
+        """The brief prompt plus the style guide text. The negative prompt is
+        NOT folded in here: a wire with a negative-prompt field gets it there
+        (folding ``Avoid: ...`` into a diffusion prompt pulls the model TOWARD
+        the avoided concept); a wire without one folds it itself
+        (``adapters.base.fold_negative``)."""
         parts = [self.prompt.strip()]
         if self.style_guide is not None:
             parts.append("Style guide:\n" + self.style_guide.read_text(encoding="utf-8").strip())
-        if self.negative_prompt:
-            parts.append(f"Avoid: {self.negative_prompt.strip()}")
         return "\n\n".join(parts)
 
 

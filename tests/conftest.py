@@ -131,6 +131,20 @@ def _no_network(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest)
     monkeypatch.setattr(socket, "create_connection", create_connection)
 
 
+@pytest.fixture(autouse=True)
+def _no_runner_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI reads the local runner's model-gateway state before generating.
+    Tests never reach a real runner: by default there is none (``not_declared``,
+    the no-runner reading). Gateway tests patch this again or call
+    ``gateway.read_gateway_state`` against their own loopback server."""
+    from qontinui_studio import cli
+    from qontinui_studio.gateway import GatewayState
+
+    monkeypatch.setattr(
+        cli, "read_gateway_state", lambda: GatewayState("not_declared", "no_runner", "test")
+    )
+
+
 def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:
     """The newest notice for (batch, outcome); notices are timestamped."""
     matches = sorted(notices_dir.glob(f"{batch_id}-{outcome}-*.md"))

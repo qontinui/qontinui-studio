@@ -8,6 +8,8 @@ unconfirmed answer is not an allowance.
 
 from __future__ import annotations
 
+import ipaddress
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -22,7 +24,37 @@ from qontinui_studio.errors import ConfigError
 
 Verdict = Literal["yes", "no", "unknown"]
 Media = Literal["image", "video"]
-AdapterKind = Literal["gemini_api", "openai_images", "fake", "none"]
+AdapterKind = Literal["gemini_api", "openai_images", "openai_compatible_images", "fake", "none"]
+# API adapters: an adapter that needs ``api_available: yes`` and is at most one
+# row per kind (one account per provider, D4).
+API_ADAPTERS = ("gemini_api", "openai_images")
+# How the scheduler bounds a provider: ``daily_quota`` (a recorded free quota
+# per day; none recorded means no work) or ``unmetered`` (a self-hosted host on
+# the local network that costs nothing per image and bounds itself with typed
+# ``busy``/``deferred`` refusals — plan 2026-10-13 Phase 11 step 2).
+Capacity = Literal["daily_quota", "unmetered"]
+UNMETERED_ADAPTERS = ("openai_compatible_images",)
+
+
+def is_local_network(url: str) -> bool:
+    """Whether ``url``'s host is on this machine or the local/tailnet network:
+    a loopback, private (RFC 1918 / ULA), link-local or CGNAT (tailnet) IP
+    literal, ``localhost``, a single-label name, or a ``.local``/``.lan``/
+    ``.internal``/``.ts.net`` name. An ``unmetered`` provider must sit on one —
+    a public host could bill per image, and spending is never a scheduler default."""
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return (
+            host == "localhost"
+            or "." not in host
+            or host.endswith((".local", ".lan", ".internal", ".ts.net"))
+        )
+    cgnat = ipaddress.ip_network("100.64.0.0/10")
+    return ip.is_loopback or ip.is_private or ip.is_link_local or (ip.version == 4 and ip in cgnat)
 
 
 def _coerce_verdict(value: Any) -> Any:
@@ -115,6 +147,12 @@ class Provider(BaseModel):
     adapter: AdapterKind = "none"
     model: str | None = None
     api_key_env: str | None = None
+    # The API base URL. ``None`` is the adapter's vendor default. For the
+    # local provider it is the facade's address (loopback on spaceship), and
+    # ``base_url_env`` names an env var that overrides it per machine.
+    base_url: str | None = None
+    base_url_env: str | None = None
+    capacity: Capacity = "daily_quota"
     # The per-UTC-day cap the scheduler will use. ``None`` means no free quota
     # is recorded, so the scheduler never assigns work to this provider —
     # spending money is an operator decision, not a scheduler default.
@@ -131,6 +169,38 @@ class Provider(BaseModel):
     domains: list[str] = Field(min_length=1)
     sources: list[str] = Field(default_factory=list)
     notes: str | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url_shape(cls, v: str | None) -> str | None:
+        if v is not None and not re.fullmatch(r"https?://[^\s/]+(/\S*)?", v):
+            raise ValueError(f"base_url must be an http(s) URL, got '{v}'")
+        return v
+
+    @model_validator(mode="after")
+    def _capacity_rules(self) -> Provider:
+        if self.capacity == "unmetered":
+            if self.adapter not in UNMETERED_ADAPTERS:
+                raise ValueError(
+                    f"provider '{self.id}': capacity 'unmetered' is only for a self-hosted "
+                    f"adapter {list(UNMETERED_ADAPTERS)}, not '{self.adapter}'"
+                )
+            if self.daily_quota is not None:
+                raise ValueError(
+                    f"provider '{self.id}': an unmetered provider records no daily_quota"
+                )
+        if self.adapter == "openai_compatible_images" and not (self.base_url or self.base_url_env):
+            raise ValueError(f"provider '{self.id}': openai_compatible_images needs a base_url")
+        return self
+
+    def resolved_base_url(self) -> str | None:
+        """The base URL in effect on this machine: ``base_url_env`` when that
+        variable is set, else ``base_url``."""
+        if self.base_url_env:
+            override = os.environ.get(self.base_url_env, "").strip()
+            if override:
+                return override
+        return self.base_url
 
     @field_validator("quota_reset_tz")
     @classmethod
@@ -190,7 +260,10 @@ class Provider(BaseModel):
             return f"automation_allowed is '{self.automation_allowed.value}'"
         if self.adapter == "none":
             return "no adapter exists for this provider"
-        if self.adapter in ("gemini_api", "openai_images") and self.api_available.value != "yes":
+        if (
+            self.adapter in (*API_ADAPTERS, *UNMETERED_ADAPTERS)
+            and self.api_available.value != "yes"
+        ):
             return f"api_available is '{self.api_available.value}'"
         if self.adapter != "fake" and not self.model:
             return "no model configured"
@@ -201,6 +274,14 @@ class Provider(BaseModel):
         gate = self.adapter_gate()
         if gate is not None:
             return gate
+        if self.capacity == "unmetered":
+            base = self.resolved_base_url() or ""
+            if not is_local_network(base):
+                return (
+                    f"unmetered capacity needs a local-network base URL; '{base}' is not one "
+                    "(a public host could bill per image)"
+                )
+            return None
         if not self.daily_quota:
             return "no free daily quota recorded (daily_quota unset or 0)"
         return None
@@ -231,7 +312,7 @@ class ProviderInventory(BaseModel):
             keys: list[tuple[str, str]] = [("id", p.id), ("provider", _normalise(p.provider))]
             if p.api_key_env:
                 keys.append(("api_key_env", p.api_key_env))
-            if p.adapter in ("gemini_api", "openai_images"):
+            if p.adapter in API_ADAPTERS:
                 keys.append(("adapter", p.adapter))
             keys += [("domain", d.partition("/")[0] + "/" + d.partition("/")[2]) for d in p.domains]
             for kind, key in keys:

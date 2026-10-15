@@ -9,6 +9,23 @@ exhausted its attempts the job moves to the next preferred provider. When every
 preferred provider is spent for today, the job is deferred to the next UTC
 midnight rather than failed.
 
+Typed job states (plan 2026-10-13 Phase 11): every provider-side outcome is
+written to ``job_attempts`` as ``done | failed | unknown | deferred | busy``.
+
+* A host's ``deferred``/``busy`` refusal requeues the job at the host's
+  ``retry_after_s`` WITHOUT spending a quota unit (the unit spent at the claim
+  is refunded) or an attempt. A ``deferred``, or a ``busy`` answered to a bulk
+  job, never moves the job to another provider, so bulk work cannot spill onto
+  a paid adapter.
+* ``unknown`` (the transport failed mid-flight, or the job id is lost) is
+  recorded as itself and the job is retried as a fresh, counted attempt.
+* An interactive job whose provider answered ``busy`` or ``unknown`` may fall
+  back to the next preferred provider — but only one with capacity now, so a
+  cloud adapter is used only within its own recorded quota (none is recorded
+  today, which means no cloud work).
+* An ``unmetered`` provider (a self-hosted host on the local network) spends
+  no quota; the host's own refusals bound it.
+
 Concurrency: every step that acts on a job first CLAIMS it with a fresh token
 (``jobs.claim``) in a conditional update, and every later write is conditional
 on that token and the expected status. A process whose claim was taken over —
@@ -33,6 +50,10 @@ from zoneinfo import ZoneInfo
 from qontinui_studio.adapters import AdapterSet, GenerationRequest, SubmittedJob
 from qontinui_studio.errors import (
     PermanentProviderError,
+    ProviderBusy,
+    ProviderDeferred,
+    ProviderOutcomeUnknown,
+    ProviderRefusal,
     QuotaExhaustedError,
     TransientProviderError,
 )
@@ -156,6 +177,45 @@ class Scheduler:
         used = self.quota_used(provider_id, self.quota_day(provider_id, now))
         return max(0, provider.daily_quota - used)
 
+    def has_capacity(self, provider_id: str, now: datetime) -> bool:
+        """Whether the scheduler may assign this provider a job now: an
+        unmetered provider whenever it is schedulable, a metered one while its
+        quota for the day lasts."""
+        provider = self.inventory.get(provider_id)
+        if provider.capacity == "unmetered":
+            return provider.schedulable_reason() is None
+        return self.quota_remaining(provider_id, now) > 0
+
+    def _refund(self, provider_id: str, day: str | None) -> None:
+        """Give back the unit a refused submission spent (none when unmetered)."""
+        if day is None:
+            return
+        self.conn.execute(
+            "UPDATE quota_usage SET used = used - 1 WHERE provider = ? AND day = ? AND used > 0",
+            (provider_id, day),
+        )
+        self.conn.commit()
+
+    def _attempt(
+        self,
+        job_id: str,
+        provider_id: str,
+        outcome: str,
+        detail: str | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO job_attempts (job_id, provider, outcome, detail, retry_after_s, at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, provider_id, outcome, detail, retry_after_s, _iso(self.clock())),
+        )
+        self.conn.commit()
+
+    def attempts(self, job_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM job_attempts WHERE job_id = ? ORDER BY id", (job_id,)
+        ).fetchall()
+
     def _mark_spent(self, provider_id: str, now: datetime) -> None:
         until = self.next_reset(provider_id, now)
         self.conn.execute(
@@ -204,7 +264,7 @@ class Scheduler:
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
                 continue
-            if self.quota_remaining(pid, now) > 0:
+            if self.has_capacity(pid, now):
                 return pid
         return None
 
@@ -217,7 +277,8 @@ class Scheduler:
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
                 continue
-            if self.inventory.get(pid).schedulable_reason() is not None:
+            provider = self.inventory.get(pid)
+            if provider.schedulable_reason() is not None or provider.capacity == "unmetered":
                 continue
             times.append(self.spent_until(pid, now) or self.next_reset(pid, now))
         return min(times) if times else None
@@ -251,11 +312,19 @@ class Scheduler:
                     last_error="reclaimed a stale submission (outcome unknown)",
                 ):
                     continue
+                if row["provider"] is not None:
+                    self._attempt(
+                        row["id"],
+                        row["provider"],
+                        "unknown",
+                        "a submission's claim outlived its lease; its process is gone and "
+                        "whether the provider ran the job is unknown",
+                    )
                 row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             if row["status"] == "queued":
                 self._submit(row, preference, template, now, report)
             elif row["status"] == "submitted":
-                self._poll(row, now, report)
+                self._poll(row, preference, template, report)
         self.conn.commit()
         return report
 
@@ -264,25 +333,30 @@ class Scheduler:
     ) -> str:
         """Atomically spend one unit of the provider's quota AND claim the job.
         Returns 'ok', 'no_quota' (the last unit went elsewhere) or 'lost'
-        (another process claimed the job). Nothing changes unless 'ok'."""
+        (another process claimed the job). Nothing changes unless 'ok'. An
+        unmetered provider spends nothing; ``quota_day`` records the day a unit
+        was spent from (NULL when none was)."""
         provider = self.inventory.get(provider_id)
         now = self.clock()
-        day = self.quota_day(provider_id, now)
+        metered = provider.capacity != "unmetered"
+        day = self.quota_day(provider_id, now) if metered else None
+        fields = {**fields, "quota_day": day}
         self.conn.commit()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO quota_usage (provider, day, used) VALUES (?, ?, 0)",
-                (provider_id, day),
-            )
-            spent = self.conn.execute(
-                "UPDATE quota_usage SET used = used + 1 "
-                "WHERE provider = ? AND day = ? AND used < ?",
-                (provider_id, day, provider.daily_quota or 0),
-            ).rowcount
-            if spent != 1:
-                self.conn.rollback()
-                return "no_quota"
+            if metered:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO quota_usage (provider, day, used) VALUES (?, ?, 0)",
+                    (provider_id, day),
+                )
+                spent = self.conn.execute(
+                    "UPDATE quota_usage SET used = used + 1 "
+                    "WHERE provider = ? AND day = ? AND used < ?",
+                    (provider_id, day, provider.daily_quota or 0),
+                ).rowcount
+                if spent != 1:
+                    self.conn.rollback()
+                    return "no_quota"
             cols = ", ".join(f"{k} = ?" for k in fields)
             claimed = self.conn.execute(
                 f"UPDATE jobs SET status = 'submitting', claim = ?, {cols} "
@@ -317,7 +391,7 @@ class Scheduler:
                 or provider_id in tried
                 or provider_id in excluded
                 or provider_id not in self.adapters.adapters  # not built this run
-                or self.quota_remaining(provider_id, now) <= 0
+                or not self.has_capacity(provider_id, now)
             ):
                 provider_id = self._pick_provider(preference, [*tried, *excluded], now)
             if provider_id is None:
@@ -343,6 +417,7 @@ class Scheduler:
                     report.failed.append(row["id"])
                 return
             adapter = self.adapters.adapters[provider_id]
+            request = self._request(row, template)
             lease = self._lease(adapter.hard_timeout_s, self.policy.submit_stale_s)
             # The claim records exactly what is being sent (prompt, model) and the
             # terms as reviewed right now (D5); ingest reads only these.
@@ -352,8 +427,9 @@ class Scheduler:
                 token,
                 {
                     "provider": provider_id,
-                    "prompt": template.prompt,
+                    "prompt": adapter.sent_prompt(request),
                     "model": adapter.model,
+                    "adapter": adapter.kind,
                     "terms_json": TermsSnapshot.of(self.inventory.get(provider_id)).to_json(),
                     "next_attempt_at": _iso(now + timedelta(seconds=lease)),
                     "updated_at": _iso(now),
@@ -367,14 +443,39 @@ class Scheduler:
             break
 
         attempts = row["attempts"] if provider_id == row["provider"] else 0
-        request = GenerationRequest(
-            job_id=row["id"],
-            prompt=template.prompt,
-            aspect_ratio=template.aspect_ratio,
-            reference_images=template.reference_images,
-        )
+        spent = self.conn.execute(
+            "SELECT quota_day FROM jobs WHERE id = ?", (row["id"],)
+        ).fetchone()
+        quota_day = spent["quota_day"] if spent is not None else None
         try:
             handle = adapter.submit(request, self.staging_dir / row["id"] / token)
+        except ProviderRefusal as e:
+            self._after_refusal(
+                row["id"],
+                token,
+                "submitting",
+                provider_id,
+                e,
+                template,
+                preference,
+                tried,
+                quota_day,
+                attempts,
+            )
+            return
+        except ProviderOutcomeUnknown as e:
+            self._after_unknown(
+                row["id"],
+                token,
+                "submitting",
+                provider_id,
+                str(e),
+                template,
+                preference,
+                tried,
+                attempts + 1,
+            )
+            return
         except QuotaExhaustedError as e:
             self._quota_exhausted(row["id"], token, "submitting", provider_id, str(e))
             return
@@ -383,6 +484,7 @@ class Scheduler:
                 # An adapter that did not type its quota error.
                 self._quota_exhausted(row["id"], token, "submitting", provider_id, str(e))
                 return
+            self._attempt(row["id"], provider_id, "failed", f"transient: {e}", e.retry_after_s)
             now = self.clock()
             attempts += 1
             if attempts >= self.policy.max_attempts_per_provider:
@@ -403,6 +505,7 @@ class Scheduler:
                 )
             return
         except PermanentProviderError as e:
+            self._attempt(row["id"], provider_id, "failed", str(e))
             self._give_up_on_provider(
                 row["id"], token, "submitting", provider_id, tried, str(e), self.clock()
             )
@@ -427,7 +530,128 @@ class Scheduler:
             return
         # Poll straight away; a synchronous provider is already done.
         fresh = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
-        self._poll(fresh, now, report)
+        self._poll(fresh, preference, template, report)
+
+    @staticmethod
+    def _request(row: sqlite3.Row, template: GenerationRequest) -> GenerationRequest:
+        return GenerationRequest(
+            job_id=row["id"],
+            prompt=template.prompt,
+            aspect_ratio=template.aspect_ratio,
+            reference_images=template.reference_images,
+            negative_prompt=template.negative_prompt,
+            seed=template.seed,
+            recipe=template.recipe,
+            priority=template.priority,
+        )
+
+    def _fallback(
+        self, preference: list[str], tried: list[str], current: str, template: GenerationRequest
+    ) -> str | None:
+        """The provider an INTERACTIVE job may fall back to after ``busy`` or
+        ``unknown``: the next preferred provider with capacity now. A metered
+        one therefore only ever within its recorded quota. Bulk jobs never."""
+        if template.priority != "interactive":
+            return None
+        return self._pick_provider(preference, [*tried, current], self.clock())
+
+    def _requeue(self, job_id: str, claim: str, status: str, **fields: object) -> bool:
+        return self._write(
+            job_id,
+            claim,
+            status,
+            status="queued",
+            claim=None,
+            polls=0,
+            submitted_at=None,
+            **fields,
+        )
+
+    def _after_refusal(
+        self,
+        job_id: str,
+        claim: str,
+        status: str,
+        provider_id: str,
+        refusal: ProviderRefusal,
+        template: GenerationRequest,
+        preference: list[str],
+        tried: list[str],
+        quota_day: str | None,
+        attempts: int,
+    ) -> None:
+        """A host's typed ``deferred``/``busy``: the job did not run. Refund
+        the unit, keep the attempt count (``attempts``, as it stood before this
+        submission), and come back when the host says."""
+        self._refund(provider_id, quota_day)
+        self._attempt(job_id, provider_id, refusal.kind, str(refusal), refusal.retry_after_s)
+        now = self.clock()
+        if refusal.kind == "busy":
+            fallback = self._fallback(preference, tried, provider_id, template)
+            if fallback is not None:
+                self._requeue(
+                    job_id,
+                    claim,
+                    status,
+                    provider=fallback,
+                    attempts=0,
+                    next_attempt_at=_iso(now),
+                    last_error=f"{provider_id}: {refusal}; falling back to {fallback}",
+                )
+                return
+        self._requeue(
+            job_id,
+            claim,
+            status,
+            provider=provider_id,
+            attempts=attempts,
+            next_attempt_at=_iso(now + timedelta(seconds=refusal.retry_after_s)),
+            last_error=f"{provider_id}: {refusal} (retry after {refusal.retry_after_s:.0f}s)",
+        )
+
+    def _after_unknown(
+        self,
+        job_id: str,
+        claim: str,
+        status: str,
+        provider_id: str,
+        error: str,
+        template: GenerationRequest,
+        preference: list[str],
+        tried: list[str],
+        attempts: int,
+    ) -> None:
+        """The outcome is UNKNOWN: recorded as such (never failed or done), and
+        the job is retried as a counted attempt — on another provider when an
+        interactive job may fall back."""
+        self._attempt(job_id, provider_id, "unknown", error)
+        now = self.clock()
+        fallback = self._fallback(preference, tried, provider_id, template)
+        if fallback is not None:
+            self._requeue(
+                job_id,
+                claim,
+                status,
+                provider=fallback,
+                attempts=0,
+                next_attempt_at=_iso(now),
+                last_error=f"{provider_id}: unknown: {error}; falling back to {fallback}",
+            )
+            return
+        if attempts >= self.policy.max_attempts_per_provider:
+            self._give_up_on_provider(
+                job_id, claim, status, provider_id, tried, f"unknown: {error}", now
+            )
+            return
+        self._requeue(
+            job_id,
+            claim,
+            status,
+            provider=provider_id,
+            attempts=attempts,
+            next_attempt_at=_iso(now + timedelta(seconds=self.policy.backoff(attempts, None))),
+            last_error=f"{provider_id}: unknown: {error}",
+        )
 
     def _quota_exhausted(
         self, job_id: str, claim: str, status: str, provider_id: str, error: str
@@ -472,7 +696,13 @@ class Scheduler:
             status="queued",
         )
 
-    def _poll(self, row: sqlite3.Row, _now: datetime, report: StepReport) -> None:
+    def _poll(
+        self,
+        row: sqlite3.Row,
+        preference: list[str],
+        template: GenerationRequest,
+        report: StepReport,
+    ) -> None:
         now = self.clock()  # read at the claim, never at step start
         provider_id = row["provider"]
         tried: list[str] = json.loads(row["tried_providers"])
@@ -519,7 +749,36 @@ class Scheduler:
         try:
             result = adapter.poll(handle)
         except PermanentProviderError as e:
+            self._attempt(job_id, provider_id, "failed", str(e))
             give_up(str(e))
+            return
+        except ProviderRefusal as e:
+            self._after_refusal(
+                job_id,
+                token,
+                "submitted",
+                provider_id,
+                e,
+                template,
+                preference,
+                tried,
+                row["quota_day"],
+                # The submission counted an attempt; a refusal gives it back.
+                max(0, int(row["attempts"]) - 1),
+            )
+            return
+        except ProviderOutcomeUnknown as e:
+            self._after_unknown(
+                job_id,
+                token,
+                "submitted",
+                provider_id,
+                str(e),
+                template,
+                preference,
+                tried,
+                int(row["attempts"]),
+            )
             return
         except TransientProviderError as e:
             if overdue:
@@ -527,17 +786,64 @@ class Scheduler:
             else:
                 release(polls=polls, next_attempt_at=next_poll, last_error=str(e))
             return
-        if result.status == "pending":
+        if result.status in ("queued", "running"):
             if overdue:
                 give_up(
-                    f"still pending after {polls} polls / "
+                    f"still {result.status} after {polls} polls / "
                     f"{(now - submitted_at).total_seconds():.0f}s"
                 )
             else:
                 release(polls=polls, next_attempt_at=next_poll)
             return
         if result.status == "failed":
+            self._attempt(job_id, provider_id, "failed", result.error)
             give_up(result.error or "provider job failed")
+            return
+        if result.status in ("deferred", "busy"):
+            refusal_cls = ProviderDeferred if result.status == "deferred" else ProviderBusy
+            self._after_refusal(
+                job_id,
+                token,
+                "submitted",
+                provider_id,
+                refusal_cls(
+                    f"{result.status}: {result.error or 'host refused the job'}",
+                    result.retry_after_s if result.retry_after_s is not None else 30.0,
+                ),
+                template,
+                preference,
+                tried,
+                row["quota_day"],
+                # The submission counted an attempt; a refusal gives it back.
+                max(0, int(row["attempts"]) - 1),
+            )
+            return
+        if result.status == "unknown":
+            self._after_unknown(
+                job_id,
+                token,
+                "submitted",
+                provider_id,
+                result.error or "the provider no longer knows this job",
+                template,
+                preference,
+                tried,
+                int(row["attempts"]),
+            )
+            return
+        if result.status != "done":
+            # A status this scheduler does not know is not a success.
+            self._after_unknown(
+                job_id,
+                token,
+                "submitted",
+                provider_id,
+                f"unrecognised job status '{result.status}'",
+                template,
+                preference,
+                tried,
+                int(row["attempts"]),
+            )
             return
         try:
             files = adapter.download(handle, self.raw_dir / row["batch_id"] / f"{job_id}-{token}")
@@ -562,6 +868,7 @@ class Scheduler:
         ):
             report.discarded.append(job_id)
             return
+        self._attempt(job_id, provider_id, "done")
         report.completed.append(
             CompletedJob(
                 job_id=job_id,

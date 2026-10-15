@@ -48,6 +48,7 @@ lands.
 |---|---|---|
 | **D4** API first, GUI automation only where the terms allow it, one account per provider | An adapter is built only for a provider whose `providers.yaml` row has `tos_reviewed` set and `automation_allowed: "yes"`. `unknown` keeps it off. A duplicate provider row is a load error. | `providers.py` (`adapter_gate`), `adapters/__init__.py` |
 | **D5** every asset carries provenance and licence | Each library row stores provider, model, prompt, brief id (or, for an imported asset, account alias, reference images and terms URL), date and SHA-256. It also snapshots the licence terms as reviewed, and the watermark. `ai_generated` is pinned true by a SQL `CHECK`. An unreviewed licence is refused for every site; a non-commercial licence is refused for a commercial site. | `store.py`, `library.py`, `gates.py` (`d5_licence`, `d5_provenance`) |
+| **a5ec7670** every generated file is marked and provenanced (plan 2026-10-13 Phase 11) | Every image the studio generates or derives (raw download, every PNG/WebP/AVIF/JPEG variant) carries the IPTC `DigitalSourceType` = `trainedAlgorithmicMedia` XMP marker and a `<file>.provenance.json` sidecar: provider, adapter, model, terms as reviewed, the prompt sent, negative prompt, references (with sha256), seed when known, recipe, `created_at`, and — for the local provider — the facade's `qontinui_provenance` verbatim (SPDX licence, recipe hash, weight sha256s, seed). An incomplete sidecar is never written; D5 refuses a generated file without the marker or a matching sidecar. A published file is a byte-identical copy of its variant, and its sidecar travels in the site manifest per format. C2PA is not written: it needs a signing credential, which is a billing decision not taken. | `marker.py`, `provenance.py`, `pipeline.py` (`ingest`), `gates.py` (`d5_provenance`), `publish.py` |
 | **D6** AI imagery is never presented as the real thing | Refuses AI imagery in any `product_screenshot` slot, and in `food`/`premises` slots on a `real_business` site. Demo sites must carry an illustrative label. The label is written to the site's `studio-manifest.json` for the site build to render. | `gates.py` (`d6_not_the_real_thing`), `publish.py` |
 | **D7** automated gates decide; the operator is notified, not asked | A batch publishes only when every gate passes, including UI Bridge page health on a preview of the batch, which runs before anything goes live. Page health is **required, with no waiver**. The operator gets a notice carrying a one-step `studio --root <abs path> unpublish --batch <id>`. The review page is not an approval queue. | `publish.py`, `notify.py`, `review.py` |
 | **D3** public redaction is explicit | The launch kit runs qontinui-web's own validator on every build record. It is ported in `launch/allowlist.py`, and a parity test runs it over a shared fixture corpus. The validator checks key for key, per-slot value types and the `<path>: <reason_code>` grammar for unknowns. It also scans every string for private repo names, UUIDs and emails, after Unicode normalisation that defeats lookalike and invisible characters. It enforces the caps: strings of at most 512 characters (decomposed too, with at most 2× NFKD expansion) and documents of at most 256 KiB. Any repo the product declares but the record left out (at most 50 such repos) must not be named anywhere in the record. A record must belong to the product: matching slugs, and only repos the product declares. Only a versioned public snapshot can back a published launch. | `launch/allowlist.py`, `launch/record.py`, `launch/publish.py` |
@@ -215,10 +216,24 @@ A site template renders each studio slot from `studio-manifest.json`:
 
 ## Provider inventory: the honest D4 outcome
 
-`providers.yaml` covers ten providers: Gemini, OpenAI, Bing Image Creator /
-Designer, Leonardo, Ideogram, Firefly, Runway, Pika, Luma and Kling. Each was
-reviewed on 2026-10-09, and every yes/no cites a source URL. Run
-`studio providers list` to see the verdicts. In summary:
+`providers.yaml` covers the fleet's own GPU (`local-gpu`) and ten third-party
+providers: Gemini, OpenAI, Bing Image Creator / Designer, Leonardo, Ideogram,
+Firefly, Runway, Pika, Luma and Kling. Each third-party row was reviewed on
+2026-10-09, and every yes/no cites a source URL. Run `studio providers list` to
+see the verdicts. In summary:
+
+- **`local-gpu` is the default provider** (plan
+  `2026-10-13-image-generation-and-visual-judgment`, D5) and the first preference
+  of the shipped briefs. It is a self-hosted, OpenAI-compatible image facade
+  behind llama-swap (`http://127.0.0.1:8100/v1` on spaceship;
+  `STUDIO_LOCAL_GPU_BASE_URL` overrides it per machine) driven by the
+  `openai_compatible_images` adapter. Its `capacity: unmetered` means it spends
+  no quota: the host bounds itself with typed `busy`/`deferred` refusals. The
+  loader allows `unmetered` only on that adapter kind, and the scheduler refuses
+  it unless the base URL is on the local network (loopback, private, tailnet), so
+  a public host can never be scheduled as free. Until the facade is deployed
+  (plan Phase 10), a request is refused at connect and reported as a retryable
+  `busy`.
 
 - **Every verdict cites the first-party URL that was checked.** For `unknown`
   that is the page that refused (e.g. HTTP 403) or rendered empty, with a note.
@@ -267,8 +282,10 @@ platform (`shlex` on POSIX, `list2cmdline` on Windows), so a root containing
 spaces still pastes correctly.
 
 Exit codes: `0` ok, `1` config error, `2` publication refused by a gate,
-`3` generation deferred or failed, `4` no build record yet, `5` a trigger was
-registered but its read-back did not confirm it.
+`3` generation deferred (quota, a host's `busy`/`deferred`, an `unknown` being
+retried) or failed, `4` no build record yet, `5` a trigger was registered but its
+read-back did not confirm it, `6` image generation refused before any provider
+call (`gateway_has_no_image_route`).
 
 ### The library: import, approval, export
 
@@ -399,6 +416,8 @@ upgraded in place the first time any command opens it.
 |---|---|
 | `GEMINI_API_KEY` | the `gemini` adapter. The env var name is set per row by `api_key_env`. |
 | `OPENAI_API_KEY` | the `openai` adapter |
+| `STUDIO_LOCAL_GPU_BASE_URL` | the `local-gpu` row's facade address on this machine (`base_url_env`); unset means the row's loopback `base_url` |
+| `QONTINUI_RUNNER_URL` | where `brief run`, `jobs run`, `launch build` and `launch run` read the runner's model-gateway state (`GET /model-gateway`; default `http://127.0.0.1:9876`) |
 | `STUDIO_WEB_BEARER` or `STUDIO_WEB_BEARER_FILE` | the launch kit's authed build-record door (`record.door: authed`) |
 | `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | `studio launch register-trigger`, and operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. Notice files are timestamped and never overwritten. |
 
@@ -421,12 +440,45 @@ reference images, so editing any of them refuses to resume that batch. After rep
 permanent failure, the job moves to the next preferred provider. All of this
 state is kept in `.studio/studio.db`.
 
+**Typed job states** (plan 2026-10-13 Phase 11). Every provider-side outcome is
+recorded in `job_attempts` as `done | failed | unknown | deferred | busy`, and
+`brief run` / `jobs run` print each waiting job's last one.
+
+- `busy` (the host's card is taken, or nothing is listening — the job provably
+  never started) and `deferred` (a `priority: bulk` brief outside the host's bulk
+  window) requeue the job at the host's `retry_after_s` **without spending a quota
+  unit or an attempt**. A `deferred`, or a `busy` answered to a bulk job, never
+  moves the job to another provider, so bulk work cannot spill onto a paid
+  adapter.
+- `unknown` — the transport failed after the request was sent, the answer was
+  truncated, or the job id was lost — is never collapsed into `failed` or `done`.
+  It is recorded as `unknown` and the job is retried as a counted attempt.
+- An interactive job whose provider answered `busy` or `unknown` may fall back to
+  the next preferred provider, but only one with capacity now: a cloud adapter
+  only within its own `daily_quota`, which is unset today (no cloud work).
+
+A brief's `negative_prompt` goes to a wire that has the field (the local facade)
+as its own field; a wire without one (Gemini, OpenAI) gets it folded in as
+`Avoid: …` text, and the job records exactly the text sent. A brief may also set
+`seed`, `recipe` (a recipe id on the host) and `priority` (`interactive` |
+`bulk`).
+
+**Gateway tenants.** Before generating, the CLI reads the runner's model-gateway
+state. No runner, or a runner build with no gateway read, means no declared
+gateway. A declared gateway with an images route carries every OpenAI-images-wire
+adapter; a declared gateway without one, or a runner that cannot say, refuses
+every image call with `gateway_has_no_image_route` (exit 6) and makes no vendor or
+local call (decision record
+`gateway-tenants-route-every-model-call-through-the-gateway`).
+
 ### Layout
 
 - `providers.yaml`: the terms inventory (Phase 0). Each row declares the
   provider's own `domains`, and every source URL must sit under one of them.
   There is at most one row per API adapter kind, and no domain, name or key
-  env var may be shared between rows.
+  env var may be shared between rows. A row may set `base_url` (and
+  `base_url_env` to override it per machine) and `capacity`
+  (`daily_quota` | `unmetered`).
 - `sites/*.yaml`: publication targets. Each declares its kind (`demo` /
   `real_business` / `product`), whether it is `commercial`, `publish_dir`,
   the four D7 preview fields, and per-slot size, category, formats, focal point and
@@ -700,7 +752,9 @@ poetry run ruff check . && poetry run ruff format --check . && poetry run mypy &
 ```
 
 Tests never call a provider. The API adapters run against HTTP mocked with
-`respx`. The end-to-end acceptance test (`tests/test_end_to_end.py`) uses the
+`respx`; the local adapter runs against a fake OpenAI-compatible image host on a
+real loopback socket (`tests/imagehost.py`), so a transport drop is a real
+dropped connection. The end-to-end acceptance test (`tests/test_end_to_end.py`) uses the
 offline fake adapter: one brief produces exact-size crops for two template sites
 with zero manual steps, and every library row carries full provenance.
 

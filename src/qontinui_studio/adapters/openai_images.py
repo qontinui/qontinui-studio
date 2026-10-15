@@ -22,7 +22,9 @@ from qontinui_studio.adapters.base import (
     PollResult,
     SubmittedJob,
     copy_staged,
+    fold_negative,
     is_daily_quota,
+    never_sent,
     read_reference,
     sniff_mime,
     write_staged,
@@ -30,6 +32,7 @@ from qontinui_studio.adapters.base import (
 from qontinui_studio.errors import (
     MissingCredentialError,
     PermanentProviderError,
+    ProviderOutcomeUnknown,
     QuotaExhaustedError,
     TransientProviderError,
 )
@@ -57,6 +60,7 @@ class OpenAIImageAdapter:
     ) -> None:
         self.provider_id = provider_id
         self.model = model
+        self.kind = "openai_images"
         # httpx timeouts are per phase (connect/write/read), not total: bound a
         # call by all three plus headroom.
         self.hard_timeout_s = 600.0
@@ -67,8 +71,13 @@ class OpenAIImageAdapter:
         self._http = http or httpx.Client(timeout=httpx.Timeout(180.0, connect=15.0))
         self._base = api_base.rstrip("/")
 
+    def sent_prompt(self, request: GenerationRequest) -> str:
+        # The OpenAI Images API has no negative-prompt field.
+        return fold_negative(request)
+
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
         size = size_for_ratio(request.aspect_ratio)
+        prompt = self.sent_prompt(request)
         files = []
         for p in request.reference_images:
             data = read_reference(p)
@@ -78,17 +87,19 @@ class OpenAIImageAdapter:
                 resp = self._http.post(
                     f"{self._base}/images/edits",
                     headers=self._headers,
-                    data={"model": self.model, "prompt": request.prompt, "size": size, "n": "1"},
+                    data={"model": self.model, "prompt": prompt, "size": size, "n": "1"},
                     files=files,
                 )
             else:
                 resp = self._http.post(
                     f"{self._base}/images/generations",
                     headers=self._headers,
-                    json={"model": self.model, "prompt": request.prompt, "size": size, "n": 1},
+                    json={"model": self.model, "prompt": prompt, "size": size, "n": 1},
                 )
         except httpx.TransportError as e:
-            raise TransientProviderError(f"openai transport: {e}") from e
+            if never_sent(e):
+                raise TransientProviderError(f"openai transport (not sent): {e}") from e
+            raise ProviderOutcomeUnknown(f"openai transport dropped mid-flight: {e}") from e
 
         if resp.status_code == 429 and is_daily_quota(resp.text):
             raise QuotaExhaustedError(f"openai 429: {_error_message(resp)}")
@@ -104,10 +115,11 @@ class OpenAIImageAdapter:
         try:
             body = resp.json()
         except ValueError as e:
-            # A 2xx with a truncated/non-JSON body (proxy hiccup): worth a retry.
-            raise TransientProviderError(f"openai unreadable response: {e}") from e
+            # A 2xx with a truncated/non-JSON body: the request ran (and was
+            # billed); its result is lost.
+            raise ProviderOutcomeUnknown(f"openai unreadable response: {e}") from e
         if not isinstance(body, dict):
-            raise TransientProviderError("openai response is not a JSON object")
+            raise ProviderOutcomeUnknown("openai response is not a JSON object")
         items: Any = body.get("data") or []
         if not isinstance(items, list):
             raise PermanentProviderError("openai response 'data' is not a list")
@@ -128,7 +140,7 @@ class OpenAIImageAdapter:
         )
 
     def poll(self, job: SubmittedJob) -> PollResult:
-        return PollResult(status="succeeded")
+        return PollResult(status="done")
 
     def download(self, job: SubmittedJob, dest_dir: Path) -> list[Path]:
         return copy_staged(job, dest_dir)

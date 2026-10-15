@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, features
 
+from qontinui_studio import marker
 from qontinui_studio.errors import (
     BackgroundRemovalUnavailable,
     FfmpegFailed,
@@ -74,8 +75,11 @@ _PIL_FORMAT = {"webp": "WEBP", "avif": "AVIF", "png": "PNG", "jpeg": "JPEG"}
 _EXT = {"webp": ".webp", "avif": ".avif", "png": ".png", "jpeg": ".jpg"}
 
 
-def export(img: Image.Image, dest_stem: Path, fmt: str, quality: int = 82) -> Path:
-    """Write ``img`` as ``fmt`` next to ``dest_stem`` and return the path."""
+def export(
+    img: Image.Image, dest_stem: Path, fmt: str, quality: int = 82, *, ai_generated: bool
+) -> Path:
+    """Write ``img`` as ``fmt`` next to ``dest_stem`` and return the path. An
+    ``ai_generated`` image carries the IPTC AI-generated marker (``marker``)."""
     if not format_supported(fmt):
         raise FormatUnsupported(f"this Pillow build cannot encode '{fmt}'")
     dest = dest_stem.with_suffix(_EXT[fmt])
@@ -83,7 +87,7 @@ def export(img: Image.Image, dest_stem: Path, fmt: str, quality: int = 82) -> Pa
     out = img
     if fmt == "jpeg" and out.mode not in ("RGB", "L"):
         out = out.convert("RGB")
-    kwargs: dict[str, object] = {}
+    kwargs: dict[str, object] = dict(marker.save_options(fmt)) if ai_generated else {}
     if fmt in ("webp", "avif", "jpeg"):
         kwargs["quality"] = quality
     out.save(dest, _PIL_FORMAT[fmt], **kwargs)

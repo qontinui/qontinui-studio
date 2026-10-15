@@ -18,6 +18,7 @@ from qontinui_studio.adapters.openai_images import OpenAIImageAdapter, size_for_
 from qontinui_studio.errors import (
     MissingCredentialError,
     PermanentProviderError,
+    ProviderOutcomeUnknown,
     TransientProviderError,
 )
 
@@ -75,7 +76,7 @@ def test_gemini_submit_poll_download(gemini: GeminiImageAdapter, tmp_path: Path)
     assert sent["generationConfig"]["responseModalities"] == ["IMAGE"]
     assert sent["generationConfig"]["imageConfig"]["aspectRatio"] == "16:9"
     assert route.calls.last.request.headers["x-goog-api-key"] == "test-key"
-    assert gemini.poll(handle).status == "succeeded"
+    assert gemini.poll(handle).status == "done"
     files = gemini.download(handle, tmp_path / "out")
     assert len(files) == 1
     with Image.open(files[0]) as img:
@@ -139,7 +140,7 @@ def test_openai_generations(openai: OpenAIImageAdapter, tmp_path: Path) -> None:
     body = json.loads(route.calls.last.request.content)
     assert body == {"model": "gpt-image-1", "prompt": "a cafe", "size": "1536x1024", "n": 1}
     assert route.calls.last.request.headers["authorization"] == "Bearer sk-test"
-    assert openai.poll(handle).status == "succeeded"
+    assert openai.poll(handle).status == "done"
     assert len(openai.download(handle, tmp_path / "o")) == 1
 
 
@@ -231,9 +232,10 @@ def test_gemini_non_image_bytes_are_permanent(gemini: GeminiImageAdapter, tmp_pa
 
 
 @respx.mock
-def test_gemini_unparseable_2xx_is_transient(gemini: GeminiImageAdapter, tmp_path: Path) -> None:
+def test_gemini_unparseable_2xx_is_unknown(gemini: GeminiImageAdapter, tmp_path: Path) -> None:
+    # The request ran; its result is lost: unknown, never failed.
     respx.post(GEMINI_URL).mock(return_value=httpx.Response(200, content=b"{truncated"))
-    with pytest.raises(TransientProviderError):
+    with pytest.raises(ProviderOutcomeUnknown):
         gemini.submit(_req(), tmp_path)
 
 
@@ -266,7 +268,7 @@ def test_openai_reference_mime_is_sniffed(openai: OpenAIImageAdapter, tmp_path: 
 def test_openai_bad_bodies(openai: OpenAIImageAdapter, tmp_path: Path) -> None:
     url = "https://api.openai.com/v1/images/generations"
     respx.post(url).mock(return_value=httpx.Response(200, content=b"<html>gateway</html>"))
-    with pytest.raises(TransientProviderError, match="unreadable"):
+    with pytest.raises(ProviderOutcomeUnknown, match="unreadable"):
         openai.submit(_req(), tmp_path)
     respx.post(url).mock(return_value=httpx.Response(200, json={"data": [{"b64_json": "!!!"}]}))
     with pytest.raises(PermanentProviderError, match="base64"):

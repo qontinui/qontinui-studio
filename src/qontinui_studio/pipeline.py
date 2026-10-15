@@ -16,13 +16,16 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from PIL import Image
 
-from qontinui_studio.adapters import AdapterSet, GenerationRequest
+from qontinui_studio import provenance
+from qontinui_studio.adapters import AdapterSet, GenerationRequest, SubmittedJob
+from qontinui_studio.adapters.base import staged_provenance
 from qontinui_studio.briefs import LoadedBrief, load_brief, validate_brief
 from qontinui_studio.errors import ConfigError, LeaseLost, StudioError
 from qontinui_studio.gates import (
@@ -33,7 +36,7 @@ from qontinui_studio.gates import (
 )
 from qontinui_studio.library import Library, TermsSnapshot
 from qontinui_studio.notify import Notifier
-from qontinui_studio.postprocess import crop_to_slot, export, remove_background
+from qontinui_studio.postprocess import crop_to_slot, export, remove_background, sha256_file
 from qontinui_studio.providers import ProviderInventory
 from qontinui_studio.publish import PublishResult, publish_batch, recover
 from qontinui_studio.scheduler import RetryPolicy, Scheduler, utc_now
@@ -58,6 +61,9 @@ class BatchOutcome:
     completed_jobs: list[str] = field(default_factory=list)
     failed_jobs: list[str] = field(default_factory=list)
     deferred_jobs: list[str] = field(default_factory=list)
+    # Each unfinished or failed job's latest provider-side outcome
+    # (``job_attempts``): ``busy``/``deferred``/``unknown``/``failed`` and why.
+    last_attempts: dict[str, str] = field(default_factory=dict)
     unavailable_providers: dict[str, str] = field(default_factory=dict)
     publish: PublishResult | None = None
     error: str | None = None
@@ -131,6 +137,10 @@ def _request_for(loaded: LoadedBrief) -> tuple[list[str], GenerationRequest]:
             prompt=b.full_prompt(),
             aspect_ratio=b.aspect_ratio,
             reference_images=list(b.reference_images),
+            negative_prompt=b.negative_prompt.strip() if b.negative_prompt else None,
+            seed=b.seed,
+            recipe=b.recipe,
+            priority=b.priority,
         ),
     )
 
@@ -174,8 +184,49 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
     model = str(job["model"])
     prompt = str(job["prompt"])
     files = [Path(p) for p in json.loads(job["files_json"])]
+    handle = SubmittedJob(
+        external_id=str(job["external_id"] or ""), data=json.loads(job["handle_json"] or "{}")
+    )
     brief = loaded.brief
     out_dir = ctx.workspace.variants_dir / job["batch_id"]
+    created_at = ctx.clock().isoformat()
+
+    def sidecar(
+        path: Path,
+        facade: dict[str, Any] | None,
+        role: str,
+        derived_from: str | None = None,
+        transform: dict[str, Any] | None = None,
+    ) -> None:
+        provenance.write(
+            path,
+            provenance.build(
+                file_sha256=sha256_file(path),
+                file_name=path.name,
+                role=role,
+                provider_id=terms.provider,
+                provider_name=terms.provider_name,
+                adapter=str(job["adapter"] or ""),
+                model=model,
+                terms=asdict(terms),
+                prompt=prompt,
+                negative_prompt=brief.negative_prompt,
+                references=[
+                    {"path": str(ref), "sha256": sha256_file(ref)} for ref in brief.reference_images
+                ],
+                seed=brief.seed,
+                recipe=brief.recipe,
+                created_at=created_at,
+                job_id=str(job["id"]),
+                batch_id=str(job["batch_id"]),
+                brief_id=brief.id,
+                facade=facade,
+                derived_from=derived_from,
+                transform=transform,
+            ),
+        )
+
+    facades = staged_provenance(handle)
     try:
         # 1. All image work happens OUTSIDE any database transaction, so a slow
         #    encode never holds SQLite's write lock against other writers.
@@ -184,6 +235,9 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
         ] = []
         for n, raw in enumerate(files):
             uid = f"{job['id']}-{n}"
+            facade = facades[n] if n < len(facades) else None
+            raw_sha = sha256_file(raw)
+            sidecar(raw, facade, "raw")
             with Image.open(raw) as opened:
                 keep_alpha = opened.mode in ("RGBA", "LA", "P")
                 source = opened.convert("RGBA" if keep_alpha else "RGB")
@@ -197,7 +251,27 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
                         img = remove_background(img)
                     img = crop_to_slot(img, slot.width, slot.height, (slot.focal_x, slot.focal_y))
                     for fmt in slot.formats:
-                        path = export(img, out_dir / f"{uid}--{site.id}--{target.slot}", fmt)
+                        path = export(
+                            img,
+                            out_dir / f"{uid}--{site.id}--{target.slot}",
+                            fmt,
+                            ai_generated=True,
+                        )
+                        sidecar(
+                            path,
+                            facade,
+                            "derivative",
+                            derived_from=raw_sha,
+                            transform={
+                                "site": site.id,
+                                "slot": target.slot,
+                                "width": slot.width,
+                                "height": slot.height,
+                                "focal": [slot.focal_x, slot.focal_y],
+                                "remove_background": slot.remove_background,
+                                "format": fmt,
+                            },
+                        )
                         variants.append(
                             (
                                 f"{uid}:{site.id}:{target.slot}:{fmt}",
@@ -209,7 +283,19 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
                             )
                         )
                 else:
-                    path = export(source, out_dir / f"{uid}--campaign--{target.campaign}", "webp")
+                    path = export(
+                        source,
+                        out_dir / f"{uid}--campaign--{target.campaign}",
+                        "webp",
+                        ai_generated=True,
+                    )
+                    sidecar(
+                        path,
+                        facade,
+                        "derivative",
+                        derived_from=raw_sha,
+                        transform={"campaign": target.campaign, "format": "webp"},
+                    )
                     variants.append(
                         (
                             f"{uid}:campaign:{target.campaign}:webp",
@@ -361,6 +447,9 @@ def drive_batch(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutco
     row = ctx.conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
     if row is None:
         raise ConfigError(f"no batch '{batch_id}'")
+    if ctx.adapters.refusal is not None:
+        # No image call may be made at all (gateway_has_no_image_route).
+        raise ctx.adapters.refusal
     lease = _Lease(ctx, batch_id)
     if not lease.acquire():
         current = ctx.conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
@@ -448,6 +537,16 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
         for j in jobs
         if j["status"] in ("queued", "submitting", "submitted", "downloaded", "ingesting")
     ]
+    for jid in [*outcome.deferred_jobs, *outcome.failed_jobs]:
+        last = ctx.conn.execute(
+            "SELECT provider, outcome, detail FROM job_attempts WHERE job_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (jid,),
+        ).fetchone()
+        if last is not None:
+            outcome.last_attempts[jid] = f"{last['outcome']} from {last['provider']}" + (
+                f": {last['detail']}" if last["detail"] else ""
+            )
     if outcome.deferred_jobs:
         outcome.status = "generating"
         return outcome
@@ -461,6 +560,8 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
 
 
 def run_brief(ctx: Context, brief_path: Path, publish: bool = True) -> BatchOutcome:
+    if ctx.adapters.refusal is not None:
+        raise ctx.adapters.refusal
     loaded = load_brief(brief_path, root=ctx.workspace.root)
     problems = validate_brief(loaded.brief, ctx.sites, ctx.inventory)
     if problems:

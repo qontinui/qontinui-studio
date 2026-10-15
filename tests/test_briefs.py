@@ -32,8 +32,9 @@ def test_shipped_example_cross_validates_except_for_schedulability() -> None:
     problems = validate_brief(
         loaded.brief, load_sites(REPO / "sites"), load_providers(REPO / "providers.yaml")
     )
-    # Only problem: neither billed API has an operator-set quota (honest D4 outcome).
-    assert len(problems) == 1 and "no preferred provider is schedulable" in problems[0]
+    # The local GPU (unmetered, first preference) is schedulable; neither billed
+    # API has an operator-set quota, which no longer leaves the brief unrunnable.
+    assert problems == []
 
 
 @pytest.mark.parametrize(
