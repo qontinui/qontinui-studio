@@ -18,7 +18,6 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from PIL import Image
 
 from qontinui_studio import pipeline
@@ -72,6 +71,16 @@ def _studio(studio_root: Path, base: str, write_brief: Callable[..., Path]) -> l
     return ["--root", str(studio_root), "brief", "run", "--no-publish", str(brief)]
 
 
+def _studio_cli(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+    """Run the ``studio`` CLI exactly as its console script does (``main`` in
+    standalone mode, which ends in ``sys.exit``) and return (exit code, output)."""
+    with pytest.raises(SystemExit) as done:
+        main(args)
+    out = capsys.readouterr()
+    code = done.value.code
+    return (code if isinstance(code, int) else 0 if code is None else 1), out.out + out.err
+
+
 def _xmp(path: Path) -> str:
     with Image.open(path) as img:
         raw = img.info.get("xmp") or img.info.get("XML:com.adobe.xmp") or b""
@@ -89,7 +98,11 @@ def _attempts(studio_root: Path) -> list[tuple[str, str]]:
 
 
 def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
-    host: ImageHost, studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock
+    host: ImageHost,
+    studio_root: Path,
+    write_brief: Callable[..., Path],
+    fake_time: FakeClock,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     # The host sends UNMARKED bytes: the studio's own writer must mark them.
     host.queue(
@@ -98,8 +111,8 @@ def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
             imagehost.completed(b64_json=imagehost.png_b64(marked=False)),
         )
     )
-    r = CliRunner().invoke(main, _studio(studio_root, host.base_url, write_brief))
-    assert r.exit_code == 0, r.output
+    code, output = _studio_cli(_studio(studio_root, host.base_url, write_brief), capsys)
+    assert code == 0, output
     written = sorted(
         p
         for d in ("raw", "variants")
@@ -117,25 +130,32 @@ def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(
 
 
 def test_a_transport_drop_after_the_request_was_sent_is_unknown_and_retried(
-    host: ImageHost, studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock
+    host: ImageHost,
+    studio_root: Path,
+    write_brief: Callable[..., Path],
+    fake_time: FakeClock,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     host.queue(
         imagehost.sse_reply(*imagehost.progress(), drop_after=2),
         imagehost.sse_reply(imagehost.completed()),
     )
-    r = CliRunner().invoke(main, _studio(studio_root, host.base_url, write_brief))
-    assert r.exit_code == 0, r.output
+    code, output = _studio_cli(_studio(studio_root, host.base_url, write_brief), capsys)
+    assert code == 0, output
     assert len(host.received) == 2, "the dropped job was retried"
     assert _attempts(studio_root) == [("local-gpu", "unknown"), ("local-gpu", "done")]
 
 
 def test_a_refused_connection_is_a_retryable_busy(
-    studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock
+    studio_root: Path,
+    write_brief: Callable[..., Path],
+    fake_time: FakeClock,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     base = f"http://127.0.0.1:{imagehost.closed_port()}/v1"
-    r = CliRunner().invoke(main, _studio(studio_root, base, write_brief))
-    assert r.exit_code == 3, r.output  # waiting, not failed
-    assert "last attempt: busy from local-gpu" in r.output
+    code, output = _studio_cli(_studio(studio_root, base, write_brief), capsys)
+    assert code == 3, output  # waiting, not failed
+    assert "last attempt: busy from local-gpu" in output
     assert _attempts(studio_root) == [("local-gpu", "busy")]
     db = sqlite3.connect(studio_root / ".studio" / "studio.db")
     status, attempts = db.execute("SELECT status, attempts FROM jobs").fetchone()
