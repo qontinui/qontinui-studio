@@ -148,9 +148,9 @@ def test_local_provider_end_to_end_every_file_is_marked_and_provenanced(
     write_brief: Callable[..., Path],
 ) -> None:
     p = studio_root / "providers.yaml"
-    p.write_text(p.read_text() + ROWS.format(base=host.base_url))
+    p.write_text(p.read_text() + ROWS.format(base=host.v1_url))
     host.queue(imagehost.sse_reply(*imagehost.progress(), imagehost.completed()))
-    local = OpenAICompatibleImageAdapter("local-gpu", "z-image-turbo", host.base_url)
+    local = OpenAICompatibleImageAdapter("local-gpu", "z-image-turbo", host.v1_url)
     ctx = _run("local-gpu", {"local-gpu": local}, studio_root, make_context, write_brief)
     assert _check_every_file(studio_root, "openai_compatible_images", facade=True) == 6
     # The facade's record is embedded VERBATIM, and the prompt carries no Avoid.

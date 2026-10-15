@@ -86,7 +86,7 @@ def _xmp(path: Path) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
-def _attempts(studio_root: Path) -> list[tuple[str, str]]:
+def _ledger(studio_root: Path) -> list[tuple[str, str]]:
     db = sqlite3.connect(studio_root / ".studio" / "studio.db")
     try:
         return [
@@ -111,7 +111,7 @@ def test_every_file_brief_run_writes_is_marked_and_has_a_provenance_sidecar(host
     )
     # ``main`` in standalone mode, exactly as the ``studio`` console script runs it.
     with pytest.raises(SystemExit) as done:
-        main(_studio(studio_root, host.base_url, write_brief))
+        main(_studio(studio_root, host.v1_url, write_brief))
     code, output = _exit(done, capsys)
     assert code == 0, output
     written = sorted(
@@ -137,11 +137,11 @@ def test_a_transport_drop_after_the_request_was_sent_is_unknown_and_retried(host
     )
     # ``main`` in standalone mode, exactly as the ``studio`` console script runs it.
     with pytest.raises(SystemExit) as done:
-        main(_studio(studio_root, host.base_url, write_brief))
+        main(_studio(studio_root, host.v1_url, write_brief))
     code, output = _exit(done, capsys)
     assert code == 0, output
     assert len(host.received) == 2, "the dropped job was retried"
-    assert _attempts(studio_root) == [("local-gpu", "unknown"), ("local-gpu", "done")]
+    assert _ledger(studio_root) == [("local-gpu", "unknown"), ("local-gpu", "done")]
 
 
 def test_a_refused_connection_is_a_retryable_busy(studio_root: Path, write_brief: Callable[..., Path], fake_time: FakeClock, capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
@@ -151,8 +151,8 @@ def test_a_refused_connection_is_a_retryable_busy(studio_root: Path, write_brief
     code, output = _exit(done, capsys)
     assert code == 3, output  # waiting, not failed
     assert "last attempt: busy from local-gpu" in output
-    assert _attempts(studio_root) == [("local-gpu", "busy")]
+    assert _ledger(studio_root) == [("local-gpu", "busy")]
     db = sqlite3.connect(studio_root / ".studio" / "studio.db")
-    status, attempts = db.execute("SELECT status, attempts FROM jobs").fetchone()
+    status, tries = db.execute("SELECT status, attempts FROM jobs").fetchone()
     db.close()
-    assert (status, attempts) == ("queued", 0)
+    assert (status, tries) == ("queued", 0)

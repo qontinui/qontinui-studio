@@ -48,7 +48,7 @@ def host() -> Iterator[ImageHost]:
 
 
 def _runner(host: ImageHost) -> str:
-    return host.base_url.removesuffix("/v1")
+    return host.v1_url.removesuffix("/v1")
 
 
 @pytest.mark.local_http

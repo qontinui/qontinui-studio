@@ -40,7 +40,7 @@ def host() -> Iterator[ImageHost]:
 
 @pytest.fixture
 def adapter(host: ImageHost) -> OpenAICompatibleImageAdapter:
-    return OpenAICompatibleImageAdapter("local-gpu", "z-image-turbo", host.base_url)
+    return OpenAICompatibleImageAdapter("local-gpu", "z-image-turbo", host.v1_url)
 
 
 def _req(**kw: object) -> GenerationRequest:
@@ -268,7 +268,7 @@ def test_an_optional_api_key_is_sent_as_a_bearer(
     host: ImageHost, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("LOCAL_GPU_KEY", "k-test")
-    keyed = OpenAICompatibleImageAdapter("local-gpu", "z", host.base_url, "LOCAL_GPU_KEY")
+    keyed = OpenAICompatibleImageAdapter("local-gpu", "z", host.v1_url, "LOCAL_GPU_KEY")
     host.queue(imagehost.sse_reply(imagehost.completed()))
     keyed.submit(_req(), tmp_path)
     assert host.received[-1].headers.get("Authorization") == "Bearer k-test"

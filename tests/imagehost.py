@@ -87,7 +87,7 @@ class ImageHost:
     server: ThreadingHTTPServer | None = None
 
     @property
-    def base_url(self) -> str:
+    def v1_url(self) -> str:
         assert self.server is not None
         return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
 
