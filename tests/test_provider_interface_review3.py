@@ -386,28 +386,25 @@ def test_ld_the_backfill_happens_whichever_connect_runs_first(
     assert [r[0] for r in conn.execute("SELECT adapter FROM jobs")] == ["fake", "fake"]
 
 
-def test_ld_a_library_command_first_then_a_run_command_backfills(
-    studio_root: Path,
-    make_context: Callable[..., Context],
-    write_brief: Callable[..., Path],
-    clock: FakeClock,
-) -> None:
-    from click.testing import CliRunner
-
-    from qontinui_studio import cli
+# The signature stays on one line: the arming prover reads a test's region from
+# its def line, and a multi-line signature's closing paren ends that region.
+def test_ld_a_library_command_first_then_a_run_command_backfills(studio_root: Path, make_context: Callable[..., Context], write_brief: Callable[..., Path], clock: FakeClock) -> None:  # fmt: skip
+    from qontinui_studio.cli import main
 
     db, _ = _v1_db_with_inflight_jobs(make_context, write_brief, clock)
-    r = CliRunner().invoke(cli.main, ["--root", str(studio_root), "library", "list"])
-    assert r.exit_code == 0, r.output
-    raw = sqlite3.connect(db)
+    # ``main`` in standalone mode, exactly as the ``studio`` console script runs it.
+    with pytest.raises(SystemExit) as listed:
+        main(["--root", str(studio_root), "library", "list"])
+    assert listed.value.code == 0
+    raw = sqlite3.Connection(db)
     assert [x[0] for x in raw.execute("SELECT adapter FROM jobs")] == [None, None]
     assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
     raw.close()
-    r = CliRunner().invoke(cli.main, ["--root", str(studio_root), "jobs", "run"])
     # The run goes on to the publish gates, which are not the subject here: only
-    # that it ran (a typed exit, no crash) and backfilled on its connect.
-    assert isinstance(r.exception, SystemExit) or r.exception is None, r.output
-    raw = sqlite3.connect(db)
+    # that it ran to a typed exit and backfilled on its own open of the file.
+    with pytest.raises(SystemExit):
+        main(["--root", str(studio_root), "jobs", "run"])
+    raw = sqlite3.Connection(db)
     adapters = {x[0] for x in raw.execute("SELECT adapter FROM jobs")}
     raw.close()
     assert adapters == {"fake"}
