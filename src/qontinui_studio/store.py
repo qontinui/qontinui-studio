@@ -216,12 +216,18 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   an unmetered provider (nothing is spent).
 # * ``jobs.adapter``: the adapter kind the job was claimed for, recorded in
 #   every provenance sidecar (the local kind must carry the facade's record).
-#   Rows claimed before v2 are BACKFILLED from the provider inventory when the
-#   caller passes one (``connect(..., adapters=...)``); a row the inventory
-#   cannot name stays NULL, and ingest resolves it then (a pre-v2 job can only
-#   have used an adapter that existed before v2, never the local one).
+#   Rows claimed before v2 are BACKFILLED from the provider inventory by the
+#   first ``connect`` that is given one (``connect(..., adapters=...)``) —
+#   whether or not that is the connect that migrated, so the order in which
+#   CLI commands run does not matter. A row the inventory cannot name stays
+#   NULL, and ingest resolves it then (a pre-v2 job can only have used an
+#   adapter that existed before v2, never the local one).
 # * ``jobs.sent_json``: the generation parameters the adapter actually put on
 #   the wire (seed, recipe, negative prompt ...); sidecars record only these.
+# * ``jobs.home_provider``: the first provider the job was ever claimed for,
+#   never cleared. A bulk job may leave it only for an unmetered provider (the
+#   scheduler's no-spill rule). Backfilled for pre-v2 rows from the first
+#   provider they left (``tried_providers[0]``), else their current provider.
 # ---------------------------------------------------------------------------
 
 SCHEMA_VERSION = 2
@@ -308,7 +314,7 @@ _V0_BATCH_COLUMNS = (
 )
 
 
-def _migrate_v0_to_v1(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> None:
+def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
     """Rebuild ``batches`` and ``assets`` with the v1 columns and CHECKs (SQLite
     cannot alter a CHECK in place). Existing rows are generated rows."""
     conn.execute(_BATCHES_V1)
@@ -333,14 +339,14 @@ def _migrate_v0_to_v1(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> 
 ATTEMPT_OUTCOMES = ("done", "failed", "unknown", "deferred", "busy")
 
 
-def _migrate_v1_to_v2(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> None:
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE jobs ADD COLUMN quota_day TEXT")
     conn.execute("ALTER TABLE jobs ADD COLUMN adapter TEXT")
     conn.execute("ALTER TABLE jobs ADD COLUMN sent_json TEXT")
-    for provider, kind in adapters.items():
-        conn.execute(
-            "UPDATE jobs SET adapter = ? WHERE provider = ? AND adapter IS NULL", (kind, provider)
-        )
+    conn.execute("ALTER TABLE jobs ADD COLUMN home_provider TEXT")
+    conn.execute(
+        "UPDATE jobs SET home_provider = COALESCE(json_extract(tried_providers, '$[0]'), provider)"
+    )
     conn.execute(
         """
         CREATE TABLE job_attempts (
@@ -358,7 +364,7 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> 
     conn.execute("CREATE INDEX job_attempts_job ON job_attempts (job_id, id)")
 
 
-_MIGRATIONS: dict[int, Callable[[sqlite3.Connection, Mapping[str, str]], None]] = {
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
 }
@@ -370,7 +376,7 @@ def _dangling(conn: sqlite3.Connection) -> Counter[tuple[str, str]]:
     return Counter((r[0], r[2]) for r in conn.execute("PRAGMA foreign_key_check"))
 
 
-def _migrate(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> None:
+def _migrate(conn: sqlite3.Connection) -> None:
     """Bring the database to :data:`SCHEMA_VERSION`, one version per
     transaction. Foreign keys are off while tables are rebuilt (SQLite ignores
     the pragma inside a transaction, so it is set around it) and every
@@ -391,7 +397,7 @@ def _migrate(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> None:
                 # Only references the migration itself broke refuse it: a
                 # dangling row that predates it must not brick every command.
                 before = _dangling(conn)
-                _MIGRATIONS[version](conn, adapters)
+                _MIGRATIONS[version](conn)
                 new = _dangling(conn) - before
                 if new:
                     raise sqlite3.IntegrityError(
@@ -407,14 +413,29 @@ def _migrate(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _backfill_adapters(conn: sqlite3.Connection, adapters: Mapping[str, str]) -> None:
+    """Name the adapter of every job claimed before v2 that the inventory can
+    name. Every claim since v2 records its adapter, so a NULL ``adapter`` beside
+    a provider marks a pre-v2 row; the update is idempotent and cheap."""
+    if not adapters:
+        return
+    for provider, kind in adapters.items():
+        conn.execute(
+            "UPDATE jobs SET adapter = ? WHERE provider = ? AND adapter IS NULL", (kind, provider)
+        )
+    conn.commit()
+
+
 def connect(db_path: Path, adapters: Mapping[str, str] | None = None) -> sqlite3.Connection:
     """Open (creating or migrating) the studio database. ``adapters`` maps
-    provider id -> adapter kind (``ProviderInventory.adapter_kinds()``); a
-    migration that backfills a column from the inventory uses it."""
+    provider id -> adapter kind (``ProviderInventory.adapter_kinds()``); when
+    given, pre-v2 jobs whose adapter is still unnamed are backfilled from it —
+    on this connect, whichever command migrated the file."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
-    _migrate(conn, adapters or {})
+    _migrate(conn)
+    _backfill_adapters(conn, adapters or {})
     return conn

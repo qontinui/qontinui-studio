@@ -452,10 +452,17 @@ recorded in `job_attempts` as `done | failed | unknown | deferred | busy`, and
   window) requeue the job at the host's `retry_after_s` (clamped to 1 s–24 h; a
   non-finite value is ignored) **without spending a quota unit or an attempt**.
   A `deferred`, or a `busy` answered to a bulk job, never moves the job to another
-  provider. A bulk job that is given up on its provider (`disabled`,
-  `weights_unverified`, repeated `unknown`) may move only to another unmetered
-  local provider; otherwise it fails with `bulk_no_spill`. Bulk work never spills
-  onto a paid adapter.
+  provider.
+- A bulk job is bound to its **home**: the first provider it is ever claimed
+  for, recorded in `jobs.home_provider` and never cleared. Its first claim
+  follows the brief's preference among the adapters built on that run. After
+  that, whatever changes its provider — a give-up (`disabled`,
+  `weights_unverified`, repeated `unknown`), a spent quota, or its home's
+  adapter not being built on a later run (key unset, D4 off, a gateway route) —
+  it may move only back to its home or to an unmetered provider; with neither
+  available it fails with `bulk_no_spill`. So a bulk job that has been on the
+  local GPU never reaches a metered (paid) adapter. Studio does not override a
+  bulk brief whose own first choice, on its first run, is a metered provider.
 - `unknown` — the transport failed after the request was sent, the answer was
   truncated, or the job id was lost — is never collapsed into `failed` or `done`.
   It is recorded as `unknown` and the job is retried as a counted attempt.
@@ -474,12 +481,19 @@ as its own field; a wire without one (Gemini, OpenAI) gets it folded in as
 `bulk`).
 
 **Gateway tenants.** Before generating, the CLI reads the runner's model-gateway
-state from a loopback runner only. No runner, or a runner build with no gateway
-read, means no declared gateway. A declared gateway with an images route (https,
-or plain http to a literal local address) carries every OpenAI-images-wire
-adapter, authenticated with the gateway's own credential: a vendor key is never
-sent to a gateway route, and an adapter that needs a key is refused when the
-gateway declares none. A declared gateway without a usable images route, or a
+state from a loopback runner only, and only after the runner's `/health`
+identifies a qontinui runner build (`buildId` and `gitSha`; identification, not
+authentication). A refused connection — no runner — means no declared gateway,
+and so does a `404` on `/model-gateway` from an identified runner (its build
+serves no gateway read). A connect timeout, an unidentified `/health`, or any
+other unreadable answer is `unknown`. A declared gateway with an images route
+(https, or plain http to a literal local address) carries every
+OpenAI-images-wire adapter, authenticated with the gateway's own credential:
+the variable the declaration names must match `QONTINUI_GATEWAY_[A-Z0-9_]+` and
+must not be any inventory row's `api_key_env`, or every image call is refused.
+So no vendor key the inventory names, and no variable outside that prefix
+(`OPENAI_API_KEY`, `AWS_SECRET_ACCESS_KEY`, ...), is sent to a gateway route; an
+adapter that needs a key is refused when the gateway declares none. A declared gateway without a usable images route, or a
 runner that cannot say, refuses every image call with `gateway_has_no_image_route`
 (exit 6, from `brief run`, `jobs run`, and `launch build` / `launch run` unless
 `--no-generate`) and makes no vendor or local call (decision record

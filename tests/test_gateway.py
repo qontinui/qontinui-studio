@@ -96,10 +96,11 @@ def _runner(host: ImageHost) -> str:
 def test_the_runner_reading_maps_to_a_typed_state(
     host: ImageHost, reply: imagehost.Reply, state: str, source: str, images: str | None
 ) -> None:
-    host.queue(reply)
+    host.queue(imagehost.runner_health(), reply)
     got = read_gateway_state(_runner(host))
     assert (got.state, got.source, got.images_base_url) == (state, source, images)
-    assert host.received[-1].path == "/model-gateway"
+    assert [r.path for r in host.received] == ["/health", "/model-gateway"]
+    assert got.runner_git_sha == imagehost.RUNNER_GIT_SHA
 
 
 @pytest.mark.local_http

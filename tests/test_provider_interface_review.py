@@ -348,7 +348,7 @@ def _v1_db_with_inflight_jobs(
     raw = sqlite3.connect(db)  # back to the v1 shape: what a v1 studio.db holds
     raw.execute("DROP INDEX job_attempts_job")
     raw.execute("DROP TABLE job_attempts")
-    for col in ("quota_day", "adapter", "sent_json"):
+    for col in ("quota_day", "adapter", "sent_json", "home_provider"):
         raw.execute(f"ALTER TABLE jobs DROP COLUMN {col}")
     raw.execute("PRAGMA user_version = 1")
     raw.commit()
@@ -422,10 +422,10 @@ def test_l1_a_vendor_key_is_never_sent_to_a_gateway_route(
         local.submit(GenerationRequest("j", "p", "1:1"), tmp_path)
     assert "authorization" not in {k.lower() for k in respx.calls.last.request.headers}
 
-    monkeypatch.setenv("GATEWAY_IMAGES_KEY", "gw-secret")
+    monkeypatch.setenv("QONTINUI_GATEWAY_IMAGES_KEY", "gw-secret")
     built = build_adapters(
         inv,  # type: ignore[arg-type]
-        gateway=GatewayState("declared", "runner", "", route, "GATEWAY_IMAGES_KEY"),
+        gateway=GatewayState("declared", "runner", "", route, "QONTINUI_GATEWAY_IMAGES_KEY"),
     )
     oa = built.adapters["openai"]
     assert isinstance(oa, OpenAIImageAdapter)
@@ -450,7 +450,10 @@ def test_l1_a_vendor_key_is_never_sent_to_a_gateway_route(
 def test_l1_only_an_https_or_literal_local_route_is_accepted(
     host: ImageHost, route: str, state: str
 ) -> None:
-    host.queue(imagehost.json_reply(200, {"state": "declared", "routes": {"images": route}}))
+    host.queue(
+        imagehost.runner_health(),
+        imagehost.json_reply(200, {"state": "declared", "routes": {"images": route}}),
+    )
     got = read_gateway_state(host.v1_url.removesuffix("/v1"))
     assert got.state == state
     assert (got.refusal() is None) is (state == "declared")

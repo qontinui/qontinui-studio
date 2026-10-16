@@ -18,6 +18,15 @@ Two writers, one reader:
   Pillow) — never a ``tEXt`` chunk that merely borrows the keyword. It requires
   exactly one packet, whose ``DigitalSourceType`` property is the marker.
 
+Packets are parsed as XML (stdlib expat, with every DTD and entity declaration
+refused, so no entity is ever expanded). A property counts only by its
+namespace URI (``http://iptc.org/std/Iptc4xmpExt/2008-02-29/``), never by its
+prefix, and a comment or any other text that merely spells the property does
+not count. A packet is marked only when it holds at least one
+``DigitalSourceType`` and every one of them is trainedAlgorithmicMedia; marking
+rewrites every existing value (``digitalCapture`` included), so a marked file
+never holds two conflicting values.
+
 C2PA is not written: it needs a signing credential, and obtaining a trusted one
 is a billing decision this plan does not take. The IPTC marker meets a5ec7670's
 mandatory part.
@@ -26,14 +35,22 @@ mandatory part.
 from __future__ import annotations
 
 import io
-import re
 import struct
 import zlib
 from pathlib import Path
+from xml.etree import ElementTree as ET
+from xml.parsers import expat
 
 from PIL import Image, PngImagePlugin, UnidentifiedImageError
 
 DIGITAL_SOURCE_TYPE = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+IPTC_EXT_NS = "http://iptc.org/std/Iptc4xmpExt/2008-02-29/"
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_X_NS = "adobe:ns:meta/"
+_DST = f"{{{IPTC_EXT_NS}}}DigitalSourceType"
+_RDF_RESOURCE = f"{{{RDF_NS}}}resource"
+_XPACKET_BEGIN = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+_XPACKET_END = '<?xpacket end="w"?>'
 
 XMP_PACKET = (
     '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
@@ -146,15 +163,49 @@ def _packets(data: bytes) -> list[bytes] | None:
     return None
 
 
-_DST_ATTR = re.compile(r"((?:[A-Za-z_][\w.-]*:)?DigitalSourceType\s*=\s*)([\"'])(.*?)\2", re.S)
-_DST_ELEM = re.compile(r"(<((?:[A-Za-z_][\w.-]*:)?DigitalSourceType)>)(.*?)(</\2>)", re.S)
+class _NoDtd(ValueError):
+    """A packet declared a DTD or an entity: refused, never expanded."""
+
+
+def _parse_packet(packet: bytes) -> ET.Element | None:
+    """The packet's root element, or None when it is not well-formed XML or
+    declares a DTD/entity. A first expat pass refuses any DOCTYPE or entity
+    declaration before anything is expanded (as defusedxml does); only a packet
+    that passes is handed to ElementTree."""
+    text = packet.rstrip(b"\x00 \t\r\n")
+
+    def refuse(*_args: object) -> None:
+        raise _NoDtd("XMP packets may not declare a DTD or entities")
+
+    guard = expat.ParserCreate()
+    guard.StartDoctypeDeclHandler = refuse
+    guard.EntityDeclHandler = refuse
+    guard.UnparsedEntityDeclHandler = refuse
+    try:
+        guard.Parse(text, True)
+        return ET.fromstring(text)
+    except (expat.ExpatError, ET.ParseError, _NoDtd, ValueError):
+        return None
+
+
+def _dst_values(root: ET.Element) -> list[str]:
+    """Every ``DigitalSourceType`` value in the packet, matched by namespace
+    URI: as an attribute, as an element's text, or as its ``rdf:resource``."""
+    values: list[str] = []
+    for el in root.iter():
+        if _DST in el.attrib:
+            values.append(el.attrib[_DST].strip())
+        if el.tag == _DST:
+            values.append((el.attrib.get(_RDF_RESOURCE) or el.text or "").strip())
+    return values
 
 
 def _declares(packet: bytes) -> bool:
-    text = packet.decode("utf-8", "replace")
-    values = [m.group(3).strip() for m in _DST_ATTR.finditer(text)]
-    values += [m.group(3).strip() for m in _DST_ELEM.finditer(text)]
-    return DIGITAL_SOURCE_TYPE in values
+    root = _parse_packet(packet)
+    if root is None:
+        return False
+    values = _dst_values(root)
+    return bool(values) and all(v == DIGITAL_SOURCE_TYPE for v in values)
 
 
 def bytes_are_marked(data: bytes) -> bool:
@@ -182,32 +233,47 @@ def is_marked(path: Path) -> bool:
         return False
 
 
+def _serialise(root: ET.Element) -> bytes:
+    for prefix, uri in (("x", _X_NS), ("rdf", RDF_NS), ("Iptc4xmpExt", IPTC_EXT_NS)):
+        ET.register_namespace(prefix, uri)
+    body = ET.tostring(root, encoding="unicode")
+    return f"{_XPACKET_BEGIN}{body}{_XPACKET_END}".encode()
+
+
 def merged_packet(existing: bytes | None) -> bytes:
     """``existing`` with the marker merged in, or the marker's own packet.
 
-    An existing ``DigitalSourceType`` is set to trainedAlgorithmicMedia (the
-    studio generated these pixels); otherwise one more ``rdf:Description`` is
-    added inside ``rdf:RDF`` (RDF allows any number), so the provider's other
-    metadata is kept. A packet with no ``rdf:RDF`` cannot be merged into and is
-    replaced."""
-    if not existing:
+    Every existing ``DigitalSourceType`` (matched by namespace URI) is set to
+    trainedAlgorithmicMedia — the studio generated these pixels, so a
+    ``digitalCapture`` or any other value is replaced, never kept beside it.
+    With none, one more ``rdf:Description`` is added inside ``rdf:RDF`` (RDF
+    allows any number), so the provider's other metadata is kept. A packet that
+    is not well-formed XML, declares a DTD, or has no ``rdf:RDF`` cannot be
+    merged into and is replaced."""
+    root = _parse_packet(existing) if existing else None
+    if root is None:
         return XMP_PACKET
-    text = existing.decode("utf-8", "replace")
-    text, n_attr = _DST_ATTR.subn(
-        lambda m: f"{m.group(1)}{m.group(2)}{DIGITAL_SOURCE_TYPE}{m.group(2)}", text
-    )
-    text, n_elem = _DST_ELEM.subn(lambda m: f"{m.group(1)}{DIGITAL_SOURCE_TYPE}{m.group(4)}", text)
-    if n_attr or n_elem:
-        return text.encode("utf-8")
-    close = text.rfind("</rdf:RDF>")
-    if close < 0:
-        return XMP_PACKET
-    description = (
-        '<rdf:Description rdf:about="" '
-        'xmlns:Iptc4xmpExt="http://iptc.org/std/Iptc4xmpExt/2008-02-29/" '
-        f'Iptc4xmpExt:DigitalSourceType="{DIGITAL_SOURCE_TYPE}"/>'
-    )
-    return (text[:close] + description + text[close:]).encode("utf-8")
+    found = False
+    for el in root.iter():
+        if _DST in el.attrib:
+            el.attrib[_DST] = DIGITAL_SOURCE_TYPE
+            found = True
+        if el.tag == _DST:
+            for child in list(el):
+                el.remove(child)
+            el.attrib.pop(_RDF_RESOURCE, None)
+            el.text = DIGITAL_SOURCE_TYPE
+            found = True
+    if not found:
+        rdf = root if root.tag == f"{{{RDF_NS}}}RDF" else root.find(f".//{{{RDF_NS}}}RDF")
+        if rdf is None:
+            return XMP_PACKET
+        ET.SubElement(
+            rdf,
+            f"{{{RDF_NS}}}Description",
+            {f"{{{RDF_NS}}}about": "", _DST: DIGITAL_SOURCE_TYPE},
+        )
+    return _serialise(root)
 
 
 def _mark_png(data: bytes) -> bytes:

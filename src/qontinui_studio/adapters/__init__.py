@@ -11,7 +11,7 @@ from qontinui_studio.adapters.base import (
     SubmittedJob,
 )
 from qontinui_studio.errors import AdapterDisabledError, GatewayRefusal, MissingCredentialError
-from qontinui_studio.gateway import GatewayState
+from qontinui_studio.gateway import GATEWAY_CREDENTIAL_ENV, GatewayState, credential_env_acceptable
 from qontinui_studio.providers import Provider, ProviderInventory, is_local_network
 
 __all__ = [
@@ -34,7 +34,8 @@ def build_adapter(
 
     With a ``gateway_route`` (a declared gateway's images route) an
     OpenAI-images-wire adapter is pointed at it and authenticates with the
-    GATEWAY's own credential (``gateway_credential_env``) — never with the
+    GATEWAY's own credential (``gateway_credential_env``, which must be a
+    ``QONTINUI_GATEWAY_*`` name other than this row's own key) — never with the
     row's vendor or facade key. An adapter that needs a key gets none when the
     gateway declares none: it is refused, not handed the vendor key."""
     gate = provider.adapter_gate()
@@ -74,6 +75,12 @@ def build_adapter(
 def _through_gateway(
     provider: Provider, model: str, route: str, credential_env: str | None
 ) -> ProviderAdapter:
+    own = frozenset({provider.api_key_env} if provider.api_key_env else ())
+    if credential_env is not None and not credential_env_acceptable(credential_env, own):
+        raise AdapterDisabledError(
+            f"{provider.id}: the gateway's credential variable {credential_env!r} is not a "
+            f"{GATEWAY_CREDENTIAL_ENV.pattern} name distinct from every vendor key"
+        )
     if provider.adapter == "openai_images":
         from qontinui_studio.adapters.openai_images import OpenAIImageAdapter
 
@@ -116,6 +123,17 @@ def build_adapters(
     -wire adapter (other wires cannot go through it)."""
     result = AdapterSet()
     refusal = gateway.refusal() if gateway is not None else None
+    if refusal is None and gateway is not None and gateway.images_credential_env is not None:
+        vendor = frozenset(p.api_key_env for p in inventory.providers if p.api_key_env)
+        if not credential_env_acceptable(gateway.images_credential_env, vendor):
+            # The gateway nominated a vendor key the inventory names (or a name
+            # outside the gateway prefix): no image call is made at all.
+            refusal = GatewayRefusal(
+                f"{GatewayRefusal.code}: the declared gateway names "
+                f"{gateway.images_credential_env!r} as its credential, which is a vendor key "
+                f"or not a {GATEWAY_CREDENTIAL_ENV.pattern} name; no image call is made",
+                gateway.state,
+            )
     route = gateway.images_base_url if gateway is not None and refusal is None else None
     if gateway is not None and gateway.state != "declared":
         route = None

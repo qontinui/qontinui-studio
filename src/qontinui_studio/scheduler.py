@@ -15,8 +15,13 @@ written to ``job_attempts`` as ``done | failed | unknown | deferred | busy``.
 * A host's ``deferred``/``busy`` refusal requeues the job at the host's
   ``retry_after_s`` WITHOUT spending a quota unit (the unit spent at the claim
   is refunded) or an attempt. A ``deferred``, or a ``busy`` answered to a bulk
-  job, never moves the job to another provider, so bulk work cannot spill onto
-  a paid adapter.
+  job, never moves the job to another provider.
+* A BULK job is bound to its HOME provider (``jobs.home_provider``, the first
+  provider it was ever claimed for). Whatever later changes its provider — a
+  give-up, a spent quota, or its home's adapter not being built on a later run
+  — it may move only to an unmetered provider, never to a metered one other
+  than its home. Its FIRST claim follows the brief's preference among the
+  adapters built on that run.
 * ``unknown`` (the transport failed mid-flight, or the job id is lost) is
   recorded as itself and the job is retried as a fresh, counted attempt.
 * An interactive job whose provider answered ``busy`` or ``unknown`` may fall
@@ -264,13 +269,15 @@ class Scheduler:
 
     # ---- the step --------------------------------------------------------
 
-    def _may_move_to(self, pid: str, template: GenerationRequest, tried: list[str]) -> bool:
-        """Whether a job may be (re)assigned to ``pid``. A BULK job that has
-        already been given up on a provider may move only to an unmetered local
-        provider: bulk work never spills onto a metered (paid) adapter, whatever
-        made it leave — ``disabled``, ``weights_unverified``, repeated
-        ``unknown``. Its first assignment follows the brief's own preference."""
-        if template.priority != "bulk" or not tried:
+    def _may_move_to(self, pid: str, template: GenerationRequest, home: str | None) -> bool:
+        """Whether a job may be assigned to ``pid``. A BULK job that has ever
+        been claimed (``home`` is its first provider) may move only to its home
+        or to an unmetered provider: bulk work never spills onto a metered
+        (paid) adapter, whatever made its provider change — ``disabled``,
+        ``weights_unverified``, repeated ``unknown``, a spent quota, or its
+        home's adapter not being built on this run (``busy``/``deferred`` keep
+        the job on its home). Its first claim follows the brief's preference."""
+        if template.priority != "bulk" or home is None or pid == home:
             return True
         return self.inventory.get(pid).capacity == "unmetered"
 
@@ -280,23 +287,27 @@ class Scheduler:
         tried: list[str],
         now: datetime,
         template: GenerationRequest,
-        given_up: list[str] | None = None,
+        home: str | None,
     ) -> str | None:
         """The first preferred provider that is not excluded (``tried``), has an
-        adapter, may take this job and has capacity now. ``given_up`` is the
-        job's own record of providers it left (defaults to ``tried``)."""
-        left = tried if given_up is None else given_up
+        adapter, may take this job (``home``: see :meth:`_may_move_to`) and has
+        capacity now."""
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
                 continue
-            if not self._may_move_to(pid, template, left):
+            if not self._may_move_to(pid, template, home):
                 continue
             if self.has_capacity(pid, now):
                 return pid
         return None
 
     def _next_window(
-        self, preference: list[str], tried: list[str], now: datetime, template: GenerationRequest
+        self,
+        preference: list[str],
+        tried: list[str],
+        now: datetime,
+        template: GenerationRequest,
+        home: str | None,
     ) -> datetime | None:
         """When some untried preferred provider (adapter built, schedulable) gets
         quota again — the earliest of their resets — or None if none ever will."""
@@ -304,7 +315,7 @@ class Scheduler:
         for pid in preference:
             if pid in tried or pid not in self.adapters.adapters:
                 continue
-            if not self._may_move_to(pid, template, tried):
+            if not self._may_move_to(pid, template, home):
                 continue
             provider = self.inventory.get(pid)
             if provider.schedulable_reason() is not None or provider.capacity == "unmetered":
@@ -387,10 +398,13 @@ class Scheduler:
                     self.conn.rollback()
                     return "no_quota"
             cols = ", ".join(f"{k} = ?" for k in fields)
+            # The first provider a job is ever claimed for is its home, kept for
+            # good: the bulk no-spill rule reads it (:meth:`_may_move_to`).
             claimed = self.conn.execute(
-                f"UPDATE jobs SET status = 'submitting', claim = ?, {cols} "
+                f"UPDATE jobs SET status = 'submitting', claim = ?, {cols}, "
+                "home_provider = COALESCE(home_provider, ?) "
                 "WHERE id = ? AND status = 'queued' AND claim IS ?",
-                (token, *fields.values(), row["id"], row["claim"]),
+                (token, *fields.values(), provider_id, row["id"], row["claim"]),
             ).rowcount
             if claimed != 1:
                 self.conn.rollback()
@@ -410,6 +424,7 @@ class Scheduler:
         report: StepReport,
     ) -> None:
         tried: list[str] = json.loads(row["tried_providers"])
+        home: str | None = row["home_provider"]
         excluded: set[str] = set()
         token = uuid.uuid4().hex
         while True:
@@ -423,10 +438,10 @@ class Scheduler:
                 or not self.has_capacity(provider_id, now)
             ):
                 provider_id = self._pick_provider(
-                    preference, [*tried, *excluded], now, template, given_up=tried
+                    preference, [*tried, *excluded], now, template, home
                 )
             if provider_id is None:
-                window = self._next_window(preference, tried, now, template)
+                window = self._next_window(preference, tried, now, template, home)
                 if window is not None:
                     self._write(
                         row["id"],
@@ -442,7 +457,7 @@ class Scheduler:
                     row["claim"],
                     "queued",
                     status="failed",
-                    last_error=self._no_provider_reason(row, preference, tried, template),
+                    last_error=self._no_provider_reason(row, preference, tried, template, home),
                 ):
                     report.failed.append(row["id"])
                 return
@@ -582,6 +597,7 @@ class Scheduler:
         preference: list[str],
         tried: list[str],
         template: GenerationRequest,
+        home: str | None,
     ) -> str:
         """Why a job with no provider left fails — typed when the bulk rule is
         what closed the remaining doors."""
@@ -590,12 +606,19 @@ class Scheduler:
             for pid in preference
             if pid not in tried
             and pid in self.adapters.adapters
-            and not self._may_move_to(pid, template, tried)
+            and not self._may_move_to(pid, template, home)
         ]
         if blocked:
+            why = (
+                f"left {tried}"
+                if home in tried
+                else f"its home {home} has no adapter on this run"
+                if home not in self.adapters.adapters
+                else f"its home {home} has no capacity now"
+            )
             return (
-                f"bulk_no_spill: left {tried} and bulk work never moves to a metered provider "
-                f"({blocked}); last error: {row['last_error']}"
+                f"bulk_no_spill: a bulk job claimed for {home} never moves to a metered "
+                f"provider other than it ({blocked}); {why}; last error: {row['last_error']}"
             )
         return str(row["last_error"] or "no schedulable provider in the brief's preference")
 
@@ -608,7 +631,7 @@ class Scheduler:
         The provider it leaves joins ``tried``, so a job never ping-pongs."""
         if template.priority != "interactive":
             return None
-        return self._pick_provider(preference, [*tried, current], self.clock(), template)
+        return self._pick_provider(preference, [*tried, current], self.clock(), template, None)
 
     def _requeue(self, job_id: str, claim: str, status: str, **fields: object) -> bool:
         return self._write(

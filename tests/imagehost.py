@@ -173,6 +173,22 @@ def json_reply(status: int, body: object, headers: dict[str, str] | None = None)
     return reply
 
 
+RUNNER_GIT_SHA = "200538ff8d9b"
+
+
+def runner_health(git_sha: str = RUNNER_GIT_SHA) -> Reply:
+    """``GET /health`` as a qontinui runner build answers it (the identity
+    fields studio checks, inside the runner's envelope)."""
+    return json_reply(
+        200,
+        {
+            "success": True,
+            "buildId": f"{git_sha}-1791306076603",
+            "data": {"status": "ok", "gitSha": git_sha, "buildId": f"{git_sha}-1791306076603"},
+        },
+    )
+
+
 def raw_reply(status: int, data: bytes, ctype: str = "application/json") -> Reply:
     def reply(h: BaseHTTPRequestHandler) -> None:
         h.send_response(status)
