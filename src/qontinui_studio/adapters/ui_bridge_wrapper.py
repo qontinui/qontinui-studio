@@ -7,8 +7,12 @@ browser session the operator logged into by hand. Studio never sees a
 credential: it posts ``POST {runner}/wrappers/{wrapper_id}/dispatch`` with
 ``{"action": "generate-image", "params": {"prompt", "aspectRatio",
 "maxPerDay", "minIntervalS"}}`` (the row's override bounds; the wrapper applies
-the stricter of its own and these) and reads the runner's ``{"success",
-"data": {"result": ...}, "error"}`` envelope.
+the stricter of its own and these) and reads a TWO-LAYER envelope:
+``{"success": true, "data": {"result": {"success": true, "data": <answer>}}}``.
+The outer layer is the runner's (dispatch.rs forwards the wrapper's body as
+``result``); the inner one is the @qontinui/ui-bridge-wrapper dispatch
+server's. A wrapper whose body carries its own ``result`` key reaches us
+one layer shallower, and that shape is accepted too.
 
 The wrapper's ``result`` (the contract this adapter is built against):
 
@@ -90,14 +94,26 @@ MAX_DETAIL_CHARS = 300
 # A URL is reduced to scheme + host: its path can carry a conversation id
 # (gemini.google.com/app/<id>, chatgpt.com/c/<id>), its query a sign-in
 # continuation or account hint.
-_URL = re.compile(r"(https?://[^\s/?#'\"]+)[^\s'\"]*")
+# Any scheme, any case; the userinfo (``user:pw@``) is dropped with the path.
+_URL = re.compile(
+    r"\b([a-z][a-z0-9+.-]*://)(?:[^\s/@'\"]*@)?([^\s/?#'\"@]+)[^\s'\"]*", re.IGNORECASE
+)
+# A scheme-less host followed by a path (``gemini.google.com/app/<id>``): only
+# a token whose last label is alphabetic, not preceded by a path character, so
+# file paths (``dist/cli.js``, ``~/.qontinui/...``) are left alone.
+_BARE_HOST_PATH = re.compile(
+    r"(?<![\w./~@:-])((?:[a-z0-9-]+\.)+[a-z]{2,})/[^\s'\"]*", re.IGNORECASE
+)
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def redact(text: object) -> str:
-    """Text fit for a job row, a latch file or a notice: URLs keep only their
-    scheme and host, e-mail addresses are masked, and the result is bounded."""
-    out = _EMAIL.sub("<email>", _URL.sub(r"\1", str(text)))
+    """Text fit for a job row, a latch file or a notice: every URL — with or
+    without a scheme, in any case — keeps only its host (and scheme), userinfo
+    and e-mail addresses are removed, and the result is bounded."""
+    out = _URL.sub(r"\1\2", str(text))
+    out = _BARE_HOST_PATH.sub(r"\1", out)
+    out = _EMAIL.sub("<email>", out)
     return out if len(out) <= MAX_DETAIL_CHARS else out[: MAX_DETAIL_CHARS - 1] + "…"
 
 

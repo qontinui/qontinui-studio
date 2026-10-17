@@ -73,9 +73,9 @@ def _inventory(*rows: dict[str, Any]) -> ProviderInventory:
     )
 
 
-def _png() -> str:
+def _png(width: int = 8, height: int = 8) -> str:
     buf = io.BytesIO()
-    Image.new("RGB", (8, 8), (200, 40, 40)).save(buf, format="PNG")
+    Image.new("RGB", (width, height), (200, 40, 40)).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -578,3 +578,130 @@ def test_studio_alone_holds_the_pace_interval(tmp_path: Path) -> None:
     now[0] += 61
     adapter.submit(_request(), tmp_path / "c")
     assert route.call_count == 2
+
+
+# --- review round 3: redaction edge cases, the real gate, the real paced path --
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("see gemini.google.com/app/8f3a2c1d9e now", "see gemini.google.com now"),
+        ("HTTPS://chatgpt.com/c/abc?x=1", "HTTPS://chatgpt.com"),
+        ("https://user:pw@chatgpt.com/c/x", "https://chatgpt.com"),
+        ("at Https://Gemini.Google.com/app/z#f", "at Https://Gemini.Google.com"),
+        # file paths are not hosts and stay readable
+        (
+            "file ~/.qontinui/wrappers/gemini-web/state.json",
+            "file ~/.qontinui/wrappers/gemini-web/state.json",
+        ),
+        ("node dist/cli.js clear-handoff", "node dist/cli.js clear-handoff"),
+    ],
+)
+def test_redact_reduces_every_url_shape_to_its_host(text: str, expected: str) -> None:
+    from qontinui_studio.adapters.ui_bridge_wrapper import redact
+
+    assert redact(text) == expected
+
+
+def _chatgpt_row() -> dict[str, Any]:
+    row = _row(
+        id="chatgpt-web",
+        provider="ChatGPT web (test)",
+        wrapper_id="chatgpt-web",
+        domains=["chatgpt.example"],
+    )
+    for k in ("api_available", "automation_allowed"):
+        row[k] = {"value": "no", "source": "https://chatgpt.example/robots.txt"}
+    row["commercial_use"] = {
+        "value": "unknown",
+        "source": "https://chatgpt.example/robots.txt",
+        "note": "first-party terms unread (403)",
+    }
+    return row
+
+
+def test_the_chatgpt_terms_snapshot_round_trips_its_unknown_licence() -> None:
+    snap = TermsSnapshot.of(_inventory(_chatgpt_row()).providers[0])
+    back = TermsSnapshot.from_json(snap.to_json())
+    assert back == snap
+    assert back.commercial_use == "unknown" and back.automation_allowed == "no"
+    assert back.operator_override is not None
+
+
+def _studio_with(studio_root: Path, *rows: dict[str, Any]) -> None:
+    path = studio_root / "providers.yaml"
+    inv = yaml.safe_load(path.read_text())
+    inv["providers"].extend(rows)
+    path.write_text(yaml.safe_dump(inv))
+
+
+@respx.mock
+def test_a_chatgpt_asset_is_refused_by_the_real_publication_gate(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qontinui_studio.adapters import build_adapters
+    from qontinui_studio.pipeline import run_brief
+
+    monkeypatch.setenv("STUDIO_RUNNER_URL", RUNNER)  # respx answers it; no socket
+
+    _studio_with(studio_root, _chatgpt_row())
+    respx.post(f"{RUNNER}/wrappers/chatgpt-web/dispatch").mock(
+        return_value=_answer({"status": "done", "images": [{"b64_json": _png(64, 36)}]})
+    )
+    ctx = make_context()
+    ctx.adapters = build_adapters(
+        ctx.inventory, only=["chatgpt-web"], state_dir=ctx.workspace.state_dir
+    )
+    assert "chatgpt-web" in ctx.adapters.adapters, ctx.adapters.unavailable
+    outcome = run_brief(ctx, write_brief(providers="chatgpt-web"))
+    assert outcome.status == "refused"
+    assert outcome.publish is not None
+    failing = [g for g in outcome.publish.failures if g.gate == "d5_licence"]
+    assert failing and "commercial terms unknown" in failing[0].detail
+    assert not (studio_root / "published" / "cafe" / "hero.webp").exists()
+
+
+@respx.mock
+def test_the_real_adapter_paced_refusal_falls_back_through_the_scheduler(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    tmp_path: Path,
+) -> None:
+    from qontinui_studio.providers import OperatorOverride
+
+    _studio_with(studio_root, _row())
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "done", "images": [{"b64_json": _png(64, 36)}]})
+    )
+    real = UIBridgeWrapperAdapter(
+        "gemini-web",
+        "m",
+        "gemini-web",
+        RUNNER,
+        override=OperatorOverride.model_validate(OVERRIDE),
+        state_dir=tmp_path / "state",
+        clock=lambda: 1_000_000.0,  # frozen: the second job lands inside 90 s
+    )
+    ctx = make_context(
+        adapters=AdapterSet(
+            adapters={"gemini-web": real, "fake": FakeImageAdapter("fake", "fake-v1")}
+        )
+    )
+    out = drive_batch(
+        ctx,
+        new_batch(ctx, load_brief(write_brief(providers="gemini-web, fake", variants=2))),
+        publish=False,
+    )
+    assert out.status == "generated"
+    assert route.call_count == 1  # the paced job never dialled
+    providers = sorted(r["provider"] for r in ctx.conn.execute("SELECT provider FROM jobs"))
+    assert providers == ["fake", "gemini-web"]
+    used = ctx.conn.execute(
+        "SELECT COALESCE(SUM(used), 0) AS u FROM quota_usage WHERE provider='gemini-web'"
+    ).fetchone()
+    assert used["u"] == 1  # the paced refusal's unit was refunded
