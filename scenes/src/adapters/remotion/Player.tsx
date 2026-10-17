@@ -74,12 +74,18 @@ function check(sceneId: string, input: unknown): Checked {
   if (refusal) return { ok: false, errors: [refusal] };
   const problems = missingRequirements(scene, result.trace);
   if (problems.length) return { ok: false, errors: [`trace cannot drive ${sceneId}; it needs: ${problems.join("; ")}`] };
-  return {
-    ok: true,
-    trace: result.trace,
-    duration: sceneDuration(scene, result.trace),
-    poster: posterFrame(scene, result.trace),
-  };
+  try {
+    return {
+      ok: true,
+      trace: result.trace,
+      duration: sceneDuration(scene, result.trace),
+      poster: posterFrame(scene, result.trace),
+    };
+  } catch (err) {
+    // A scene bug (e.g. a poster outside the scene) shows the error panel,
+    // never crashes the consumer's page.
+    return { ok: false, errors: [err instanceof Error ? err.message : String(err)] };
+  }
 }
 
 export function StudioPlayer({

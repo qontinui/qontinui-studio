@@ -96,7 +96,7 @@ export function illustrativeCases(
 
 /** 120 characters: SOURCE_REF_MAX, the longest source the schema accepts. */
 export const LONG_SOURCE_REF =
-  "build-record export of qontinui/qontinui-design-tokens, qontinui/qontinui-studio and qontinui/qontinui-web, last 30 days";
+  "TEST FIXTURE, not a real build-record export: a source as long as the schema allows, so the label must wrap, never clip.";
 
 export function loadS1Trace(): SceneTrace {
   return loadIllustrativeTrace(SCENE_ID);

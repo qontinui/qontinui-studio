@@ -35,7 +35,8 @@ const HTML = `<!doctype html>
 /**
  * The page bundle. `process.env.VITEST` is passed through from the process
  * that builds it, so the test-only replay hook works under vitest (the scene
- * matrix) and refuses everywhere else (`pnpm embed:serve`).
+ * matrix) and refuses otherwise (`pnpm embed:serve`, unless someone runs it
+ * with VITEST=true by hand).
  */
 export async function bundleEmbedPage(): Promise<string> {
   const result = await build({

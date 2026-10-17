@@ -133,7 +133,7 @@ title-safe width and is clamped to three lines with an ellipsis, and every
 scene layout starts its header below that room, so the label can neither clip
 sideways nor reach the header. The full source always stays in the trace;
 `source.ref` is capped at 120 characters. S1's plan title is clamped to two
-lines. Goldens cover a 120-character realistic source, a source of 120 "W"s
+lines. Goldens cover a 120-character source (a labelled test fixture), a source of 120 "W"s
 and a 160-character title. Both mode badges use neutral token colours
 (border/brand), not attention-layer state colours.
 
@@ -398,7 +398,7 @@ The golden suite renders, for every scene, its illustrative trace at each
 aspect (`illustrativeCases` in `tests/golden/cases.ts`; the catalogue unit
 test fails if a scene lacks an aspect). For S1 that is five frames in 16:9
 and one each in 9:16 and 1:1, plus one frame per aspect of a replay with the
-longest realistic source, and at 9:16 and 1:1 a replay whose source is 120
+longest allowed source (a labelled test fixture), and at 9:16 and 1:1 a replay whose source is 120
 "W"s and a trace with a 160-character title, all at native size (scale 1).
 
 **Scene matrix** (`tests/matrix/scene-matrix.test.ts`, plan Phase 3's arming

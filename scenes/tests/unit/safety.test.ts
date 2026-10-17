@@ -30,6 +30,7 @@ import {
   withStaging,
 } from "../../src/adapters/output";
 import { StudioPlayer } from "../../src/adapters/remotion/Player";
+import { posterFrame } from "../../src/api/scene-root";
 import { s1PlanLifecycle } from "../../src/scenes/s1-plan-lifecycle";
 import { clone, replayTraceJson, s1TraceJson } from "./fixtures";
 
@@ -253,5 +254,32 @@ describe("Remotion adapter port handling", () => {
       }),
     ).rejects.toThrow("something else");
     expect(calls).toBe(1);
+  });
+});
+
+describe("StudioPlayer on the server (reduced motion is assumed)", () => {
+  it("server-renders an autoplay embed on its poster frame, not frame 0", () => {
+    const trace = s1TraceJson();
+    const html = renderToStaticMarkup(
+      createElement(StudioPlayer, { scene: "s1-plan-lifecycle", trace, aspect: "16:9", assetBaseUrl: "/x", autoPlay: true }),
+    );
+    const poster = posterFrame(s1PlanLifecycle, parseTrace(trace));
+    expect(poster).toBeGreaterThan(0);
+    expect(html).toContain(`data-studio-frame="${poster}"`);
+  });
+
+  it("shows the error panel, not a crash, when a scene's poster is out of range", () => {
+    const scene = s1PlanLifecycle as { poster?: (t: unknown) => number };
+    const original = scene.poster;
+    scene.poster = () => 99_999;
+    try {
+      const html = renderToStaticMarkup(
+        createElement(StudioPlayer, { scene: "s1-plan-lifecycle", trace: s1TraceJson(), aspect: "16:9", assetBaseUrl: "/x" }),
+      );
+      expect(html).toContain("data-studio-player-error");
+      expect(html).toContain("is not a whole frame");
+    } finally {
+      scene.poster = original;
+    }
   });
 });

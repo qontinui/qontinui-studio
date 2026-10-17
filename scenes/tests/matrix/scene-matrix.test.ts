@@ -17,7 +17,7 @@
  *   replay. "On screen" means, for the badge and the detail line each:
  *   inside the scene's frame, non-empty, opaque, visible, text colour opaque
  *   and contrasting with its background; the label is the topmost scene
- *   element at its centre; and a screenshot of it shows drawn text.
+ *   element at its centre; and screenshots of it with and without its text differ.
  * - **Reduced motion:** under `prefers-reduced-motion: reduce` the embed,
  *   even when asked to autoplay and given no controls, stays on the scene's
  *   poster frame, shows a visible play control, and plays only once it is
@@ -209,15 +209,34 @@ function readLabel(page: Page): Promise<LabelReading> {
   });
 }
 
-/** Distinct colours in a screenshot of the label: text drawn on it gives many. */
-async function labelColours(page: Page, rect: LabelReading["rect"]): Promise<number> {
-  const shot = await page.screenshot({ clip: rect, type: "png" });
-  const png = PNG.sync.read(Buffer.from(shot));
-  const colours = new Set<number>();
-  for (let i = 0; i < png.data.length; i += 4) {
-    colours.add(((png.data[i] as number) << 16) | ((png.data[i + 1] as number) << 8) | (png.data[i + 2] as number));
+/**
+ * Pixels of the label that are text: the label is screenshotted as painted,
+ * then again with its text made invisible, and the differing pixels counted.
+ * Borders and badge backgrounds are in both shots, so only drawn glyphs count.
+ */
+async function labelTextPixels(page: Page, rect: LabelReading["rect"]): Promise<number> {
+  const shoot = async () => PNG.sync.read(Buffer.from(await page.screenshot({ clip: rect, type: "png" })));
+  const painted = await shoot();
+  await page.evaluate(() => {
+    const label = document.querySelector("[data-studio-scene] [data-studio-mode]") as HTMLElement;
+    const style = document.createElement("style");
+    style.id = "matrix-hide-label-text";
+    style.textContent = "[data-studio-mode] * { color: transparent !important; -webkit-text-fill-color: transparent !important; }";
+    label.ownerDocument.head.appendChild(style);
+  });
+  const hidden = await shoot();
+  await page.evaluate(() => document.getElementById("matrix-hide-label-text")?.remove());
+  let differing = 0;
+  for (let i = 0; i < painted.data.length; i += 4) {
+    if (
+      painted.data[i] !== hidden.data[i] ||
+      painted.data[i + 1] !== hidden.data[i + 1] ||
+      painted.data[i + 2] !== hidden.data[i + 2]
+    ) {
+      differing++;
+    }
   }
-  return colours.size;
+  return differing;
 }
 
 async function expectLabelOnScreen(page: Page, expected: { mode: string; badge: string; detail: string }) {
@@ -233,8 +252,8 @@ async function expectLabelOnScreen(page: Page, expected: { mode: string; badge: 
     expect(part.legible, `the label's ${name} text contrasts with its background`).toBe(true);
   }
   expect(reading.topmost, "nothing in the scene covers the mode label").toBe(true);
-  // Belt and braces: what the browser actually painted there has text in it.
-  expect(await labelColours(page, reading.rect), "the label's pixels carry drawn text").toBeGreaterThan(8);
+  // Belt and braces: what the browser actually painted there includes text.
+  expect(await labelTextPixels(page, reading.rect), "the label's pixels carry drawn text").toBeGreaterThan(200);
 }
 
 /** The play control is there and visible (Remotion hides controls by opacity). */
