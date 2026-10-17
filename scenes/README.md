@@ -23,7 +23,8 @@ src/api/          the studio scene API — the only thing scenes import (besides
   scene-root.tsx  what every adapter renders: canvas + scene + mode label
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header
-src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin", ...)
+src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
+                  S3 "Gates and continuations", ...)
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
@@ -45,6 +46,7 @@ assets/fonts/     bundled Inter 4.1, full character set (OFL)
 | --- | --- | --- |
 | `s1-plan-lifecycle` | one plan, draft to shipped | illustrative; replay once the build-record export lands in coord |
 | `s2-digital-twin` | GitHub, CI, machines and sessions mirrored into coord; decisions from the twin; the developer twin answering from served documents | illustrative only: the export carries no twin, webhook or question events |
+| `s3-gates-continuations` | a session registers a gate on a condition and ends; coord observes the condition and clears the gate; a new session continues | illustrative only: the export carries gate counts, not gate events |
 
 ## The engine seam (plan D7)
 
@@ -180,12 +182,14 @@ as an unknown event. A trace contains:
   - `source`: `hand-authored` for illustrative traces; `build-record` with an
     `export_version` for replays;
   - `date_range`: required for a replay.
-- `entities`: `plans`, `prs`, `sessions` and `sources` (systems the twin
-  mirrors: `repo-host`, `ci`, `machine`, `session`; display labels only).
+- `entities`: `plans`, `prs`, `sessions`, `sources` (systems the twin
+  mirrors: `repo-host`, `ci`, `machine`, `session`; display labels only) and
+  `gates` (a condition a session waits on).
 - `events`: each event has an `id` and an `at` (ISO-8601 with an offset), and is
   one of:
   - `plan.drafted|vetted|implementing|shipped`
-  - `session.started|ended`
+  - `session.started|ended` (`session.started` may name the gate it
+    `continues`)
   - `pr.opened`
   - `ci.started|passed|failed`
   - `merge_train.queued`
@@ -195,6 +199,7 @@ as an unknown event. A trace contains:
   - `question.asked` and `question.answered` (the answer, and whether it came
     from a served `policy` or `intent` document or from the `operator`; the
     answer cites the document unless the operator gave it)
+  - `gate.registered` (by a session), `gate.observed` and `gate.cleared`
 
 The validator also checks that:
 
@@ -202,6 +207,9 @@ The validator also checks that:
 - an answer references a `question.asked` event that comes strictly before
   it (by time, then by position in the trace), and each question is answered
   at most once;
+- a gate is registered, observed and cleared at most once each; it is
+  observed and cleared only after it is registered; and a continuation
+  starts only after its gate cleared (all by time, then by position);
 - replay events fall inside `date_range`;
 - an illustrative trace never claims a build-record source, and a replay never
   claims a hand-authored one;
@@ -214,7 +222,8 @@ The validator also checks that:
 
 Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
 may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
-S2 at most four sources).
+S2 at most four sources, S3 at least one continuation and at most three
+sessions).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The
