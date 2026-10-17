@@ -41,6 +41,12 @@ describe("S4 trace fields", () => {
     expect(errorsOf(again)).toContain('events.18.pr: "pr-412" lands more than once');
   });
 
+  it("keeps a red PR out of the train until it is green again or re-queued", () => {
+    const json = traceJson();
+    json.events.splice(5, 1, { id: "e06", at: "2026-09-16T09:34:00Z", kind: "ci.failed", pr: "pr-412" } as never);
+    expect(errorsOf(json)).toContain('events.6.pr: pr.landed while "pr-412" is red (it needs ci.passed or merge_train.queued first)');
+  });
+
   it("caps the scene at four PRs", () => {
     const json = traceJson();
     json.entities!.prs!.push({ id: "pr-5", plan: "plan-sync", repo: "example/sync-service", number: 5, title: "x" });
@@ -108,6 +114,24 @@ describe("S4 scene model", () => {
       [418, 1, 0],
     ]);
     expect(resolved.cars[1]?.status).toBe("Resolved · queued");
+  });
+
+  it("puts a PR that goes green again back in line, at the back", () => {
+    const json = traceJson();
+    json.events.splice(5, 0, { id: "e90", at: "2026-09-16T09:20:00Z", kind: "ci.failed", pr: "pr-412" } as never);
+    const red = parseTrace(json);
+    const rtl = s4Timeline(red, STUDIO_FPS);
+    const failed = findBeat(rtl, (e) => e.id === "e90")!;
+    const outOfLine = s4State(red, rtl, failed.startFrame + rtl.beatFrames - 1).cars.find((c) => c.number === 412)!;
+    expect(outOfLine).toMatchObject({ aside: 1, level: "attention" });
+    const passed = findBeat(rtl, (e) => e.kind === "ci.passed" && "pr" in e && e.pr === "pr-412")!;
+    const back = s4State(red, rtl, passed.startFrame + rtl.beatFrames - 1).cars;
+    expect(back.map((c) => [c.number, c.aside])).toEqual([
+      [415, 0],
+      [418, 0],
+      [421, 0],
+      [412, 0],
+    ]);
   });
 
   it("puts the poster on the conflict with the next PR at the head", () => {

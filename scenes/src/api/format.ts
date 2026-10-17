@@ -16,6 +16,12 @@ export function formatDateTime(value: string | number): string {
   return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
 }
 
+/** "14:05 UTC" from an ISO timestamp or epoch ms. */
+export function formatTime(value: string | number): string {
+  const ms = typeof value === "number" ? value : Date.parse(value);
+  return `${new Date(ms).toISOString().slice(11, 16)} UTC`;
+}
+
 /** Compact elapsed duration: "45m", "3h 20m", "2d 4h". Floors to minutes. */
 export function formatElapsed(ms: number): string {
   const totalMinutes = Math.max(0, Math.floor(ms / 60_000));

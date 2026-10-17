@@ -11,7 +11,7 @@ import {
   buildTimeline,
   durations,
   easings,
-  formatDateTime,
+  formatTime,
   mix,
   msToFrames,
   progress,
@@ -81,6 +81,9 @@ function standings(beats: readonly Beat[], count: number): Map<string, Standing>
       out.set(event.pr, { key: beat.index, aside: false, landed: false, last: kind });
     } else if (kind === "merge_train.conflicted" || kind === "ci.failed") {
       out.set(event.pr, { key: beat.index, aside: true, landed: false, last: kind });
+    } else if (kind === "ci.passed" && prev?.aside && prev.last !== "merge_train.conflicted") {
+      // Green again after a red run: back in line, at the back.
+      out.set(event.pr, { key: beat.index, aside: false, landed: false, last: kind });
     } else if (prev) {
       out.set(event.pr, { ...prev, landed: kind === "pr.landed", last: kind });
     }
@@ -180,7 +183,7 @@ export function s4State(trace: SceneTrace, timeline: Timeline, frame: number): S
     return {
       id: b.event.id,
       text: pr ? `#${pr.number} ${pr.title}` : b.event.id,
-      detail: `landed ${formatDateTime(b.atMs).slice(11)} · tested on this main`,
+      detail: `landed ${formatTime(b.atMs)} · tested on this main`,
       level: "done" as AttentionLevel,
       appear: progress(frame, b.startFrame, fast, easings.enter),
     };
