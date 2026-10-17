@@ -1,0 +1,20 @@
+# The studio-style-v1 brand reference set (style/guide.yaml, plan
+# 2026-10-09-qontinui-marketing-studio-animated-process-explainers Phase 1).
+# Campaign-only: a candidate for the reference set, never published to a site.
+id: style-v1-social-square
+purpose: "Square social-card art (1080x1080) for explainer posts"
+targets:
+  - campaign: studio-style-v1
+aspect_ratio: "1:1"
+prompt: >-
+  A single solid geometric block low in the frame on a fine grid floor with its glowing wireframe twin floating above it, joined by a thin vertical line of light. Strong central symmetry and wide dark margins for a title drawn later.
+negative_prompt: >-
+  text, letters, numbers, logos, watermarks, people, faces, hands, user
+  interface, screenshots, charts, neon, lens flare
+style_guide: ../style/studio-style-v1.md
+reference_images: []
+# The fleet's own GPU only: bulk work never spills onto a metered provider.
+provider_preference: [local-gpu]
+priority: bulk
+variants: 2
+tags: [studio-style-v1]

@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 from PIL import Image
 
-from qontinui_studio.errors import ApprovalRefused
+from qontinui_studio.errors import ApprovalRefused, TagRefused
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.providers import Provider
 
@@ -63,6 +63,9 @@ class TermsSnapshot:
 END_OF_STRING = r"(?![\s\S])"
 ALIAS_PATTERN = r"^[A-Za-z0-9._-]+" + END_OF_STRING
 APPROVAL_STATUSES = ("candidate", "approved", "rejected")
+# A library tag names a set consumers select by (e.g. the brand reference set
+# ``studio-style-v1``). Lowercase, so a set cannot be split by spelling.
+TAG_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,63}" + END_OF_STRING
 ORIGINS = ("generated", "imported")  # the CHECK on assets.origin (store.py)
 MIMES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 
@@ -314,6 +317,56 @@ class Library:
             raise
         return self.asset(uid), True
 
+    def tag(self, uid: str, tag: str, by: str, on: date, commit: bool = True) -> bool:
+        """Put asset ``uid`` in the set ``tag``. ``by`` is a reviewer alias, or
+        ``brief:<brief id>`` when a brief applied the tag at ingest. Returns
+        whether a row was added (tagging twice is a no-op that keeps the first
+        record). A tag is a selection, not an approval: it gates nothing."""
+        if not is_tag(tag):
+            raise TagRefused(
+                f"tag '{tag}' must match {TAG_PATTERN} (lowercase letters, digits, '.', '_', '-')"
+            )
+        brief_id = by.removeprefix("brief:")
+        if not is_alias(by) and not (by.startswith("brief:") and is_alias(brief_id)):
+            raise TagRefused(f"tagger '{by}' is neither an alias nor 'brief:<brief id>'")
+        if self.conn.execute("SELECT 1 FROM assets WHERE uid = ?", (uid,)).fetchone() is None:
+            raise TagRefused(f"no asset '{uid}' in the library")
+        added = self.conn.execute(
+            "INSERT OR IGNORE INTO asset_tags (asset_uid, tag, tagged_by, tagged_on) "
+            "VALUES (?, ?, ?, ?)",
+            (uid, tag, by, on.isoformat()),
+        ).rowcount
+        if commit:
+            self.conn.commit()
+        return added == 1
+
+    def untag(self, uid: str, tag: str) -> bool:
+        """Take asset ``uid`` out of the set ``tag``; returns whether it was in it."""
+        removed = self.conn.execute(
+            "DELETE FROM asset_tags WHERE asset_uid = ? AND tag = ?", (uid, tag)
+        ).rowcount
+        self.conn.commit()
+        return removed == 1
+
+    def tags(self, uid: str) -> list[str]:
+        return [
+            r["tag"]
+            for r in self.conn.execute(
+                "SELECT tag FROM asset_tags WHERE asset_uid = ? ORDER BY tag", (uid,)
+            )
+        ]
+
+    def tagged(self, tag: str, status: str | None = None) -> list[AssetRecord]:
+        """Every asset in the set ``tag`` (optionally only those with approval
+        ``status``), oldest first: the query a set's consumer runs."""
+        sql = "SELECT a.* FROM assets a JOIN asset_tags t ON t.asset_uid = a.uid WHERE t.tag = ?"
+        params: list[str] = [tag]
+        if status is not None:
+            sql += " AND a.approval_status = ?"
+            params.append(status)
+        rows = self.conn.execute(sql + " ORDER BY a.created_at, a.uid", params).fetchall()
+        return [AssetRecord.from_row(r) for r in rows]
+
     def rejection(self, uid: str) -> str | None:
         """Why a consumer must not use asset ``uid``, or None. Only an explicit
         rejection counts: approval is library metadata, never a publish gate
@@ -363,6 +416,10 @@ class Library:
         return out
 
 
+def is_tag(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(TAG_PATTERN, value, re.ASCII) is not None
+
+
 def is_alias(value: object) -> bool:
     """An operator alias: ``^[A-Za-z0-9._-]+$`` — so never an e-mail address
     (no '@') and never contains whitespace."""
@@ -370,12 +427,13 @@ def is_alias(value: object) -> bool:
 
 
 EXPORT_FORMAT = "qontinui-studio/library-export"
-EXPORT_VERSION = 1
+# Version 2 adds each asset's ``tags`` (schema v3).
+EXPORT_VERSION = 2
 
 
 def export_document(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Every asset in the library as plain data: provenance, licence, approval
-    and variants, pointed at by SHA-256. No binaries and no local paths (the
+    """Every asset in the library as plain data: provenance, licence, approval,
+    tags and variants, pointed at by SHA-256. No binaries and no local paths (the
     raw and variant files stay in ``.studio/``); ordered by (asset_id,
     created_at, uid) so the document is reproducible."""
     conn.commit()
@@ -420,6 +478,7 @@ def export_document(conn: sqlite3.Connection) -> dict[str, Any]:
                         "by": a.approval_by,
                         "on": a.approval_on,
                     },
+                    "tags": library.tags(a.uid),
                     "variants": [
                         {
                             "id": v.id,

@@ -173,7 +173,7 @@ def test_export_is_deterministic_and_complete(populated: Context, studio_root: P
     second = export_yaml(connect(Workspace(studio_root).db_path))
     assert first == second
     doc = yaml.safe_load(first)
-    assert doc["format"] == "qontinui-studio/library-export" and doc["version"] == 1
+    assert doc["format"] == "qontinui-studio/library-export" and doc["version"] == 2
     assets = doc["assets"]
     keys = [(a["asset_id"], a["created_at"], a["uid"]) for a in assets]
     assert keys == sorted(keys)
@@ -245,7 +245,7 @@ def test_cli_export_is_byte_identical_on_rerun(populated: Context, studio_root: 
 
 def test_export_of_an_empty_library(studio_root: Path) -> None:
     doc = yaml.safe_load(export_yaml(connect(Workspace(studio_root).db_path)))
-    assert doc == {"assets": [], "format": "qontinui-studio/library-export", "version": 1}
+    assert doc == {"assets": [], "format": "qontinui-studio/library-export", "version": 2}
 
 
 def test_cli_list_filters_by_approval_status_and_origin(
