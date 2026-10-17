@@ -531,7 +531,7 @@ pnpm studio-scenes compositions
 ## Narration (plan Phase 5)
 
 ```sh
-STUDIO_TTS_URL=http://<host>:8880 STUDIO_ASR_URL=http://<host>:<port> \
+STUDIO_TTS_URL=http://127.0.0.1:8880 STUDIO_ASR_URL=http://127.0.0.1:8890 \
   pnpm studio-scenes narrate teaser --script narration/examples/teaser.md --out out/teaser-voice
 pnpm studio-scenes compose teaser --format mp4 --aspect 16:9 --out out/teaser.mp4 \
   --narration out/teaser-voice/teaser.timing.json
@@ -566,7 +566,10 @@ re-voicing (another voice, another script) never edits a scene.
 
 **Services, by HTTP only.** Kokoro's Python stack links GPL code
 (phonemizer, espeak-ng), so it runs as a separate service and only its audio
-enters a render; this package never links it (plan Phase 0). Configuration:
+enters a render; this package never links it (plan Phase 0). Both services
+are defined in qontinui's `docker/speech/` (Kokoro-FastAPI on
+`127.0.0.1:8880`, speaches/faster-whisper on `127.0.0.1:8890`, published on
+loopback by default, so they run on the host that renders). Configuration:
 
 | Variable | Meaning |
 | --- | --- |

@@ -216,6 +216,28 @@ describe("the service clients", () => {
     expect(durationSeconds(readWav(spoken.wav))).toBeCloseTo(1.5);
   });
 
+  it("clamps a word Kokoro starts before the clip's start to zero", async () => {
+    // Kokoro-FastAPI v0.9.0 answers like the first word for some sentences (observed
+    // 2026-10-17). "odd" only exercises the clamp: the timing table would still
+    // refuse it, since it starts before the word before it.
+    const early: Fetch = async () =>
+      Response.json({
+        audio: Buffer.from(tone(0.5)).toString("base64"),
+        audio_format: "audio/wav",
+        timestamps: [
+          { word: "When", start_time: -0.019, end_time: 0.093 },
+          { word: "red", start_time: 0.093, end_time: 0.2 },
+          { word: "odd", start_time: -0.05, end_time: -0.01 },
+        ],
+      });
+    const spoken = await kokoroTts(config, early).speak("When red odd.", { speed: 1 });
+    expect(spoken.words).toEqual([
+      { text: "When", start: 0, end: 0.093 },
+      { text: "red", start: 0.093, end: 0.2 },
+      { text: "odd", start: 0, end: 0 },
+    ]);
+  });
+
   it("asks Whisper for verbose JSON with word timestamps", async () => {
     const { impl, requests } = fakeFetch("good");
     const transcript = await whisperAsr(config, impl).transcribe(tone(0.2));

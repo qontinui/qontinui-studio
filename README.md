@@ -894,6 +894,32 @@ whose `pulse.yaml` names `products/qontinui-studio.yaml`). The task's
 working directory is the repo's primary checkout, so it runs whatever branch
 that checkout is on (normally `main`).
 
+**Host settings: `pulse.env`.** The task's session inherits the runner's
+environment and nothing else, so the speech services are named in a
+host-local file that the script reads before anything else:
+`$STUDIO_PULSE_ENV_FILE`, else
+`${XDG_CONFIG_HOME:-~/.config}/qontinui-studio/pulse.env`. With the services
+from qontinui's `docker/speech/` running on the same host (loopback by
+default), it holds:
+
+```sh
+STUDIO_TTS_URL=http://127.0.0.1:8880
+STUDIO_ASR_URL=http://127.0.0.1:8890
+```
+
+The file is data, never sourced as shell. Each line is blank, a `#` comment
+or `KEY=value` with an uppercase `STUDIO_[A-Z0-9_]+` key at the start of the
+line. The value is read verbatim, with no quotes stripped and no expansion.
+Any other line refuses the whole file, and the script exits 3. A variable
+already set to a non-empty value in the environment wins over the file, and
+the first occurrence of a key in the file wins over a later one. A missing
+default file is fine, and the pulse then renders silent and is blocked, as
+recorded above. A missing file that `STUDIO_PULSE_ENV_FILE` names explicitly
+is refused. The script reports the keys it set, never their values. Treat the
+file like a shell profile, because `STUDIO_FFMPEG` and `STUDIO_FFPROBE` name
+binaries that get run. Keep it writable by its owner only, and make it `0600`
+if it names a key.
+
 ## Development
 
 ```bash

@@ -139,6 +139,19 @@ async function call(fetchImpl: Fetch, what: string, url: string, init: RequestIn
 
 const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 
+/**
+ * A service word (Kokoro's or Whisper's) as a clip-relative word.
+ * Kokoro-FastAPI v0.9.0 starts some clips' first word a few milliseconds
+ * BEFORE zero (observed 2026-10-17: -0.019 s for "When the checks go red,
+ * ..."), which the timing table rightly refuses; a clip cannot hold sound
+ * before its start, so clamp to it, and keep the end at or after the start.
+ * Ends past the clip's length are not clamped (not observed).
+ */
+function heard(text: string, start: number, end: number): HeardWord {
+  const s = Math.max(0, start);
+  return { text, start: s, end: Math.max(s, end) };
+}
+
 /** Kokoro-FastAPI's captioned speech: `{audio: <base64>, audio_format, timestamps: [{word, start_time, end_time}]}`. */
 export function kokoroTts(config: SpeechConfig, fetchImpl: Fetch = fetch): TtsClient {
   if (!config.ttsUrl) throw new SpeechServiceError("no TTS service configured (set STUDIO_TTS_URL to a Kokoro-FastAPI base URL)");
@@ -175,7 +188,7 @@ export function kokoroTts(config: SpeechConfig, fetchImpl: Fetch = fetch): TtsCl
       for (const t of Array.isArray(body.timestamps) ? body.timestamps : []) {
         const w = t as { word?: unknown; start_time?: unknown; end_time?: unknown };
         if (typeof w.word === "string" && finite(w.start_time) && finite(w.end_time)) {
-          words.push({ text: w.word, start: w.start_time, end: w.end_time });
+          words.push(heard(w.word, w.start_time, w.end_time));
         }
       }
       return { wav: Buffer.from(body.audio, "base64"), words };
@@ -214,7 +227,7 @@ export function whisperAsr(config: SpeechConfig, fetchImpl: Fetch = fetch): AsrC
       for (const w of Array.isArray(body.words) ? body.words : []) {
         const word = w as { word?: unknown; start?: unknown; end?: unknown };
         if (typeof word.word === "string" && finite(word.start) && finite(word.end)) {
-          words.push({ text: word.word, start: word.start, end: word.end });
+          words.push(heard(word.word, word.start, word.end));
         }
       }
       if (!words.length) {

@@ -10,12 +10,21 @@
 # posts under <root>/.studio/pulse/<week>/. It posts nothing: social accounts
 # and the final publish click are operator-owned.
 #
+# Host settings (STUDIO_TTS_URL, STUDIO_ASR_URL, ...) come from the
+# environment, then from a host-local pulse.env (scripts/lib/pulse-env.sh says
+# where and what it accepts); the environment wins.
+#
 # Exit: the pulse's own (0 = it ran: ready, blocked or no-export; 1 = failed),
-# or the failing setup step's (2 = a linked scenes/node_modules was refused).
+# or the failing setup step's (2 = a linked scenes/node_modules was refused,
+# 3 = the pulse.env file was refused).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
+
+# shellcheck source=scripts/lib/pulse-env.sh
+. "$here/scripts/lib/pulse-env.sh"
+pulse_env_load || exit 3
 
 poetry install --no-interaction --no-ansi --quiet
 (
