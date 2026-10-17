@@ -347,7 +347,7 @@ function restrictions(bans) {
 const PROVENANCE_WRITERS = ["src/api/trace/provenance.ts", "src/api/trace/from-build-record.ts", "src/api/trace/testing.ts"];
 
 export default tseslint.config(
-  { ignores: ["node_modules/**", "out/**", ".golden-out/**", "bin/**", "lint-fixtures/**"] },
+  { ignores: ["node_modules/**", "out/**", ".golden-out/**", "bin/**", "lint-fixtures/**", "src/narration/vendor/**"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
