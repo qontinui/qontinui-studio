@@ -44,6 +44,8 @@ import base64
 import binascii
 import json
 import re
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -85,14 +87,17 @@ TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 UNREACHABLE_RETRY_AFTER_S = 3600.0
 MAX_DETAIL_CHARS = 300
 
-_URL_QUERY = re.compile(r"(https?://[^\s?#'\"]+)[?#][^\s'\"]*")
+# A URL is reduced to scheme + host: its path can carry a conversation id
+# (gemini.google.com/app/<id>, chatgpt.com/c/<id>), its query a sign-in
+# continuation or account hint.
+_URL = re.compile(r"(https?://[^\s/?#'\"]+)[^\s'\"]*")
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def redact(text: object) -> str:
-    """Text fit for a job row or a notice: URLs lose their query and fragment,
-    e-mail addresses are masked, and the result is bounded."""
-    out = _EMAIL.sub("<email>", _URL_QUERY.sub(r"\1", str(text)))
+    """Text fit for a job row, a latch file or a notice: URLs keep only their
+    scheme and host, e-mail addresses are masked, and the result is bounded."""
+    out = _EMAIL.sub("<email>", _URL.sub(r"\1", str(text)))
     return out if len(out) <= MAX_DETAIL_CHARS else out[: MAX_DETAIL_CHARS - 1] + "…"
 
 
@@ -157,11 +162,12 @@ class UIBridgeWrapperAdapter:
         wrapper_id: str,
         runner_url: str = DEFAULT_RUNNER_URL,
         *,
-        override: OperatorOverride | None = None,
-        latch: HandoffLatch | None = None,
+        override: OperatorOverride,
+        state_dir: Path,
         notifier: Notifier | None = None,
         client: httpx.Client | None = None,
         dispatch_timeout_s: float = DISPATCH_TIMEOUT_S,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if not is_local_network(runner_url):
             raise PermanentProviderError(
@@ -173,9 +179,13 @@ class UIBridgeWrapperAdapter:
         self.kind = KIND
         self.wrapper_id = wrapper_id
         self.runner_url = runner_url.rstrip("/")
+        # Required, not optional: without the bounds no dispatch is bounded,
+        # and without a state dir a hand-off could neither latch nor space.
         self.override = override
-        self.latch = latch
+        self.latch = HandoffLatch(state_dir / "handoffs")
+        self.pace_path = state_dir / "wrapper-pace" / f"{provider_id}.json"
         self.notifier = notifier
+        self.clock = clock
         self.dispatch_timeout_s = dispatch_timeout_s
         self.hard_timeout_s = dispatch_timeout_s + CONNECT_TIMEOUT_S
         self._client = client
@@ -188,21 +198,44 @@ class UIBridgeWrapperAdapter:
         return {"aspect_ratio": request.aspect_ratio}
 
     def _params(self, request: GenerationRequest) -> dict[str, Any]:
-        params: dict[str, Any] = {
+        return {
             "prompt": self.sent_prompt(request),
             "aspectRatio": request.aspect_ratio,
+            "maxPerDay": self.override.max_per_day,
+            "minIntervalS": self.override.min_interval_s,
         }
-        if self.override is not None:
-            params["maxPerDay"] = self.override.max_per_day
-            params["minIntervalS"] = self.override.min_interval_s
-        return params
+
+    def _space(self) -> None:
+        """Studio's own copy of the human-pace interval: the last dispatch to
+        this provider is recorded BEFORE it is sent, and a dispatch inside the
+        interval is refused as ``paced`` without dialling, so studio alone holds
+        the interval even against a wrapper that does not."""
+        now = self.clock()
+        try:
+            last = float(json.loads(self.pace_path.read_text(encoding="utf-8"))["last_dispatch_at"])
+        except FileNotFoundError:
+            last = None
+        except (OSError, ValueError, KeyError, TypeError):
+            last = now  # unreadable: fail closed, wait one full interval
+        if last is not None:
+            wait = self.override.min_interval_s - (now - last)
+            if wait > 0:
+                raise ProviderBusy(
+                    f"{self.provider_id}: studio-side pace interval not yet elapsed",
+                    clamp_retry_after(wait),
+                    code="paced",
+                )
+        self.pace_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.pace_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"last_dispatch_at": now}), encoding="utf-8")
+        tmp.replace(self.pace_path)
 
     def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
-        if self.latch is not None:
-            latched = self.latch.describe(self.provider_id)
-            if latched is not None:
-                reason = str((self.latch.get(self.provider_id) or {}).get("reason", "ui_changed"))
-                raise OperatorHandoff(latched, reason)
+        latched = self.latch.describe(self.provider_id)
+        if latched is not None:
+            reason = str((self.latch.get(self.provider_id) or {}).get("reason", "ui_changed"))
+            raise OperatorHandoff(latched, reason)
+        self._space()
         body = {"action": ACTION, "params": self._params(request)}
         url = f"{self.runner_url}/wrappers/{self.wrapper_id}/dispatch"
         timeout = httpx.Timeout(self.dispatch_timeout_s + 5.0, connect=CONNECT_TIMEOUT_S)
@@ -252,6 +285,17 @@ class UIBridgeWrapperAdapter:
             )
         data = envelope.get("data") if isinstance(envelope, dict) else None
         result = data.get("result") if isinstance(data, dict) else None
+        # The runner forwards the wrapper's body as ``result`` (dispatch.rs: the
+        # body's own ``result`` key if it has one, else the whole body). The
+        # @qontinui/ui-bridge-wrapper dispatch server answers
+        # ``{"success": true, "data": <handler result>}``, so the handler's
+        # answer sits one level further in. Both shapes are accepted, explicitly.
+        if isinstance(result, dict) and "status" not in result and "success" in result:
+            if result.get("success") is not True:
+                raise ProviderOutcomeUnknown(
+                    f"{self.provider_id}: wrapper reported failure: {redact(result.get('error'))}"
+                )
+            result = result.get("data")
         if not isinstance(result, dict):
             raise ProviderOutcomeUnknown(
                 f"{self.provider_id}: runner answered 2xx without a result object"
@@ -263,7 +307,7 @@ class UIBridgeWrapperAdapter:
             f"operator hand-off needed ({reason}): {self.provider_id} stopped and did nothing "
             f"further; {detail}"
         )
-        if self.latch is not None and self.latch.set(self.provider_id, reason, detail):
+        if self.latch.set(self.provider_id, reason, detail):
             if self.notifier is not None:
                 self.notifier.notify(
                     Notice(

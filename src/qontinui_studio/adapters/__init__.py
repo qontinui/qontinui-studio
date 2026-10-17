@@ -38,7 +38,7 @@ def build_adapter(
     provider: Provider,
     gateway_route: str | None = None,
     gateway_credential_env: str | None = None,
-    latch: HandoffLatch | None = None,
+    state_dir: Path | None = None,
     notifier: Notifier | None = None,
 ) -> ProviderAdapter:
     """Construct one adapter, refusing with a typed error when D4 keeps it off.
@@ -84,6 +84,13 @@ def build_adapter(
         )
 
         runner = base or os.environ.get(RUNNER_URL_ENV, "").strip() or DEFAULT_RUNNER_URL
+        if state_dir is None:
+            raise AdapterDisabledError(
+                f"{provider.id}: a ui_bridge_wrapper needs the workspace state dir (its hand-off "
+                "latch and pace record live there)"
+            )
+        if provider.operator_override is None:  # the loader already refuses this
+            raise AdapterDisabledError(f"{provider.id}: a ui_bridge_wrapper needs its override")
         try:
             return UIBridgeWrapperAdapter(
                 provider.id,
@@ -91,7 +98,7 @@ def build_adapter(
                 provider.wrapper_id or "",
                 runner,
                 override=provider.operator_override,
-                latch=latch,
+                state_dir=state_dir,
                 notifier=notifier,
             )
         except PermanentProviderError as e:  # a non-local runner URL
@@ -156,14 +163,14 @@ def build_adapters(
     inventory: ProviderInventory,
     only: list[str] | None = None,
     gateway: GatewayState | None = None,
-    handoff_dir: Path | None = None,
+    state_dir: Path | None = None,
     notifier: Notifier | None = None,
 ) -> AdapterSet:
     """Build every provider's adapter. With a ``gateway`` reading, a refusing
     state builds none, and a declared images route carries every OpenAI-images
     -wire adapter (other wires cannot go through it)."""
     result = AdapterSet()
-    latch = HandoffLatch(handoff_dir) if handoff_dir is not None else None
+    latch = HandoffLatch(state_dir / "handoffs") if state_dir is not None else None
     refusal = gateway.refusal() if gateway is not None else None
     if refusal is None and gateway is not None and gateway.images_credential_env is not None:
         vendor = frozenset(p.api_key_env for p in inventory.providers if p.api_key_env)
@@ -201,7 +208,7 @@ def build_adapters(
         try:
             result.adapters[provider.id] = build_adapter(
                 provider,
-                latch=latch,
+                state_dir=state_dir,
                 notifier=notifier,
                 gateway_route=route,
                 gateway_credential_env=gateway.images_credential_env

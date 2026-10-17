@@ -262,6 +262,13 @@ class Provider(BaseModel):
                     f"operator_override.max_per_day ({self.operator_override.max_per_day})"
                 )
         if self.adapter in WRAPPER_ADAPTERS:
+            if self.operator_override is None:
+                # Even with automation_allowed "yes": the override carries the
+                # manual-volume bounds every dispatch sends.
+                raise ValueError(
+                    f"provider '{self.id}': a ui_bridge_wrapper row needs an operator_override "
+                    "(its bounds ride every dispatch)"
+                )
             if not self.wrapper_id:
                 raise ValueError(f"provider '{self.id}': ui_bridge_wrapper needs a wrapper_id")
             if self.capacity == "unmetered":

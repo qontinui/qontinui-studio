@@ -70,7 +70,7 @@ def test_gui_adapters_exist_only_under_an_operator_override() -> None:
 
 
 def test_billed_apis_are_not_scheduled_without_an_operator_quota(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     inv = load_providers(REPO / "providers.yaml")
     for pid in ("gemini", "openai"):
@@ -79,7 +79,7 @@ def test_billed_apis_are_not_scheduled_without_an_operator_quota(
         assert p.schedulable_reason() is not None
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    built = build_adapters(inv)
+    built = build_adapters(inv, state_dir=tmp_path)
     # Built: the unmetered local GPU and the operator's two free web accounts;
     # no billed API is.
     assert set(built.adapters) == {"local-gpu", "gemini-web", "chatgpt-web"}

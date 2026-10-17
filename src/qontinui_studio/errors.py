@@ -36,9 +36,11 @@ class QuotaExhaustedError(ProviderError):
 class OperatorHandoff(QuotaExhaustedError):
     """A wrapper driving the operator's own web account stopped at a login
     wall, CAPTCHA, bot challenge, usage limit or an unrecognised page, and
-    handed the run to the operator. Typed as a spent quota on purpose: the
-    provider leaves the rotation until its reset (no retry loop against the
-    site), and an interactive job falls through to the next provider."""
+    handed the run to the operator. Typed as a spent quota so the scheduler
+    takes the provider out of this run and an interactive job falls through to
+    the next provider; the hand-off LATCH (adapters/ui_bridge_wrapper.py) keeps
+    it out of every later run until the operator runs
+    ``studio providers clear-handoff`` — not merely until the quota reset."""
 
     REASONS = (
         "login_wall",
