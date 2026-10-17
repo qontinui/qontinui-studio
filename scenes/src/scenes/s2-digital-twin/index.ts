@@ -6,8 +6,10 @@ export const s2DigitalTwin = defineScene({
   id: "s2-digital-twin",
   title: "The digital twin",
   requires: {
-    // Illustrative only: the build-record export carries no twin, webhook or
-    // question events (plan catalogue; the gap is filed against the sibling plan).
+    // Illustrative only: the build-record export (build-record/1) carries no
+    // twin, webhook or question events. The gap is filed as a proposed
+    // amendment to the sibling plan: coord finding 9383b43c (topic
+    // plan-amendment), not applied — the export is never reshaped for a scene.
     kinds: ["twin.mirrored", "twin.decided", "question.asked", "question.answered"],
     entities: ["sources", "sessions"],
   },

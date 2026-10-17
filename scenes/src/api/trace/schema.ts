@@ -55,11 +55,13 @@ export const sessionEntity = z
  * never a machine name, an account or a private repo (sibling D3).
  */
 export const SOURCE_KINDS = ["repo-host", "ci", "machine", "session"] as const;
+export const SOURCE_LABEL_MAX = 20;
 export const sourceEntity = z
   .object({
     id,
     kind: z.enum(SOURCE_KINDS),
-    label: z.string().min(1).max(40),
+    /** Short: it is drawn inside a node at every aspect. */
+    label: z.string().min(1).max(SOURCE_LABEL_MAX),
   })
   .strict();
 
@@ -140,13 +142,16 @@ export const traceEvent = z.discriminatedUnion("kind", [
     .object({
       ...eventBase,
       kind: z.literal("question.answered"),
-      /** The id of the `question.asked` event this answers. */
+      /** The id of the `question.asked` event this answers (one answer per question). */
       question: id,
       answer: z.string().min(1).max(120),
       /** Where the answer came from: a served policy or intent document, or the operator. */
       from: z.enum(["policy", "intent", "operator"]),
-      /** The document cited, e.g. "policy git-operations". */
-      document: z.string().min(1).max(60),
+      /**
+       * The served document cited, e.g. "policy git-operations". Required when
+       * the answer came from a document; absent when the operator answered.
+       */
+      document: z.string().min(1).max(60).optional(),
     })
     .strict(),
 ]);
@@ -319,6 +324,7 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   const sources = unique("sources", trace.entities.sources.map((s) => s.id));
   unique("events", trace.events.map((e) => e.id));
   const eventsById = new Map(trace.events.map((e) => [e.id, e]));
+  const answeredQuestions = new Set<string>();
 
   trace.entities.prs.forEach((pr, i) => {
     if (!plans.has(pr.plan)) {
@@ -346,17 +352,42 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     if ("source" in event) ref("source", sources, event.source);
     if (event.kind === "question.answered") {
       const asked = eventsById.get(event.question);
+      const askedAt = trace.events.findIndex((e) => e.id === event.question);
       if (!asked || asked.kind !== "question.asked") {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["events", i, "question"],
           message: `"${event.question}" is not a question.asked event`,
         });
-      } else if (Date.parse(asked.at) > Date.parse(event.at)) {
+      } else {
+        // Timelines order by time, then by position: the answer must come
+        // strictly after its question in that order.
+        const askedMs = Date.parse(asked.at);
+        const answeredMs = Date.parse(event.at);
+        if (answeredMs < askedMs || (answeredMs === askedMs && i < askedAt)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["events", i, "at"],
+            message: `answered before question "${event.question}" was asked`,
+          });
+        }
+        if (answeredQuestions.has(event.question)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["events", i, "question"],
+            message: `question "${event.question}" is answered more than once`,
+          });
+        }
+        answeredQuestions.add(event.question);
+      }
+      if ((event.from === "operator") === (event.document !== undefined)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ["events", i, "at"],
-          message: `answered before question "${event.question}" was asked`,
+          path: ["events", i, "document"],
+          message:
+            event.from === "operator"
+              ? "an operator's answer cites no document"
+              : `an answer from ${event.from} must cite its document`,
         });
       }
     }

@@ -61,7 +61,7 @@ export interface SourceState {
   /** Inert until the source first reports; running while it reports; then done. */
   level: AttentionLevel;
   emphasis: number;
-  /** 0..1 the edge into the twin is drawn (replays on every report). */
+  /** 0..1 the edge into the twin is drawn (from the source's first report on). */
   pulse: number;
 }
 
@@ -81,13 +81,19 @@ export interface S2State {
   /** How many facts the twin holds now. */
   factCount: number;
   decisions: RowState[];
-  /** 0..1 the twin → decisions edge, replayed on every decision. */
+  /** 0..1 the twin → decisions edge, drawn at the first decision and kept. */
   decisionPulse: number;
   developer: RowState[];
-  /** 0..1 the twin → developer-twin edge, replayed on every question event. */
+  /** 0..1 the twin → developer-twin edge, drawn at the first question and kept. */
   developerPulse: number;
-  operator: { level: AttentionLevel; sublabel: string };
+  /** `short` is for layouts with no room for the full sublabel. */
+  operator: { level: AttentionLevel; sublabel: string; short: string };
   caption: { title: string; body: string; appear: number } | null;
+}
+
+/** `text` as a sentence: a full stop added unless it already ends in punctuation. */
+function sentence(text: string): string {
+  return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
 /** Beats of `kind` that have started at `frame`. */
@@ -119,12 +125,16 @@ export function s2State(trace: SceneTrace, timeline: Timeline, frame: number): S
     const last = reports[reports.length - 1];
     if (!last) return { id: source.id, label: source.label, level: "inert", emphasis: 0, pulse: 0 };
     const reporting = frame < last.startFrame + beatFrames;
+    const end = last.startFrame + beatFrames;
     return {
       id: source.id,
       label: source.label,
       level: reporting ? "running" : "done",
-      emphasis: reporting ? progress(frame, last.startFrame, fast) : 0,
-      pulse: pulseOf(last),
+      // Rises at the report, eases out once its beat is over.
+      emphasis: reporting ? progress(frame, last.startFrame, fast) : 1 - progress(frame, end, fast),
+      // The edge draws at the source's first report and then stays drawn; a
+      // repeat report shows as the node lighting up again, never a blank edge.
+      pulse: pulseOf(reports[0]),
     };
   });
 
@@ -171,7 +181,7 @@ export function s2State(trace: SceneTrace, timeline: Timeline, frame: number): S
       row: {
         id: a.event.id,
         text: a.event.answer,
-        detail: a.event.from === "operator" ? "from the operator" : `from served ${a.event.document}`,
+        detail: a.event.from === "operator" ? "from the operator" : `from served ${a.event.document ?? a.event.from}`,
         level: a.event.from === "operator" ? "attention" : "done",
         appear: appearOf(a),
       },
@@ -188,7 +198,10 @@ export function s2State(trace: SceneTrace, timeline: Timeline, frame: number): S
     level: (woken ? "attention" : "inert") as AttentionLevel,
     sublabel: woken
       ? "woken to answer"
-      : `not woken · ${fromDocuments} ${fromDocuments === 1 ? "answer" : "answers"} from documents`,
+      : fromDocuments === 0
+        ? "not woken"
+        : `not woken · ${fromDocuments} ${fromDocuments === 1 ? "answer" : "answers"} from documents`,
+    short: woken ? "woken" : "not woken",
   };
 
   // --- caption -----------------------------------------------------------------------
@@ -204,7 +217,7 @@ export function s2State(trace: SceneTrace, timeline: Timeline, frame: number): S
         appear,
       };
     } else if (event.kind === "twin.decided") {
-      caption = { title: "Decided from the twin, not guessed", body: event.note ?? `${event.decision}: ${event.basis}.`, appear };
+      caption = { title: "Decided from the twin, not guessed", body: event.note ?? sentence(`${event.decision}: ${event.basis}`), appear };
     } else if (event.kind === "question.asked") {
       caption = { title: "A session has a question", body: event.note ?? `"${event.question}"`, appear };
     } else if (event.kind === "question.answered") {
@@ -214,7 +227,7 @@ export function s2State(trace: SceneTrace, timeline: Timeline, frame: number): S
           event.note ??
           (event.from === "operator"
             ? event.answer
-            : `${event.answer}. Cited: ${event.document}. The operator is not woken.`),
+            : `${sentence(event.answer)} Cited: ${event.document ?? event.from}. The operator is not woken.`),
         appear,
       };
     }
@@ -226,9 +239,9 @@ export function s2State(trace: SceneTrace, timeline: Timeline, frame: number): S
     twin,
     factCount: mirrored.length,
     decisions,
-    decisionPulse: pulseOf(decided[decided.length - 1]),
+    decisionPulse: pulseOf(decided[0]),
     developer,
-    developerPulse: pulseOf(questionBeats[questionBeats.length - 1]),
+    developerPulse: pulseOf(questionBeats[0]),
     operator,
     caption,
   };

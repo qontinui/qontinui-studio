@@ -11,11 +11,17 @@ export interface CaptionProps {
   /** 0..1 entrance (fade + slide). */
   appear?: number;
   align?: "left" | "center";
+  /** Clamp the body to this many lines with an ellipsis (default: no clamp). */
+  maxBodyLines?: number;
   unit: number;
 }
 
 /** Narrative caption: a short title and an optional line of body text. */
-export function Caption({ x, y, width, title, body, appear = 1, align = "left", unit }: CaptionProps) {
+export function Caption({ x, y, width, title, body, appear = 1, align = "left", maxBodyLines, unit }: CaptionProps) {
+  const clamp =
+    maxBodyLines === undefined
+      ? {}
+      : { display: "-webkit-box", WebkitBoxOrient: "vertical" as const, WebkitLineClamp: maxBodyLines, overflow: "hidden" };
   return (
     <div
       data-studio-caption={title}
@@ -48,6 +54,7 @@ export function Caption({ x, y, width, title, body, appear = 1, align = "left", 
             fontWeight: fontWeights.regular,
             lineHeight: 1.35,
             marginTop: Math.round(10 * unit),
+            ...clamp,
           }}
         >
           {body}
