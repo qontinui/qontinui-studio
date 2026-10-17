@@ -17,6 +17,7 @@ from PIL import Image
 from qontinui_studio.errors import ApprovalRefused, TagRefused
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.providers import Provider
+from qontinui_studio.sites import ID_PATTERN
 
 
 @dataclass(frozen=True)
@@ -318,17 +319,29 @@ class Library:
         return self.asset(uid), True
 
     def tag(self, uid: str, tag: str, by: str, on: date, commit: bool = True) -> bool:
-        """Put asset ``uid`` in the set ``tag``. ``by`` is a reviewer alias, or
-        ``brief:<brief id>`` when a brief applied the tag at ingest. Returns
-        whether a row was added (tagging twice is a no-op that keeps the first
-        record). A tag is a selection, not an approval: it gates nothing."""
+        """Put asset ``uid`` in the set ``tag``, by reviewer alias ``by``.
+        Returns whether a row was added (tagging twice is a no-op that keeps
+        the first record). A tag is a selection, not an approval: it gates
+        nothing."""
+        if not is_alias(by):
+            raise TagRefused(f"tagger '{by}' is not an alias (never an e-mail address)")
+        return self._tag(uid, tag, by, on, commit)
+
+    def tag_from_brief(
+        self, uid: str, tag: str, brief_id: str, on: date, commit: bool = True
+    ) -> bool:
+        """The tag a brief's ``tags`` applies at ingest, recorded as
+        ``brief:<brief id>``. Only ingest calls this, so ``brief:`` always
+        means a brief applied it."""
+        if re.fullmatch(ID_PATTERN, brief_id) is None:
+            raise TagRefused(f"brief id '{brief_id}' does not match {ID_PATTERN}")
+        return self._tag(uid, tag, f"brief:{brief_id}", on, commit)
+
+    def _tag(self, uid: str, tag: str, by: str, on: date, commit: bool) -> bool:
         if not is_tag(tag):
             raise TagRefused(
                 f"tag '{tag}' must match {TAG_PATTERN} (lowercase letters, digits, '.', '_', '-')"
             )
-        brief_id = by.removeprefix("brief:")
-        if not is_alias(by) and not (by.startswith("brief:") and is_alias(brief_id)):
-            raise TagRefused(f"tagger '{by}' is neither an alias nor 'brief:<brief id>'")
         if self.conn.execute("SELECT 1 FROM assets WHERE uid = ?", (uid,)).fetchone() is None:
             raise TagRefused(f"no asset '{uid}' in the library")
         added = self.conn.execute(
@@ -361,6 +374,8 @@ class Library:
         ``status``), oldest first: the query a set's consumer runs."""
         sql = "SELECT a.* FROM assets a JOIN asset_tags t ON t.asset_uid = a.uid WHERE t.tag = ?"
         params: list[str] = [tag]
+        if status is not None and status not in APPROVAL_STATUSES:
+            raise ValueError(f"unknown approval status '{status}'")
         if status is not None:
             sql += " AND a.approval_status = ?"
             params.append(status)

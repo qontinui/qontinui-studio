@@ -76,6 +76,8 @@ def test_tag_untag_and_the_status_filter(
     assert lib.untag(b, "studio-style-v1") is True
     assert lib.untag(b, "studio-style-v1") is False
     assert [x.uid for x in lib.tagged("studio-style-v1")] == [a]
+    with pytest.raises(ValueError):
+        lib.tagged("studio-style-v1", status="aproved")
 
 
 @pytest.mark.parametrize(
@@ -85,6 +87,7 @@ def test_tag_untag_and_the_status_filter(
         (None, "Bad Tag", "josh"),
         (None, "studio-style-v1", "josh@example.com"),
         (None, "studio-style-v1", "brief:"),
+        (None, "studio-style-v1", "brief:hero-test"),  # brief provenance is ingest's alone
     ],
 )
 def test_tag_refusals(
