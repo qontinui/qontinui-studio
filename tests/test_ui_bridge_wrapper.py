@@ -839,3 +839,36 @@ def test_a_missing_error_reads_no_detail(tmp_path: Path) -> None:
     respx.post(DISPATCH).mock(return_value=httpx.Response(404, json={"success": False}))
     with pytest.raises(PermanentProviderError, match="no detail"):
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+# --- review of the time budget -------------------------------------------------
+
+
+@respx.mock
+def test_a_wrapper_timeout_is_a_refunded_refusal_not_a_handoff(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "timeout", "retry_after_s": 60, "typed": True})
+    )
+    adapter = _adapter(tmp_path / "state")
+    with pytest.raises(ProviderBusy) as busy:
+        adapter.submit(_request(), tmp_path)
+    assert busy.value.code == "timeout" and busy.value.retry_after_s == 60
+    assert not (tmp_path / "state" / "handoffs" / "gemini-web.json").exists()
+
+
+@respx.mock
+def test_the_budget_is_never_below_one_second(tmp_path: Path) -> None:
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
+    )
+    _adapter(tmp_path / "state", dispatch_timeout_s=10.0).submit(_request(), tmp_path)
+    assert json.loads(route.calls.last.request.content)["params"]["budgetS"] == 1
+
+
+def test_the_read_timeout_covers_a_cold_browser_spawn(tmp_path: Path) -> None:
+    from qontinui_studio.adapters.ui_bridge_wrapper import SPAWN_ALLOWANCE_S
+
+    adapter = _adapter(tmp_path / "state")
+    assert adapter.read_timeout_s >= adapter.dispatch_timeout_s + 30
+    assert SPAWN_ALLOWANCE_S >= 30
+    assert adapter.hard_timeout_s > adapter.read_timeout_s
