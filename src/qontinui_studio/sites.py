@@ -29,6 +29,9 @@ SlotCategory = Literal[
 ExportFormat = Literal["webp", "avif", "png", "jpeg"]
 
 ID_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+# GitHub ``owner/name``: coord refuses any other spelling of a repo for the
+# image_generation dial (``repo_not_owner_name``).
+REPO_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$"
 
 # The supervisor (:9875) and the runner (:9876) — dev tooling UIs, never a
 # site preview. Refused on any host that resolves to this machine.
@@ -169,6 +172,12 @@ class Site(BaseModel):
     commercial: bool
     publish_dir: Path
     public_url: str | None = None
+    # The repository this site's assets ship into, as GitHub ``owner/name``.
+    # Studio names it when it reads coord's ``image_generation`` dial
+    # (``GET /coord/fleet-policy?domain=image_generation&repo=<repo>``), so a
+    # per-repo override governs generation for this site. Unset reads the
+    # tenant-wide level (plan 2026-10-13 Phase 12 step 3).
+    repo: str | None = Field(default=None, pattern=REPO_PATTERN)
     # The label a demo/template site must show beside AI imagery (D6). On other
     # site kinds AI imagery still carries ``ai_label`` (EU synthetic-content
     # transparency).

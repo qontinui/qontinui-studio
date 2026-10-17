@@ -346,6 +346,7 @@ def _v1_db_with_inflight_jobs(
     db = ctx.workspace.db_path
     ctx.conn.close()
     raw = sqlite3.connect(db)  # back to the v1 shape: what a v1 studio.db holds
+    raw.execute("DROP TABLE imagegen_dial_last_known")  # v4
     raw.execute("DROP TABLE asset_tags")  # v3
     raw.execute("DROP INDEX job_attempts_job")
     raw.execute("DROP TABLE job_attempts")

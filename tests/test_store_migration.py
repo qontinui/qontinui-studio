@@ -118,7 +118,15 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
     db = tmp_path / ".studio" / "studio.db"
     _v0_db(db, write_image(tmp_path / "raw.png"))
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    # v4: the image-generation dial's last-known level; an upgraded studio has
+    # read none, and a level outside the dial's vocabulary is refused.
+    assert conn.execute("SELECT COUNT(*) FROM imagegen_dial_last_known").fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO imagegen_dial_last_known (repo_key, level, read_at) "
+            "VALUES ('', 'local-only', 't')"
+        )
     # v3: library tags; an upgraded library starts with none.
     assert conn.execute("SELECT COUNT(*) FROM asset_tags").fetchone()[0] == 0
     # v2: typed job states and the refundable quota day.

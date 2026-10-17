@@ -150,6 +150,24 @@ def _no_runner_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("qontinui_studio.cli.read_gateway_state", no_runner, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _coord_dial_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Studio reads coord's ``image_generation`` dial before generating. Tests
+    never reach coord: by default the dial answers coord's no-row default
+    (``on``), and this machine's ``QONTINUI_IMAGEGEN`` is unset. Off-switch
+    tests install their own reader (``Context.imagegen``) or patch this again."""
+
+    def coord_default() -> object:
+        from qontinui_studio.imagegen_policy import DialReading
+
+        return lambda repo: DialReading("on", "test: coord's no-row default", "none")
+
+    monkeypatch.delenv("QONTINUI_IMAGEGEN", raising=False)
+    monkeypatch.setattr(
+        "qontinui_studio.imagegen_policy.default_reader", coord_default, raising=False
+    )
+
+
 def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:
     """The newest notice for (batch, outcome); notices are timestamped."""
     matches = sorted(notices_dir.glob(f"{batch_id}-{outcome}-*.md"))

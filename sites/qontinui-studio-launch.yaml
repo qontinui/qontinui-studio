@@ -9,6 +9,9 @@ commercial: false
 # hosted, so the Phase 2 gates REFUSE to publish decoration here
 # (d7_page_health not_configured) and the launch kit assembles without it, as
 # D1 allows.
+# The repo these assets ship into: studio reads coord's image_generation dial
+# for it (plan 2026-10-13 Phase 12), so a per-repo override governs this site.
+repo: qontinui/qontinui-studio
 publish_dir: ../.studio/sites/qontinui-studio-launch
 slots:
   hero:
