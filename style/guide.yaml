@@ -29,6 +29,8 @@ tokens:
       role: The real factory layer. Sessions, PR cards and gates are solid shapes in this surface.
     - token: --qontinui-border-default
       role: The edge of a real-layer shape.
+    - token: --qontinui-border-subtle
+      role: The faint grid floor that gives a scene depth.
     - token: --qontinui-brand-primary
       role: The twin. Its line work and the event pulses that travel into it.
     - token: --qontinui-glow-primary

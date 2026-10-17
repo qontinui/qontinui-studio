@@ -300,12 +300,13 @@ def library_list(
     --status approved --json`` is what a consumer project may use)."""
     ws = Workspace(obj.root)
     lib = Library(connect(ws.db_path))
+    tags_of = {a.uid: lib.tags(a.uid) for a in lib.assets(batch_id)}
     assets = [
         a
         for a in lib.assets(batch_id)
         if (not statuses or a.approval_status in statuses)
         and (origin is None or a.origin == origin)
-        and set(tags) <= set(lib.tags(a.uid))
+        and set(tags) <= set(tags_of[a.uid])
     ]
     if as_json:
         click.echo(
@@ -313,7 +314,7 @@ def library_list(
                 [
                     {
                         **a.__dict__,
-                        "tags": lib.tags(a.uid),
+                        "tags": tags_of[a.uid],
                         "variants": [v.__dict__ for v in lib.variants(a.uid)],
                     }
                     for a in assets
@@ -327,7 +328,7 @@ def library_list(
             f"{a.uid}  {a.origin}  {a.provider}/{a.model}  commercial={a.licence_commercial_use} "
             f"reviewed={a.licence_tos_reviewed or 'UNREVIEWED'}  watermark={a.watermark}  "
             f"ai_generated={a.ai_generated}  approval={a.approval_status}  "
-            f"tags={','.join(lib.tags(a.uid)) or '-'}  variants={len(lib.variants(a.uid))}"
+            f"tags={','.join(tags_of[a.uid]) or '-'}  variants={len(lib.variants(a.uid))}"
         )
 
 
@@ -477,6 +478,7 @@ def style_render(
     library's reference set."""
     ws = Workspace(obj.root)
     style_dir = (style_dir or obj.root / "style").resolve()
+    library_read = not no_library and ws.db_path.is_file()
     try:
         guide = load_guide(style_dir)
         tokens = read_tokens_css(tokens_css) if tokens_css is not None else None
@@ -487,7 +489,9 @@ def style_render(
             utc_now(),
             tokens=tokens,
             tokens_source=str(tokens_css) if tokens_css is not None else None,
-            library=None if no_library else Library(connect(ws.db_path)),
+            # A render never creates or migrates a library: none on disk is
+            # rendered as not read (UNKNOWN), like --no-library.
+            library=Library(connect(ws.db_path)) if library_read else None,
         )
     except StudioError as e:
         raise click.ClickException(str(e)) from e
@@ -499,7 +503,7 @@ def style_render(
         f"reference set {guide.references.tag}: "
         + (
             "UNKNOWN (library not read)"
-            if no_library
+            if not library_read
             else f"{sheet.references_approved} approved of {sheet.references_tagged} tagged "
             f"(target {sheet.target_approved})"
         )

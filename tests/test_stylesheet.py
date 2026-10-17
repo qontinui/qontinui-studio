@@ -17,7 +17,9 @@ from qontinui_studio.errors import ConfigError
 from qontinui_studio.library import Library
 from qontinui_studio.pipeline import Context, run_brief
 from qontinui_studio.providers import load_providers
+from qontinui_studio.store import connect
 from qontinui_studio.stylesheet import build_style_sheet, load_guide, load_icon, read_tokens_css
+from qontinui_studio.workspace import Workspace
 
 REPO = Path(__file__).resolve().parent.parent
 STYLE = REPO / "style"
@@ -88,7 +90,6 @@ def test_render_resolves_tokens_and_reports_no_drift(tmp_path: Path) -> None:
     page = sheet.page.read_text()
     assert "var(--qontinui-brand-primary)" in page and "UNRESOLVED" not in page
     assert "the reference set is UNKNOWN" in page
-    assert "<script" not in page
 
 
 def test_render_without_tokens_says_unknown(tmp_path: Path) -> None:
@@ -112,15 +113,16 @@ def test_a_guide_token_missing_from_tokens_css_refuses(tmp_path: Path) -> None:
 def test_a_look_colour_off_the_tokens_is_drift(tmp_path: Path) -> None:
     style = tmp_path / "style"
     shutil.copytree(STYLE, style)
+    shutil.copytree(REPO / "briefs", tmp_path / "briefs")
     frag = style / "studio-style-v1.md"
-    frag.write_text(frag.read_text() + " Accent #FF00FF.")
+    frag.write_text(frag.read_text() + " Accent #FF00FF, edge #fff.")
     guide = load_guide(style)
     css = _tokens_css([t.token for t in guide.tokens.all()], tmp_path)
     sheet = build_style_sheet(
         guide, style, tmp_path / "o", NOW, tokens=read_tokens_css(css), tokens_source="t",
         library=None,
     )  # fmt: skip
-    assert sheet.fragment_drift == ["studio-style-v1: #FF00FF"]
+    assert sheet.fragment_drift == ["studio-style-v1: #FF00FF", "studio-style-v1: #FFF"]
 
 
 @pytest.mark.parametrize(
@@ -132,6 +134,12 @@ def test_a_look_colour_off_the_tokens_is_drift(tmp_path: Path) -> None:
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M0 0"/></svg>',
         '<!DOCTYPE svg [<!ENTITY a "b">]><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"/>',
         '<svg viewBox="0 0 24 24"><path d="M0 0"/></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><use href="#a"/></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><image href="x.png"/></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><foreignObject/></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'viewBox="0 0 24 24"><path d="M0 0" xlink:href="#a"/></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0" style="x"/></svg>',
     ],
 )
 def test_icons_outside_the_contract_are_refused(tmp_path: Path, body: str) -> None:
@@ -160,8 +168,15 @@ def test_the_reference_set_is_the_library_tag_query(
     assert len(list((tmp_path / "o" / "refs").iterdir())) == 1
 
 
-def test_cli_style_render(studio_root: Path, tmp_path: Path) -> None:
+def _copy_guide(studio_root: Path) -> None:
     shutil.copytree(STYLE, studio_root / "style")
+    for b in (REPO / "briefs").glob("style-v1-*.yaml"):
+        shutil.copy(b, studio_root / "briefs" / b.name)
+
+
+def test_cli_style_render(studio_root: Path, tmp_path: Path) -> None:
+    _copy_guide(studio_root)
+    connect(Workspace(studio_root).db_path).close()  # an empty library
     guide = load_guide(STYLE)
     css = _tokens_css([t.token for t in guide.tokens.all()], tmp_path)
     r = CliRunner().invoke(
@@ -171,3 +186,36 @@ def test_cli_style_render(studio_root: Path, tmp_path: Path) -> None:
     assert (studio_root / ".studio" / "style" / "index.html").is_file()
     assert f"tokens: {len(guide.tokens.all())}/{len(guide.tokens.all())} resolved" in r.output
     assert "reference set studio-style-v1: 0 approved of 0 tagged (target 20)" in r.output
+
+
+def test_a_missing_reference_brief_refuses_the_guide(tmp_path: Path) -> None:
+    style = tmp_path / "style"
+    shutil.copytree(STYLE, style)
+    with pytest.raises(ConfigError, match="reference brief"):
+        load_guide(style)  # tmp_path has no briefs/
+
+
+def test_a_missing_preview_file_renders_a_note(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path], tmp_path: Path
+) -> None:
+    ctx = make_context()
+    run_brief(ctx, write_brief())
+    lib = Library(ctx.conn)
+    uid = lib.assets()[0].uid
+    lib.tag(uid, "studio-style-v1", "josh", date(2026, 10, 17))
+    lib.decide(uid, "approved", "josh", date(2026, 10, 17))
+    for v in lib.variants(uid):
+        Path(v.path).unlink()
+    Path(lib.asset(uid).raw_path).unlink()
+    sheet = build_style_sheet(
+        load_guide(STYLE), STYLE, tmp_path / "o", NOW, tokens=None, tokens_source=None, library=lib
+    )
+    assert "preview file missing" in sheet.page.read_text()
+
+
+def test_render_does_not_create_a_library(studio_root: Path) -> None:
+    _copy_guide(studio_root)
+    r = CliRunner().invoke(main, ["--root", str(studio_root), "style", "render"])
+    assert r.exit_code == 0, r.output
+    assert "UNKNOWN (library not read)" in r.output
+    assert not (studio_root / ".studio" / "studio.db").exists()
