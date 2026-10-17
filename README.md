@@ -267,7 +267,10 @@ poetry run studio providers list
 poetry run studio brief validate briefs/example-hero.yaml
 poetry run studio brief run briefs/example-hero.yaml     # generate -> crop -> gate -> publish
 poetry run studio jobs run                               # resume batches deferred by quota/backoff
-poetry run studio library list [--json] [--batch ID] [--status S]... [--origin O]
+poetry run studio library list [--json] [--batch ID] [--status S]... [--origin O] [--tag T]...
+poetry run studio library tag UID TAG --by ALIAS        # file an asset under a set (not an approval)
+poetry run studio library untag UID TAG
+poetry run studio style render --tokens-css PATH        # .studio/style/index.html from style/guide.yaml
 poetry run studio library import INBOX_DIR               # images made elsewhere -> library (never published)
 poetry run studio library approve UID --by ALIAS         # consumer-facing approval (D5: commercial_use yes only)
 poetry run studio library reject UID --by ALIAS
@@ -399,6 +402,15 @@ that. External consumers are expected to filter with `--status`.
 `--origin generated|imported` narrow the listing; with `--json` that is what a
 consumer project reads to pick assets.
 
+**Tags.** A tag names a set that consumers select from, such as the brand
+reference set `studio-style-v1`. A brief's `tags: [...]` files every asset it
+produces under those tags at ingest, recorded as `tagged_by: brief:<id>`.
+`studio library tag|untag <uid> <tag> --by <alias>` changes the set by hand.
+`studio library list --tag <t> --status approved --json` is the set query.
+Tags are lowercase, matching `^[a-z0-9][a-z0-9._-]{0,63}$`. A tag is not an
+approval and gates nothing. Tags are stored in `asset_tags`, added in schema
+v3, and the export carries them (export version 2).
+
 **Export.** `studio library export --out <path>` writes every asset as YAML:
 uid, asset_id, origin, batch, provider, model, account, prompt, reference images,
 dates, SHA-256, size, MIME type, licence, watermark, `ai_generated`, approval,
@@ -515,8 +527,17 @@ runner that cannot say, refuses every image call with `gateway_has_no_image_rout
   script, brief and assets site, publish target), plus their capture scripts.
 - `briefs/*.yaml`: the asset id, purpose, targets (`{site, slot}` or
   `{campaign}`), aspect ratio, prompt, style guide, reference images, provider
-  preference and number of variants.
+  preference, number of variants and optional library `tags`. The
+  `style-v1-*.yaml` briefs generate the `studio-style-v1` reference set. They
+  are campaign-only, local GPU only, and use bulk priority.
 - `schemas/import-manifest.schema.json`: the `library import` manifest contract.
+- `style/`: the studio style guide (plan
+  `2026-10-09-qontinui-marketing-studio-animated-process-explainers`, D4).
+  `guide.yaml` defines the twin metaphor, the icon set (`icons/*.svg`), the
+  looks (prompt fragments such as `studio-style-v1.md`) and the reference set.
+  Palette, motion and typography appear there only as token names, and their
+  values come from `@qontinui/design-tokens`. Run `studio style render` to
+  produce the style-sheet page. See `style/README.md`.
 - `.studio/` (gitignored): the SQLite library and scheduler state, raw downloads
   and imports, variants, notices and the review page.
 

@@ -49,6 +49,7 @@ from qontinui_studio.review import build_review_page
 from qontinui_studio.scheduler import utc_now
 from qontinui_studio.sites import load_sites
 from qontinui_studio.store import connect
+from qontinui_studio.stylesheet import build_style_sheet, load_guide, read_tokens_css
 from qontinui_studio.workspace import Workspace
 
 
@@ -279,13 +280,24 @@ def library() -> None:
     default=None,
     help="Only generated or only imported assets.",
 )
+@click.option(
+    "--tag",
+    "tags",
+    multiple=True,
+    help="Only assets carrying this library tag (repeatable: an asset must carry every one).",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def library_list(
-    obj: Obj, batch_id: str | None, statuses: tuple[str, ...], origin: str | None, as_json: bool
+    obj: Obj,
+    batch_id: str | None,
+    statuses: tuple[str, ...],
+    origin: str | None,
+    tags: tuple[str, ...],
+    as_json: bool,
 ) -> None:
-    """List library assets; filters combine (e.g. ``--status approved --json``
-    is what a consumer project may use)."""
+    """List library assets; filters combine (e.g. ``--tag studio-style-v1
+    --status approved --json`` is what a consumer project may use)."""
     ws = Workspace(obj.root)
     lib = Library(connect(ws.db_path))
     assets = [
@@ -293,12 +305,17 @@ def library_list(
         for a in lib.assets(batch_id)
         if (not statuses or a.approval_status in statuses)
         and (origin is None or a.origin == origin)
+        and set(tags) <= set(lib.tags(a.uid))
     ]
     if as_json:
         click.echo(
             json.dumps(
                 [
-                    {**a.__dict__, "variants": [v.__dict__ for v in lib.variants(a.uid)]}
+                    {
+                        **a.__dict__,
+                        "tags": lib.tags(a.uid),
+                        "variants": [v.__dict__ for v in lib.variants(a.uid)],
+                    }
                     for a in assets
                 ],
                 indent=2,
@@ -310,8 +327,35 @@ def library_list(
             f"{a.uid}  {a.origin}  {a.provider}/{a.model}  commercial={a.licence_commercial_use} "
             f"reviewed={a.licence_tos_reviewed or 'UNREVIEWED'}  watermark={a.watermark}  "
             f"ai_generated={a.ai_generated}  approval={a.approval_status}  "
-            f"variants={len(lib.variants(a.uid))}"
+            f"tags={','.join(lib.tags(a.uid)) or '-'}  variants={len(lib.variants(a.uid))}"
         )
+
+
+@library.command("tag")
+@click.argument("uid")
+@click.argument("tag")
+@click.option("--by", "by", required=True, help="Tagger alias (never an e-mail address).")
+@click.pass_obj
+def library_tag(obj: Obj, uid: str, tag: str, by: str) -> None:
+    """File an asset under a library tag (a set consumers select by). A tag is
+    not an approval and gates nothing."""
+    lib = Library(connect(Workspace(obj.root).db_path))
+    try:
+        added = lib.tag(uid, tag, by, utc_now().date())
+    except StudioError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"{uid}: {'tagged' if added else 'already tagged'} {tag}")
+
+
+@library.command("untag")
+@click.argument("uid")
+@click.argument("tag")
+@click.pass_obj
+def library_untag(obj: Obj, uid: str, tag: str) -> None:
+    """Take an asset out of a library tag."""
+    lib = Library(connect(Workspace(obj.root).db_path))
+    removed = lib.untag(uid, tag)
+    click.echo(f"{uid}: {'untagged' if removed else 'was not tagged'} {tag}")
 
 
 @library.command("import")
@@ -391,6 +435,75 @@ def review_build(obj: Obj) -> None:
     ws = Workspace(obj.root)
     page = build_review_page(connect(ws.db_path), ws.review_dir, utc_now(), root=obj.root)
     click.echo(str(page))
+
+
+@main.group()
+def style() -> None:
+    """The studio style guide (plan D4)."""
+
+
+@style.command("render")
+@click.option(
+    "--style-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="The guide directory holding guide.yaml (default: <root>/style).",
+)
+@click.option(
+    "--tokens-css",
+    type=click.Path(dir_okay=False, path_type=Path),
+    envvar="STUDIO_DESIGN_TOKENS_CSS",
+    default=None,
+    help="@qontinui/design-tokens' tokens.css (env STUDIO_DESIGN_TOKENS_CSS). Without it "
+    "every token value renders as unresolved.",
+)
+@click.option(
+    "--out",
+    "out",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory (default: <root>/.studio/style).",
+)
+@click.option(
+    "--no-library",
+    is_flag=True,
+    help="Do not read the library: the reference set renders as UNKNOWN.",
+)
+@click.pass_obj
+def style_render(
+    obj: Obj, style_dir: Path | None, tokens_css: Path | None, out: Path | None, no_library: bool
+) -> None:
+    """Render the style-sheet page from the guide, the token package and the
+    library's reference set."""
+    ws = Workspace(obj.root)
+    style_dir = (style_dir or obj.root / "style").resolve()
+    try:
+        guide = load_guide(style_dir)
+        tokens = read_tokens_css(tokens_css) if tokens_css is not None else None
+        sheet = build_style_sheet(
+            guide,
+            style_dir,
+            out or ws.state_dir / "style",
+            utc_now(),
+            tokens=tokens,
+            tokens_source=str(tokens_css) if tokens_css is not None else None,
+            library=None if no_library else Library(connect(ws.db_path)),
+        )
+    except StudioError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(str(sheet.page))
+    click.echo(f"tokens: {sheet.tokens_resolved}/{sheet.tokens_named} resolved")
+    for d in sheet.fragment_drift:
+        click.echo(f"warning: prompt fragment colour not a token value: {d}", err=True)
+    click.echo(
+        f"reference set {guide.references.tag}: "
+        + (
+            "UNKNOWN (library not read)"
+            if no_library
+            else f"{sheet.references_approved} approved of {sheet.references_tagged} tagged "
+            f"(target {sheet.target_approved})"
+        )
+    )
 
 
 @main.group()

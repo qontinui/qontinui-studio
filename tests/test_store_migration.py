@@ -118,7 +118,9 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
     db = tmp_path / ".studio" / "studio.db"
     _v0_db(db, write_image(tmp_path / "raw.png"))
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    # v3: library tags; an upgraded library starts with none.
+    assert conn.execute("SELECT COUNT(*) FROM asset_tags").fetchone()[0] == 0
     # v2: typed job states and the refundable quota day.
     job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
     assert {"quota_day", "adapter"} <= job_cols

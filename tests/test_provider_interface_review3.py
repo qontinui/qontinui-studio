@@ -22,7 +22,7 @@ from qontinui_studio.errors import AdapterDisabledError, ProviderBusy, ProviderD
 from qontinui_studio.gateway import GatewayState, read_gateway_state
 from qontinui_studio.pipeline import Context, _request_for, new_batch
 from qontinui_studio.providers import load_providers
-from qontinui_studio.store import connect
+from qontinui_studio.store import SCHEMA_VERSION, connect
 
 from . import imagehost
 from .conftest import FakeClock
@@ -398,7 +398,7 @@ def test_ld_a_library_command_first_then_a_run_command_backfills(studio_root: Pa
     assert listed.value.code == 0
     raw = sqlite3.Connection(db)
     assert [x[0] for x in raw.execute("SELECT adapter FROM jobs")] == [None, None]
-    assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     raw.close()
     # The run goes on to the publish gates, which are not the subject here: only
     # that it ran to a typed exit and backfilled on its own open of the file.

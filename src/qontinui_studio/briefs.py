@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from qontinui_studio import postprocess
 from qontinui_studio.errors import ConfigError
+from qontinui_studio.library import TAG_PATTERN, is_tag
 from qontinui_studio.providers import ProviderInventory
 from qontinui_studio.sites import ID_PATTERN, Site
 
@@ -59,6 +60,20 @@ class Brief(BaseModel):
     # ``bulk`` work waits for the host's bulk window and never spills onto
     # another provider when the host refuses it.
     priority: Literal["interactive", "bulk"] = "interactive"
+    # Library tags every asset this brief produces is filed under at ingest
+    # (e.g. the brand reference set ``studio-style-v1``). A selection, not an
+    # approval: approval stays a separate, recorded decision.
+    tags: list[str] = Field(default_factory=list)
+
+    @field_validator("tags")
+    @classmethod
+    def _valid_tags(cls, v: list[str]) -> list[str]:
+        for t in v:
+            if not is_tag(t):
+                raise ValueError(f"tag '{t}' must match {TAG_PATTERN}")
+        if len(set(v)) != len(v):
+            raise ValueError("tags names a tag twice")
+        return v
 
     @field_validator("targets")
     @classmethod

@@ -228,9 +228,18 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   never cleared. A bulk job may leave it only for an unmetered provider (the
 #   scheduler's no-spill rule). Backfilled for pre-v2 rows from the first
 #   provider they left (``tried_providers[0]``), else their current provider.
+#
+# Version 3 — library tags (plan 2026-10-09-qontinui-marketing-studio-animated-
+# process-explainers, Phase 1):
+#
+# * ``asset_tags``: one row per (asset, tag). A tag names a SET a consumer
+#   selects by, e.g. the brand reference set ``studio-style-v1``; it is not an
+#   approval and gates nothing. ``tagged_by`` is a reviewer alias or
+#   ``brief:<brief id>`` for a tag a brief applied at ingest. Existing assets
+#   carry no tags.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _BATCHES_V1 = """
 CREATE TABLE batches_v1 (
@@ -364,9 +373,25 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX job_attempts_job ON job_attempts (job_id, id)")
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE asset_tags (
+            asset_uid TEXT NOT NULL REFERENCES assets(uid),
+            tag TEXT NOT NULL,
+            tagged_by TEXT NOT NULL,
+            tagged_on TEXT NOT NULL,
+            PRIMARY KEY (asset_uid, tag)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX asset_tags_tag ON asset_tags (tag, asset_uid)")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 
