@@ -22,10 +22,10 @@ src/api/          the studio scene API — the only thing scenes import (besides
   engine.ts       EngineAdapter / PlayerEmbedProps — the engine seam (D7)
   scene-root.tsx  what every adapter renders: canvas + scene + mode label
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
-                  feed (a panel of short rows), scene header
+                  feed (a panel of short rows), scene header, label (a small pill on a point)
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
                   S3 "Gates and continuations", S4 "The merge train", S5 "The fleet",
-                  S6 "Self-correction", ...)
+                  S6 "Self-correction", S7 "Model-based GUI automation")
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
@@ -51,6 +51,7 @@ assets/fonts/     bundled Inter 4.1, full character set (OFL)
 | `s4-merge-train` | PRs queued, rebased onto main, tested and landed in order; a conflicted PR steps out and rejoins at the back | illustrative only: the export carries land times but no queue order, rebase or conflict events |
 | `s5-fleet` | sessions on several machines, each in its own worktree, coordinating through declared intent and claims; a held claim is a collision avoided | illustrative only: the export carries a session count, excludes machine names, and has no worktree, intent or claim events |
 | `s6-self-correction` | CI goes red; the session diagnoses it from the CI log and pushes a fix; CI runs again, round the loop to green, with no human step | illustrative only: the export carries attempts, CI duration and a red-CI-fixed count, but no CI run, diagnosis or fix events |
+| `s7-gui-automation` | a state graph learned from an app (states and actions found while exploring), then traversed by actions to a goal: the original Qontinui idea, now one module of the factory | illustrative by design |
 
 ## The engine seam (plan D7)
 
@@ -188,8 +189,9 @@ as an unknown event. A trace contains:
   - `date_range`: required for a replay.
 - `entities`: `plans`, `prs`, `sessions`, `sources` (systems the twin
   mirrors: `repo-host`, `ci`, `machine`, `session`; display labels only),
-  `gates` (a condition a session waits on) and `machines` (display labels
-  only; a session may name its `machine`).
+  `gates` (a condition a session waits on), `machines` (display labels
+  only; a session may name its `machine`), and `states` / `transitions` (a
+  GUI's states and the actions between them).
 - `events`: each event has an `id` and an `at` (ISO-8601 with an offset), and is
   one of:
   - `plan.drafted|vetted|implementing|shipped`
@@ -206,6 +208,7 @@ as an unknown event. A trace contains:
     from a served `policy` or `intent` document or from the `operator`; the
     answer cites the document unless the operator gave it)
   - `gate.registered` (by a session), `gate.observed` and `gate.cleared`
+  - `gui.state_found`, `gui.transition_found` and `gui.transition_taken`
   - `worktree.allocated`, `intent.declared`, `claim.acquired|released` and
     `claim.contended` (naming the session that holds the claim)
 
@@ -225,6 +228,9 @@ The validator also checks that:
   a PR lands at most once;
 - a diagnosis is made only while its PR is red, and a fix answers the latest
   red run's diagnosis, once, while the PR is still red;
+- a GUI state or transition is found at most once; a transition is found
+  only after both its states, taken only after it is found, and each step of
+  a traversal starts where the previous one ended;
 - a claim is acquired only when no session holds it (the holder may not
   re-acquire it), released only by its holder, and contended only against the
   session holding it at that point; a session's end releases its claims; and
@@ -246,7 +252,8 @@ may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
 sessions, S4 at most four PRs, S5 at most three machines with two sessions
 each, every session on a machine and started before it acts, S6 exactly
-one PR, a closed loop (red, a fix, then green) and no operator step).
+one PR, a closed loop (red, a fix, then green) and no operator step, S7 at
+most six states).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

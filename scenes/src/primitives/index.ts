@@ -3,6 +3,7 @@ export { Counter, type CounterProps } from "./Counter";
 export { Edge, type EdgeProps, type Point } from "./Edge";
 export { Feed, feedHeight, type FeedProps, type FeedRow } from "./Feed";
 export { Gate, type GateProps } from "./Gate";
+export { Label, type LabelProps } from "./Label";
 export { ModeLabel, type ModeLabelProps } from "./ModeLabel";
 export { Node, type NodeProps } from "./Node";
 export { PrCard, type PrCardProps } from "./PrCard";

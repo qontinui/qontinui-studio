@@ -1,0 +1,169 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "Learn the app's states, then drive it by its model",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s7-gui-automation.json"
+    }
+  },
+  "entities": {
+    "states": [
+      {
+        "id": "st-login",
+        "label": "Sign in"
+      },
+      {
+        "id": "st-home",
+        "label": "Home"
+      },
+      {
+        "id": "st-search",
+        "label": "Search"
+      },
+      {
+        "id": "st-results",
+        "label": "Results"
+      },
+      {
+        "id": "st-cart",
+        "label": "Cart"
+      },
+      {
+        "id": "st-checkout",
+        "label": "Checkout"
+      }
+    ],
+    "transitions": [
+      {
+        "id": "t-signin",
+        "from": "st-login",
+        "to": "st-home",
+        "action": "click Sign in"
+      },
+      {
+        "id": "t-search",
+        "from": "st-home",
+        "to": "st-search",
+        "action": "open Search"
+      },
+      {
+        "id": "t-submit",
+        "from": "st-search",
+        "to": "st-results",
+        "action": "type, press Enter"
+      },
+      {
+        "id": "t-add",
+        "from": "st-results",
+        "to": "st-cart",
+        "action": "click Add to cart"
+      },
+      {
+        "id": "t-checkout",
+        "from": "st-cart",
+        "to": "st-checkout",
+        "action": "click Checkout"
+      },
+      {
+        "id": "t-cart",
+        "from": "st-home",
+        "to": "st-cart",
+        "action": "open Cart"
+      }
+    ]
+  },
+  "events": [
+    {
+      "id": "e01",
+      "at": "2026-09-19T10:00:12Z",
+      "kind": "gui.state_found",
+      "state": "st-login"
+    },
+    {
+      "id": "e02",
+      "at": "2026-09-19T10:00:24Z",
+      "kind": "gui.state_found",
+      "state": "st-home"
+    },
+    {
+      "id": "e03",
+      "at": "2026-09-19T10:00:36Z",
+      "kind": "gui.transition_found",
+      "transition": "t-signin"
+    },
+    {
+      "id": "e04",
+      "at": "2026-09-19T10:00:48Z",
+      "kind": "gui.state_found",
+      "state": "st-search"
+    },
+    {
+      "id": "e05",
+      "at": "2026-09-19T10:01:00Z",
+      "kind": "gui.transition_found",
+      "transition": "t-search"
+    },
+    {
+      "id": "e06",
+      "at": "2026-09-19T10:01:12Z",
+      "kind": "gui.state_found",
+      "state": "st-results"
+    },
+    {
+      "id": "e07",
+      "at": "2026-09-19T10:01:24Z",
+      "kind": "gui.transition_found",
+      "transition": "t-submit"
+    },
+    {
+      "id": "e08",
+      "at": "2026-09-19T10:01:36Z",
+      "kind": "gui.state_found",
+      "state": "st-cart"
+    },
+    {
+      "id": "e09",
+      "at": "2026-09-19T10:01:48Z",
+      "kind": "gui.transition_found",
+      "transition": "t-add"
+    },
+    {
+      "id": "e10",
+      "at": "2026-09-19T10:02:00Z",
+      "kind": "gui.state_found",
+      "state": "st-checkout"
+    },
+    {
+      "id": "e11",
+      "at": "2026-09-19T10:02:12Z",
+      "kind": "gui.transition_found",
+      "transition": "t-checkout"
+    },
+    {
+      "id": "e12",
+      "at": "2026-09-19T10:02:24Z",
+      "kind": "gui.transition_found",
+      "transition": "t-cart"
+    },
+    {
+      "id": "e13",
+      "at": "2026-09-19T10:03:27Z",
+      "kind": "gui.transition_taken",
+      "transition": "t-signin"
+    },
+    {
+      "id": "e14",
+      "at": "2026-09-19T10:03:30Z",
+      "kind": "gui.transition_taken",
+      "transition": "t-cart"
+    },
+    {
+      "id": "e15",
+      "at": "2026-09-19T10:03:33Z",
+      "kind": "gui.transition_taken",
+      "transition": "t-checkout"
+    }
+  ]
+}

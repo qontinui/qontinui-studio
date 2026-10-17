@@ -231,6 +231,13 @@ const S5_CASES = illustrativeCases("s5-fleet", { "16:9": [0, 240, 467, 587], "9:
  */
 const S6_CASES = illustrativeCases("s6-self-correction", { "16:9": [0, 170, 310, 398, 497], "9:16": [398], "1:1": [170, 398] });
 
+/**
+ * S7 (507 frames: 36-frame intro, one beat every 27): 0 intro, 200 exploring
+ * (states and actions being learned), 250 a state found, 440 the poster (the
+ * traversal done, the path lit), 506 the end.
+ */
+const S7_CASES = illustrativeCases("s7-gui-automation", { "16:9": [0, 200, 440, 506], "9:16": [440], "1:1": [250, 440] });
+
 export const GOLDEN_CASES: readonly GoldenCase[] = [
   ...S1_CASES,
   ...S2_CASES,
@@ -238,6 +245,7 @@ export const GOLDEN_CASES: readonly GoldenCase[] = [
   ...S4_CASES,
   ...S5_CASES,
   ...S6_CASES,
+  ...S7_CASES,
 ];
 
 export function goldenName(c: GoldenCase, frame: number): string {

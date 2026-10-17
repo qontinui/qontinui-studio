@@ -87,6 +87,25 @@ export const gateEntity = z
   })
   .strict();
 
+/** A state of an application's GUI, as a learned model sees it (S7). */
+export const guiStateEntity = z
+  .object({
+    id,
+    label: z.string().min(1).max(24),
+  })
+  .strict();
+
+/** A transition between two GUI states, made by an action (S7). */
+export const guiTransitionEntity = z
+  .object({
+    id,
+    from: id,
+    to: id,
+    /** The action that makes it, e.g. "click Sign in". */
+    action: z.string().min(1).max(32),
+  })
+  .strict();
+
 export const traceEntities = z
   .object({
     plans: z.array(planEntity).default([]),
@@ -95,6 +114,8 @@ export const traceEntities = z
     sources: z.array(sourceEntity).default([]),
     gates: z.array(gateEntity).default([]),
     machines: z.array(machineEntity).default([]),
+    states: z.array(guiStateEntity).default([]),
+    transitions: z.array(guiTransitionEntity).default([]),
   })
   .strict();
 
@@ -202,6 +223,11 @@ export const traceEvent = z.discriminatedUnion("kind", [
   z.object({ ...eventBase, kind: z.literal("gate.registered"), gate: id, session: id }).strict(),
   z.object({ ...eventBase, kind: z.literal("gate.observed"), gate: id }).strict(),
   z.object({ ...eventBase, kind: z.literal("gate.cleared"), gate: id }).strict(),
+  // Model-based GUI automation (S7): states and transitions are found while
+  // exploring an application, then the learned graph is traversed by actions.
+  z.object({ ...eventBase, kind: z.literal("gui.state_found"), state: id }).strict(),
+  z.object({ ...eventBase, kind: z.literal("gui.transition_found"), transition: id }).strict(),
+  z.object({ ...eventBase, kind: z.literal("gui.transition_taken"), transition: id }).strict(),
   // The fleet (S5): sessions in isolated worktrees coordinate through declared
   // intent and claims. A contended claim names the session holding it.
   z
@@ -267,6 +293,9 @@ export const EVENT_KINDS = [
   "gate.registered",
   "gate.observed",
   "gate.cleared",
+  "gui.state_found",
+  "gui.transition_found",
+  "gui.transition_taken",
   "worktree.allocated",
   "intent.declared",
   "claim.acquired",
@@ -419,6 +448,19 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   const sources = unique("sources", trace.entities.sources.map((s) => s.id));
   const gates = unique("gates", trace.entities.gates.map((g) => g.id));
   const machines = unique("machines", trace.entities.machines.map((m) => m.id));
+  const guiStates = unique("states", trace.entities.states.map((st) => st.id));
+  const guiTransitions = unique("transitions", trace.entities.transitions.map((t) => t.id));
+  trace.entities.transitions.forEach((t, k) => {
+    for (const end of ["from", "to"] as const) {
+      if (!guiStates.has(t[end])) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["entities", "transitions", k, end],
+          message: `unknown state "${t[end]}"`,
+        });
+      }
+    }
+  });
   trace.entities.sessions.forEach((session, i) => {
     if (session.machine !== undefined && !machines.has(session.machine)) {
       ctx.addIssue({
@@ -541,6 +583,49 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       // A session registers a gate while it is running, not after it ended.
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
+    }
+    if (event.kind === "gui.state_found") ref("state", guiStates, event.state);
+    if (event.kind === "gui.transition_found" || event.kind === "gui.transition_taken") {
+      ref("transition", guiTransitions, event.transition);
+    }
+    if (event.kind === "gui.state_found" || event.kind === "gui.transition_found") {
+      const key = event.kind === "gui.state_found" ? event.state : event.transition;
+      const keyOf = (e: TraceEvent) =>
+        e.kind === "gui.state_found" ? e.state : e.kind === "gui.transition_found" ? e.transition : undefined;
+      const again = trace.events.some((e, j) => e.kind === event.kind && keyOf(e) === key && j !== i && precedes(j, i));
+      if (again) issue(event.kind === "gui.state_found" ? "state" : "transition", `"${key}" is found more than once`);
+    }
+    if (event.kind === "gui.transition_found" || event.kind === "gui.transition_taken") {
+      const t = trace.entities.transitions.find((x) => x.id === event.transition);
+      const foundBefore = (kind: "gui.state_found" | "gui.transition_found", key: string) =>
+        trace.events.some(
+          (e, j) =>
+            precedes(j, i) &&
+            ((kind === "gui.state_found" && e.kind === "gui.state_found" && e.state === key) ||
+              (kind === "gui.transition_found" && e.kind === "gui.transition_found" && e.transition === key)),
+        );
+      if (t && event.kind === "gui.transition_found") {
+        // A transition is learned between two states already found.
+        for (const end of [t.from, t.to]) {
+          if (guiStates.has(end) && !foundBefore("gui.state_found", end)) {
+            issue("transition", `"${t.id}" is found before its state "${end}"`);
+          }
+        }
+      }
+      if (t && event.kind === "gui.transition_taken") {
+        if (!foundBefore("gui.transition_found", t.id)) issue("transition", `"${t.id}" is taken before it is found`);
+        // A traversal is a path: each step starts where the previous one ended.
+        let previous = -1;
+        trace.events.forEach((e, j) => {
+          if (e.kind === "gui.transition_taken" && precedes(j, i) && (previous < 0 || precedes(previous, j))) previous = j;
+        });
+        const prev = previous >= 0 ? trace.events[previous] : undefined;
+        const prevT =
+          prev && prev.kind === "gui.transition_taken" ? trace.entities.transitions.find((x) => x.id === prev.transition) : undefined;
+        if (prevT && prevT.to !== t.from) {
+          issue("transition", `"${t.id}" starts at "${t.from}", but the traversal is at "${prevT.to}"`);
+        }
+      }
     }
     const repeat = lifeRepeats.get(i);
     if (repeat) issue("session", repeat);
