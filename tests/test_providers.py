@@ -26,7 +26,8 @@ REQUIRED = {
 
 def test_shipped_inventory_covers_every_provider_with_sourced_verdicts() -> None:
     inv = load_providers(REPO / "providers.yaml")
-    assert inv.operator_accounts_owed is True
+    # Answered 2026-10-17: no paid API; the operator's own web accounts.
+    assert inv.operator_accounts_owed is False
     assert REQUIRED <= {p.id for p in inv.providers}
     for p in inv.providers:
         for verdict in (p.automation_allowed, p.commercial_use, p.api_available):
@@ -40,20 +41,32 @@ def test_shipped_inventory_covers_every_provider_with_sourced_verdicts() -> None
 def test_d4_unknown_or_no_automation_keeps_the_adapter_off() -> None:
     inv = load_providers(REPO / "providers.yaml")
     for p in inv.providers:
-        if p.automation_allowed.value != "yes":
+        if p.automation_allowed.value != "yes" and p.operator_override is None:
             assert p.adapter_gate() is not None, p.id
             with pytest.raises(AdapterDisabledError):
                 build_adapter(p)
+    # The only rows that run despite a "no" are the operator-overridden wrapper
+    # rows, and they keep the "no" on record.
+    overridden = {p.id for p in inv.providers if p.operator_override is not None}
+    assert overridden == {"gemini-web", "chatgpt-web"}
+    for pid in overridden:
+        assert inv.get(pid).automation_allowed.value == "no"
+        assert inv.get(pid).adapter == "ui_bridge_wrapper"
 
 
-def test_no_gui_adapter_is_shipped() -> None:
-    """Every no-API provider's terms forbid (or do not confirm) UI automation,
-    so the honest D4 outcome is that no GUI-automation adapter exists."""
+def test_gui_adapters_exist_only_under_an_operator_override() -> None:
+    """Every no-API provider's terms forbid (or do not confirm) UI automation.
+    A GUI adapter exists only where the operator recorded an override (plan
+    2026-10-17-free-image-generation-local-gpu-and-private-ui-bridge-wrappers);
+    every other no-API row has none."""
     inv = load_providers(REPO / "providers.yaml")
     for p in inv.providers:
         if p.api_available.value != "yes":
-            assert p.adapter == "none", p.id
             assert p.automation_allowed.value in ("no", "unknown"), p.id
+            if p.operator_override is None:
+                assert p.adapter == "none", p.id
+            else:
+                assert p.adapter == "ui_bridge_wrapper", p.id
 
 
 def test_billed_apis_are_not_scheduled_without_an_operator_quota(
@@ -67,8 +80,9 @@ def test_billed_apis_are_not_scheduled_without_an_operator_quota(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     built = build_adapters(inv)
-    # The only adapter built is the unmetered local GPU; no billed API is.
-    assert set(built.adapters) == {"local-gpu"}
+    # Built: the unmetered local GPU and the operator's two free web accounts;
+    # no billed API is.
+    assert set(built.adapters) == {"local-gpu", "gemini-web", "chatgpt-web"}
     assert inv.get("local-gpu").capacity == "unmetered"
     assert "env var GEMINI_API_KEY is unset" in built.unavailable["gemini"]
     assert "automation_allowed is 'no'" in built.unavailable["bing"]

@@ -260,8 +260,11 @@ def test_runner_outcomes_are_typed(
 def test_transport_failures_split_on_whether_the_prompt_left(tmp_path: Path) -> None:
     adapter = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER)
     respx.post(DISPATCH).mock(side_effect=httpx.ConnectError("refused"))
-    with pytest.raises(ProviderBusy):
+    with pytest.raises(ProviderBusy) as busy:
         adapter.submit(_request(), tmp_path)
+    # Parked past the scheduler's 30-minute run horizon: a dead runner is not
+    # re-dialled for the whole run.
+    assert busy.value.retry_after_s == 3600
     respx.post(DISPATCH).mock(side_effect=httpx.ReadError("dropped"))
     with pytest.raises(ProviderOutcomeUnknown):
         adapter.submit(_request(), tmp_path)
