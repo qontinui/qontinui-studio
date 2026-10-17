@@ -50,13 +50,29 @@ export const sessionEntity = z
   })
   .strict();
 
+/**
+ * A system whose state the factory's twin mirrors (S2). Display label only:
+ * never a machine name, an account or a private repo (sibling D3).
+ */
+export const SOURCE_KINDS = ["repo-host", "ci", "machine", "session"] as const;
+export const sourceEntity = z
+  .object({
+    id,
+    kind: z.enum(SOURCE_KINDS),
+    label: z.string().min(1).max(40),
+  })
+  .strict();
+
 export const traceEntities = z
   .object({
     plans: z.array(planEntity).default([]),
     prs: z.array(prEntity).default([]),
     sessions: z.array(sessionEntity).default([]),
+    sources: z.array(sourceEntity).default([]),
   })
   .strict();
+
+export type EntityKind = keyof z.infer<typeof traceEntities>;
 
 // ---------------------------------------------------------------------------
 // Events
@@ -101,6 +117,38 @@ export const traceEvent = z.discriminatedUnion("kind", [
     .strict(),
   z.object({ ...eventBase, kind: z.literal("merge_train.queued"), ...prRef }).strict(),
   z.object({ ...eventBase, kind: z.literal("pr.landed"), ...prRef }).strict(),
+  // The digital twin (S2): state mirrored from a source, and what is decided
+  // from it.
+  z
+    .object({ ...eventBase, kind: z.literal("twin.mirrored"), source: id, fact: z.string().min(1).max(80) })
+    .strict(),
+  z
+    .object({
+      ...eventBase,
+      kind: z.literal("twin.decided"),
+      decision: z.string().min(1).max(80),
+      /** What in the twin the decision was made from. */
+      basis: z.string().min(1).max(80),
+    })
+    .strict(),
+  // The developer twin (S2): a session's question, answered from served
+  // documents rather than by waking the operator.
+  z
+    .object({ ...eventBase, kind: z.literal("question.asked"), session: id, question: z.string().min(1).max(120) })
+    .strict(),
+  z
+    .object({
+      ...eventBase,
+      kind: z.literal("question.answered"),
+      /** The id of the `question.asked` event this answers. */
+      question: id,
+      answer: z.string().min(1).max(120),
+      /** Where the answer came from: a served policy or intent document, or the operator. */
+      from: z.enum(["policy", "intent", "operator"]),
+      /** The document cited, e.g. "policy git-operations". */
+      document: z.string().min(1).max(60),
+    })
+    .strict(),
 ]);
 
 export type TraceEvent = z.infer<typeof traceEvent>;
@@ -120,6 +168,10 @@ export const EVENT_KINDS = [
   "ci.failed",
   "merge_train.queued",
   "pr.landed",
+  "twin.mirrored",
+  "twin.decided",
+  "question.asked",
+  "question.answered",
 ] as const satisfies readonly EventKind[];
 
 // ---------------------------------------------------------------------------
@@ -264,7 +316,9 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   const plans = unique("plans", trace.entities.plans.map((p) => p.id));
   const prs = unique("prs", trace.entities.prs.map((p) => p.id));
   const sessions = unique("sessions", trace.entities.sessions.map((s) => s.id));
+  const sources = unique("sources", trace.entities.sources.map((s) => s.id));
   unique("events", trace.events.map((e) => e.id));
+  const eventsById = new Map(trace.events.map((e) => [e.id, e]));
 
   trace.entities.prs.forEach((pr, i) => {
     if (!plans.has(pr.plan)) {
@@ -289,6 +343,23 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     if ("plan" in event) ref("plan", plans, event.plan);
     if ("pr" in event) ref("pr", prs, event.pr);
     if ("session" in event) ref("session", sessions, event.session);
+    if ("source" in event) ref("source", sources, event.source);
+    if (event.kind === "question.answered") {
+      const asked = eventsById.get(event.question);
+      if (!asked || asked.kind !== "question.asked") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["events", i, "question"],
+          message: `"${event.question}" is not a question.asked event`,
+        });
+      } else if (Date.parse(asked.at) > Date.parse(event.at)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["events", i, "at"],
+          message: `answered before question "${event.question}" was asked`,
+        });
+      }
+    }
 
     const at = Date.parse(event.at);
     if (at < rangeFrom || at > rangeTo) {

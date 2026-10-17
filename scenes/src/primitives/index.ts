@@ -1,9 +1,11 @@
 export { Caption, type CaptionProps } from "./Caption";
 export { Counter, type CounterProps } from "./Counter";
 export { Edge, type EdgeProps, type Point } from "./Edge";
+export { Feed, type FeedProps, type FeedRow } from "./Feed";
 export { Gate, type GateProps } from "./Gate";
 export { ModeLabel, type ModeLabelProps } from "./ModeLabel";
 export { Node, type NodeProps } from "./Node";
 export { PrCard, type PrCardProps } from "./PrCard";
+export { SceneHeader, type SceneHeaderProps } from "./SceneHeader";
 export { SessionLane, type SessionLaneProps } from "./SessionLane";
 export { Timeline, type TimelineProps, type TimelineTick } from "./Timeline";
