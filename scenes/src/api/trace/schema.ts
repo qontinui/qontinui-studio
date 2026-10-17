@@ -360,7 +360,6 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     const tb = Date.parse((trace.events[b] as TraceEvent).at);
     return ta < tb || (ta === tb && a < b);
   };
-  /** Index of the first event of `kind` for gate `gate`, or -1. */
   /** Index of the first event of `kind` for gate `gate` in timeline order, or -1. */
   const gateEvent = (kind: EventKind, gate: string) => {
     let first = -1;

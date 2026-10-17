@@ -174,12 +174,7 @@ const S2_CASES: readonly GoldenCase[] = [
   { id: "s2-digital-twin-1x1-long-labels", scene: "s2-digital-twin", aspect: "1:1", frames: [503], trace: s2LongLabelsTrace },
 ];
 
-/**
- * S3 (528 frames: 36-frame intro, one beat every 36): 0 intro, 150 the
- * condition observed after the wait (no session running), 251 the poster
- * (the first continuation running), 527 the end.
- */
-/** S3 with 80-character session labels and a 60-character condition (the schema maximums). */
+/** S3 with session labels near the 80-character maximum and a 60-character condition (the maximum). */
 export function s3LongLabelsTrace(): SceneTrace {
   const json = JSON.parse(readFileSync(illustrativeTraceFile("s3-gates-continuations"), "utf8"));
   json.entities.sessions.forEach((s: { label: string }, i: number) => {
@@ -189,6 +184,11 @@ export function s3LongLabelsTrace(): SceneTrace {
   return parseTrace(json);
 }
 
+/**
+ * S3 (528 frames: 36-frame intro, one beat every 36): 0 intro, 150 the
+ * condition observed after the wait (no session running), 251 the poster
+ * (the first continuation running), 527 the end.
+ */
 const S3_CASES: readonly GoldenCase[] = [
   ...illustrativeCases("s3-gates-continuations", { "16:9": [0, 150, 251, 527], "9:16": [251], "1:1": [251] }),
   { id: "s3-gates-continuations-9x16-long-labels", scene: "s3-gates-continuations", aspect: "9:16", frames: [251], trace: s3LongLabelsTrace },
