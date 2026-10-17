@@ -202,6 +202,7 @@ def test_done_stages_marked_images(tmp_path: Path) -> None:
             "aspectRatio": "1:1",
             "maxPerDay": 10,
             "minIntervalS": 90,
+            "budgetS": 280,
         },
     }
     assert adapter.poll(job).status == "done"

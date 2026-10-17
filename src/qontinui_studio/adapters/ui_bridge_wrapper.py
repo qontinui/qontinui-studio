@@ -89,6 +89,8 @@ RUNNER_URL_ENV = "STUDIO_RUNNER_URL"
 DISPATCH_TIMEOUT_S = 300.0
 CONNECT_TIMEOUT_S = 10.0
 TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
+# Kept back from the dispatch timeout when telling the wrapper its budget.
+BUDGET_MARGIN_S = 20
 # No runner listening, or a wrapper it cannot start, is not a busy site: park
 # the job past the scheduler's run horizon (30 min) so ``brief run`` returns at
 # once and reports it, rather than re-dialling a dead door for the whole run
@@ -210,6 +212,11 @@ class UIBridgeWrapperAdapter:
             "aspectRatio": request.aspect_ratio,
             "maxPerDay": self.override.max_per_day,
             "minIntervalS": self.override.min_interval_s,
+            # The wrapper's whole-run budget: inside the dispatch timeout this
+            # adapter asks the runner for, so a slow success is answered
+            # before the runner gives up on it (a success lost on the wire is
+            # still counted against the day's cap).
+            "budgetS": int(self.dispatch_timeout_s) - BUDGET_MARGIN_S,
         }
 
     def _space(self) -> None:
