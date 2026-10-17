@@ -118,7 +118,7 @@ export function MergeTrain({ trace, frame, layout, timeline }: SceneProps) {
         y={p.main.y}
         width={p.main.width}
         title="MAIN · LANDED"
-        rows={state.main.slice(-TRAIN_SLOTS)}
+        rows={state.main.slice(-TRAIN_SLOTS).map((r) => (layout.orientation === "square" ? { ...r, detail: r.short } : r))}
         capacity={TRAIN_SLOTS}
         empty="Nothing landed yet"
         unit={u}

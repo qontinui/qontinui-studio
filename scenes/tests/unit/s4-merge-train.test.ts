@@ -47,6 +47,22 @@ describe("S4 trace fields", () => {
     expect(errorsOf(json)).toContain('events.6.pr: pr.landed while "pr-412" is red (it needs ci.passed or merge_train.queued first)');
   });
 
+  it("tracks a conflict and red CI independently", () => {
+    const base = traceJson();
+    const run = (...kinds: string[]) =>
+      errorsOf({
+        ...base,
+        events: kinds.map((kind, n) => ({ id: `x${n}`, at: `2026-09-16T12:${String(n).padStart(2, "0")}:00Z`, kind, pr: "pr-412" })),
+      });
+    expect(run("merge_train.queued", "merge_train.conflicted", "ci.passed", "pr.landed").join("\n")).toMatch(/unresolved conflict/);
+    expect(
+      run("merge_train.queued", "merge_train.conflicted", "ci.failed", "ci.passed", "merge_train.rebased", "pr.landed").join("\n"),
+    ).toMatch(/unresolved conflict/);
+    expect(run("merge_train.queued", "merge_train.conflicted", "ci.passed", "merge_train.resolved", "merge_train.rebased", "pr.landed")).toEqual([]);
+    expect(run("merge_train.queued", "merge_train.conflicted", "ci.failed", "merge_train.resolved").join("\n")).not.toMatch(/resolved without/);
+    expect(run("merge_train.queued", "merge_train.conflicted", "ci.failed", "merge_train.resolved", "pr.landed").join("\n")).toMatch(/is red/);
+  });
+
   it("caps the scene at four PRs", () => {
     const json = traceJson();
     json.entities!.prs!.push({ id: "pr-5", plan: "plan-sync", repo: "example/sync-service", number: 5, title: "x" });
@@ -132,6 +148,15 @@ describe("S4 scene model", () => {
       [421, 0],
       [412, 0],
     ]);
+  });
+
+  it("keeps a conflicted PR out of line through a CI pass until it is resolved", () => {
+    const json = traceJson();
+    json.events.splice(11, 0, { id: "e90", at: "2026-09-16T10:04:00Z", kind: "ci.passed", pr: "pr-418" } as never);
+    const t = parseTrace(json);
+    const ttl = s4Timeline(t, STUDIO_FPS);
+    const pass = findBeat(ttl, (e) => e.id === "e90")!;
+    expect(s4State(t, ttl, pass.startFrame + ttl.beatFrames - 1).cars.find((c) => c.number === 418)?.aside).toBe(1);
   });
 
   it("puts the poster on the conflict with the next PR at the head", () => {

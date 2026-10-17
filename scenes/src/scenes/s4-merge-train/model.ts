@@ -64,7 +64,11 @@ const STATUS: Record<S4Kind, { text: string; level: AttentionLevel }> = {
 interface Standing {
   /** Order key: the beat that put it in line (queued / resolved / conflicted). */
   key: number;
-  /** Out of line: a conflict not yet resolved, or failed tests. */
+  /** An unresolved conflict. */
+  conflict: boolean;
+  /** Red CI not yet followed by a pass or a re-queue. */
+  red: boolean;
+  /** Out of line: conflict || red. */
   aside: boolean;
   landed: boolean;
   last: S4Kind;
@@ -76,17 +80,18 @@ function standings(beats: readonly Beat[], count: number): Map<string, Standing>
     const event = beat.event;
     if (!("pr" in event)) continue;
     const kind = event.kind as S4Kind;
-    const prev = out.get(event.pr);
-    if (kind === "merge_train.queued" || kind === "merge_train.resolved") {
-      out.set(event.pr, { key: beat.index, aside: false, landed: false, last: kind });
-    } else if (kind === "merge_train.conflicted" || kind === "ci.failed") {
-      out.set(event.pr, { key: beat.index, aside: true, landed: false, last: kind });
-    } else if (kind === "ci.passed" && prev?.aside && prev.last !== "merge_train.conflicted") {
-      // Green again after a red run: back in line, at the back.
-      out.set(event.pr, { key: beat.index, aside: false, landed: false, last: kind });
-    } else if (prev) {
-      out.set(event.pr, { ...prev, landed: kind === "pr.landed", last: kind });
-    }
+    const prev = out.get(event.pr) ?? { key: beat.index, conflict: false, red: false, aside: false, landed: false, last: kind };
+    const next = { ...prev, last: kind };
+    if (kind === "merge_train.queued") Object.assign(next, { conflict: false, red: false });
+    else if (kind === "merge_train.conflicted") next.conflict = true;
+    else if (kind === "merge_train.resolved") next.conflict = false;
+    else if (kind === "ci.failed") next.red = true;
+    else if (kind === "ci.passed") next.red = false;
+    else if (kind === "pr.landed") next.landed = true;
+    next.aside = next.conflict || next.red;
+    // Joining, leaving or rejoining the line moves a PR to the back.
+    if (!out.has(event.pr) || kind === "merge_train.queued" || next.aside !== prev.aside) next.key = beat.index;
+    out.set(event.pr, next);
   }
   return out;
 }
@@ -122,7 +127,8 @@ export interface S4State {
   title: string;
   cars: CarState[];
   /** Landed PRs, in landing order. */
-  main: { id: string; text: string; detail: string; level: AttentionLevel; appear: number }[];
+  /** `short` is the detail for narrow layouts. */
+  main: { id: string; text: string; detail: string; short: string; level: AttentionLevel; appear: number }[];
   landed: number;
   total: number;
   caption: { title: string; body: string; appear: number } | null;
@@ -184,6 +190,7 @@ export function s4State(trace: SceneTrace, timeline: Timeline, frame: number): S
       id: b.event.id,
       text: pr ? `#${pr.number} ${pr.title}` : b.event.id,
       detail: `landed ${formatTime(b.atMs)} · tested on this main`,
+      short: `landed ${formatTime(b.atMs)}`,
       level: "done" as AttentionLevel,
       appear: progress(frame, b.startFrame, fast, easings.enter),
     };

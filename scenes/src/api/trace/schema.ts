@@ -436,34 +436,29 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     }
     if (prs.has("pr" in event ? event.pr : "") && "pr" in event) {
       const pr = event.pr;
-      // The PR's standing just before this event: the latest queued /
-      // conflicted / resolved / ci.failed / ci.passed event for it.
-      let standing: EventKind | null = null;
-      let standingAt = -1;
-      trace.events.forEach((e, j) => {
-        if ("pr" in e && e.pr === pr && precedes(j, i) && (standingAt < 0 || precedes(standingAt, j))) {
-          if (
-            e.kind === "merge_train.queued" ||
-            e.kind === "merge_train.conflicted" ||
-            e.kind === "merge_train.resolved" ||
-            e.kind === "ci.failed" ||
-            e.kind === "ci.passed"
-          ) {
-            standing = e.kind;
-            standingAt = j;
-          }
-        }
-      });
-      if (event.kind === "merge_train.resolved" && standing !== "merge_train.conflicted") {
+      // Two independent flags, replayed in timeline order up to this event:
+      // an unresolved conflict (set by conflicted; cleared by resolved or a
+      // re-queue) and red CI (set by ci.failed; cleared by ci.passed or a
+      // re-queue).
+      let conflict = false;
+      let red = false;
+      trace.events
+        .map((e, j) => ({ e, j }))
+        .filter(({ e, j }) => "pr" in e && e.pr === pr && precedes(j, i))
+        .sort((a, b) => (precedes(a.j, b.j) ? -1 : 1))
+        .forEach(({ e }) => {
+          if (e.kind === "merge_train.conflicted") conflict = true;
+          else if (e.kind === "merge_train.resolved") conflict = false;
+          else if (e.kind === "ci.failed") red = true;
+          else if (e.kind === "ci.passed") red = false;
+          else if (e.kind === "merge_train.queued") conflict = red = false;
+        });
+      if (event.kind === "merge_train.resolved" && !conflict) {
         issue("pr", `merge_train.resolved without an unresolved merge_train.conflicted for "${pr}"`);
       }
-      // A conflicted PR is out of the train until it is resolved; a red one
-      // until it is green again or re-queued.
-      if ((event.kind === "merge_train.rebased" || event.kind === "pr.landed") && standing === "merge_train.conflicted") {
-        issue("pr", `${event.kind} while "${pr}" has an unresolved conflict`);
-      }
-      if ((event.kind === "merge_train.rebased" || event.kind === "pr.landed") && standing === "ci.failed") {
-        issue("pr", `${event.kind} while "${pr}" is red (it needs ci.passed or merge_train.queued first)`);
+      if (event.kind === "merge_train.rebased" || event.kind === "pr.landed") {
+        if (conflict) issue("pr", `${event.kind} while "${pr}" has an unresolved conflict`);
+        if (red) issue("pr", `${event.kind} while "${pr}" is red (it needs ci.passed or merge_train.queued first)`);
       }
       if (event.kind === "pr.landed") {
         const first = trace.events.findIndex((e, j) => e.kind === "pr.landed" && e.pr === pr && j !== i && precedes(j, i));
