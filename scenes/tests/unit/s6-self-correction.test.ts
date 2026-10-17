@@ -63,6 +63,44 @@ describe("S6 trace fields", () => {
     expect(missingRequirements(s6SelfCorrection, parseTrace(open))).toContain(
       "a closed loop: a red run, a fix after it, and a green run after the last fix",
     );
+    const human = traceJson();
+    human.entities!.sessions = [{ id: "s1", label: "Session" }];
+    human.events.push(
+      { id: "e90", at: "2026-09-18T14:22:00Z", kind: "question.asked", session: "s1", question: "What now?" } as never,
+      { id: "e91", at: "2026-09-18T14:23:00Z", kind: "question.answered", question: "e90", answer: "Do X", from: "operator" } as never,
+    );
+    expect(missingRequirements(s6SelfCorrection, parseTrace(human))).toContain("no operator step (the scene claims none)");
+  });
+
+  it("refuses a fix once the PR is green again", () => {
+    const json = traceJson();
+    json.events.push({ id: "e90", at: "2026-09-18T15:10:00Z", kind: "fix.pushed", pr: "pr-430", summary: "late" } as never);
+    expect(errorsOf(json).join("\n")).toMatch(/events.12.pr: fix.pushed without a diagnosis/);
+  });
+
+  it("says what each green was: first try, a re-run, or after a fix", () => {
+    const base = traceJson();
+    const play = (...kinds: string[]) => {
+      const t = parseTrace({
+        ...base,
+        events: kinds.map((kind, n) => ({
+          id: `x${n}`,
+          at: `2026-09-18T12:${String(n).padStart(2, "0")}:00Z`,
+          kind,
+          pr: "pr-430",
+          ...(kind === "ci.diagnosed" ? { cause: "c" } : kind === "fix.pushed" ? { summary: "s" } : {}),
+        })),
+      });
+      const ttl = s6Timeline(t, STUDIO_FPS);
+      return s6State(t, ttl, ttl.durationInFrames - 1);
+    };
+    expect(play("ci.started", "ci.passed").log.at(-1)?.detail).toBe("green on the first try");
+    expect(play("ci.started", "ci.failed", "ci.started", "ci.passed").log.at(-1)?.detail).toBe("green on a re-run");
+    const flaky = play("ci.failed", "ci.diagnosed", "fix.pushed", "ci.started", "ci.passed", "ci.failed", "ci.started", "ci.passed");
+    expect(flaky.log.at(-1)?.detail).toBe("green on a re-run");
+    expect(flaky.caption?.body).toBe("Every check passes.");
+    // No ci.started at all: the run after the fix still draws the loop-back edge.
+    expect(play("ci.failed", "ci.diagnosed", "fix.pushed", "ci.passed").edges.run).toBe(1);
   });
 
   it("follows exactly one PR", () => {
@@ -127,7 +165,7 @@ describe("S6 scene model", () => {
     expect(state.toGreenMs).toBe(46 * 60_000);
     expect(state.isGreen).toBe(true);
     expect(at("e07").isGreen).toBe(false);
-    expect(state.log.at(-1)).toMatchObject({ text: "Run 3 green · 14 checks", detail: "fixed by the session · no human step" });
+    expect(state.log.at(-1)).toMatchObject({ text: "Run 3 green · 14 checks", detail: "fix pushed · no human step" });
     // The exit edge to green does not redraw at the landing.
     const landed = at("e12", 0);
     expect(landed.edges.green).toBe(1);

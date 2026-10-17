@@ -162,22 +162,30 @@ export function s6State(trace: SceneTrace, timeline: Timeline, frame: number): S
   }
 
   // --- the session's log -----------------------------------------------------------------
-  // A result with no open run counts as a run of its own.
+  // A result with no open run counts as a run of its own. `fixedSinceRed`:
+  // a fix pushed since the latest red run (reset by each red). The loop-back
+  // edge (fix → run) is drawn by the first run that follows a fix.
   let run = 0;
   let open = false;
+  let sawRed = false;
   let fixedSinceRed = false;
+  let loopBeat: Beat | undefined;
   const log: S6State["log"] = [];
   for (const b of passed) {
     const e = b.event;
-    if ((e.kind === "ci.failed" || e.kind === "ci.passed") && !open) run++;
-    if (e.kind === "ci.started") {
+    const isResult = e.kind === "ci.failed" || e.kind === "ci.passed";
+    if (e.kind === "ci.started" || (isResult && !open)) {
       run++;
-      open = true;
-    } else if (e.kind === "ci.failed" || e.kind === "ci.passed") open = false;
+      if (fixedSinceRed) loopBeat = b;
+    }
+    if (e.kind === "ci.started") open = true;
+    else if (isResult) open = false;
     if (e.kind === "fix.pushed") fixedSinceRed = true;
     if (e.kind === "ci.failed") {
       const checks = e.checks !== undefined ? ` · ${e.checks} checks` : "";
       log.push({ id: e.id, text: `Run ${run} red${checks}`, detail: "CI reports the failure to the session", level: "attention", appear: appearOf(b) });
+      sawRed = true;
+      fixedSinceRed = false;
     } else if (e.kind === "ci.diagnosed") {
       log.push({ id: e.id, text: e.cause, detail: "diagnosis, from the CI log", level: "running", appear: appearOf(b) });
     } else if (e.kind === "fix.pushed") {
@@ -188,7 +196,7 @@ export function s6State(trace: SceneTrace, timeline: Timeline, frame: number): S
         id: e.id,
         text: `Run ${run} green${checks}`,
         // "No human step" is claimed only where the trace shows a correction.
-        detail: fixedSinceRed ? "fixed by the session · no human step" : "green on the first try",
+        detail: !sawRed ? "green on the first try" : fixedSinceRed ? "fix pushed · no human step" : "green on a re-run",
         level: "done",
         appear: appearOf(b),
       });
@@ -212,7 +220,14 @@ export function s6State(trace: SceneTrace, timeline: Timeline, frame: number): S
     const appear = appearOf(current);
     const text = (title: string, body: string) => ({ title, body: e.note ?? body, appear });
     if (e.kind === "pr.opened") caption = text("Pull request opened", "The change goes up for CI, as every change does.");
-    else if (e.kind === "ci.started") caption = text(run > 1 ? "CI runs again" : "CI runs", run > 1 ? "On the fix, automatically." : "Every required check runs.");
+    else if (e.kind === "ci.started") {
+      caption =
+        run <= 1
+          ? text("CI runs", "Every required check runs.")
+          : fixedSinceRed
+            ? text("CI runs again", "On the fix, automatically.")
+            : text("CI runs again", "The checks run again.");
+    }
     else if (e.kind === "ci.failed") caption = text("CI goes red", "The session that owns the PR reads the failure.");
     else if (e.kind === "ci.diagnosed") caption = text("Diagnosed", `From the CI log: ${sentence(e.cause)}`);
     else if (e.kind === "fix.pushed") caption = text("Fixed", `A fix is pushed: ${sentence(e.summary)}`);
@@ -224,8 +239,8 @@ export function s6State(trace: SceneTrace, timeline: Timeline, frame: number): S
     else if (e.kind === "pr.landed") caption = text("Landed", "The corrected change is on main.");
   }
 
-  // The loop-back edge (fix → run) exists only once CI runs again.
-  if (run <= 1) edges.run = 0;
+  // The loop-back edge (fix → run) exists only once a run follows a fix.
+  edges.run = loopBeat ? progress(frame, loopBeat.startFrame, slow) : 0;
 
   return {
     title: trace.meta.title,

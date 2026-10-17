@@ -588,7 +588,7 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
           else if (e.kind === "ci.failed") {
             red = true;
             diagnosed = fixed = false;
-          } else if (e.kind === "ci.passed") red = false;
+          } else if (e.kind === "ci.passed") red = diagnosed = fixed = false;
           else if (e.kind === "merge_train.queued") conflict = red = false;
           else if (e.kind === "ci.diagnosed") {
             diagnosed = true;

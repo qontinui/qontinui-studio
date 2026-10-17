@@ -224,7 +224,7 @@ The validator also checks that:
   PR, a conflicted PR is neither rebased nor landed until it is resolved, and
   a PR lands at most once;
 - a diagnosis is made only while its PR is red, and a fix answers the latest
-  red run's diagnosis, once;
+  red run's diagnosis, once, while the PR is still red;
 - a claim is acquired only when no session holds it (the holder may not
   re-acquire it), released only by its holder, and contended only against the
   session holding it at that point; a session's end releases its claims; and

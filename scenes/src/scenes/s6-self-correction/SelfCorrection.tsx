@@ -65,7 +65,7 @@ function place(layout: Layout): Placement {
   const sideX = safe.x + 500 * u;
   return {
     header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
-    at: ring({ x: safe.x + 215 * u, y: 540 * u }, 135 * u, 150 * u, 175 * u),
+    at: ring({ x: safe.x + 215 * u, y: 540 * u }, 135 * u, 150 * u, 210 * u),
     node: { width: 160 * u, height: 68 * u },
     pr: { x: sideX, y: 300 * u, width: right - sideX },
     log: { x: sideX, y: 450 * u, width: right - sideX, rows: LOG_ROWS },
