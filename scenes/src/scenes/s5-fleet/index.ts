@@ -20,6 +20,10 @@ export const s5Fleet = defineScene({
     if (machines.length > MAX_MACHINES) problems.push(`at most ${MAX_MACHINES} machines (the trace has ${machines.length})`);
     const homeless = sessions.filter((s) => s.machine === undefined).map((s) => s.id);
     if (homeless.length) problems.push(`every session on a machine (not: ${homeless.join(", ")})`);
+    const started = new Set(trace.events.flatMap((e) => (e.kind === "session.started" ? [e.session] : [])));
+    const acting = new Set(trace.events.flatMap((e) => ("session" in e && e.session !== undefined ? [e.session] : [])));
+    const unstarted = [...acting].filter((id) => !started.has(id));
+    if (unstarted.length) problems.push(`a session.started for every session that acts (not: ${unstarted.join(", ")})`);
     for (const m of machines) {
       const n = sessions.filter((s) => s.machine === m.id).length;
       if (n > SESSIONS_PER_MACHINE) problems.push(`at most ${SESSIONS_PER_MACHINE} sessions per machine (${m.id} has ${n})`);

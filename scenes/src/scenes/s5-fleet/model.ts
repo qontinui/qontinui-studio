@@ -86,26 +86,33 @@ export function s5State(trace: SceneTrace, timeline: Timeline, frame: number): S
     const mine = passed.filter((b) => "session" in b.event && b.event.session === sessionId && isS5Kind(b.event.kind));
     const start = mine.find((b) => b.event.kind === "session.started");
     if (!start) return null;
-    const worktree = [...mine].reverse().find((b) => b.event.kind === "worktree.allocated");
-    const last = mine[mine.length - 1] as Beat;
-    const e = last.event;
+    // What the session holds now: acquired, not yet released; its end releases all.
+    let held: string[] = [];
+    let repo: string | null = null;
+    for (const b of mine) {
+      const e = b.event;
+      if (e.kind === "worktree.allocated") repo = e.repo;
+      else if (e.kind === "claim.acquired") held.push(e.resource);
+      else if (e.kind === "claim.released") held = held.filter((r) => r !== e.resource);
+      else if (e.kind === "session.ended") held = [];
+    }
+    const e = (mine[mine.length - 1] as Beat).event;
     let detail = "starting";
     let level: AttentionLevel = "running";
-    if (e.kind === "worktree.allocated") detail = "in its own worktree";
-    else if (e.kind === "intent.declared") detail = `intent: ${e.intent}`;
-    else if (e.kind === "claim.acquired") detail = `holds ${e.resource}`;
-    else if (e.kind === "claim.contended") {
+    if (e.kind === "session.ended") {
+      detail = "done · claims released, worktree reclaimed";
+      level = "done";
+    } else if (e.kind === "claim.contended") {
       detail = `${e.resource} is taken · picks other work`;
       level = "waiting";
-    } else if (e.kind === "claim.released") detail = `released ${e.resource}`;
-    else if (e.kind === "session.ended") {
-      detail = "done";
-      level = "done";
-    }
-    const repo = worktree && worktree.event.kind === "worktree.allocated" ? worktree.event.repo : null;
+    } else if (held.length) detail = `holds ${held.join(", ")}`;
+    else if (e.kind === "intent.declared") detail = `intent: ${e.intent}`;
+    else if (e.kind === "claim.released") detail = `released ${e.resource}`;
+    else if (repo) detail = "in its own worktree";
     return {
       id: sessionId,
-      text: repo ? `${label} · worktree of ${repo}` : label,
+      // The worktree goes with the session: shown while it runs, gone once it ends.
+      text: repo && level !== "done" ? `${label} · ${repo}` : label,
       detail,
       level,
       appear: appearOf(start),
@@ -130,7 +137,7 @@ export function s5State(trace: SceneTrace, timeline: Timeline, frame: number): S
     const e = b.event;
     const who = "session" in e ? sessionLabel(e.session) : "";
     if (e.kind === "intent.declared") {
-      log.push({ id: e.id, text: e.intent, detail: `intent declared by ${who}`, level: "landing", appear: appearOf(b) });
+      log.push({ id: e.id, text: e.intent, detail: `intent declared by ${who}`, level: "running", appear: appearOf(b) });
     } else if (e.kind === "claim.acquired") {
       log.push({ id: e.id, text: e.resource, detail: `claimed by ${who}`, level: "running", appear: appearOf(b) });
     } else if (e.kind === "claim.contended") {
@@ -165,7 +172,7 @@ export function s5State(trace: SceneTrace, timeline: Timeline, frame: number): S
     } else if (e.kind === "claim.contended") {
       caption = text("Already claimed", `${e.resource} is held by ${sessionLabel(e.holder)}, so ${who} picks other work instead of colliding.`);
     } else if (e.kind === "claim.released") {
-      caption = text("Released", `${who} releases ${e.resource} once its work has landed.`);
+      caption = text("Released", `${who} releases ${e.resource} once it is done with it.`);
     } else if (e.kind === "session.ended") {
       caption = text("Done", `${who} ends; its claims are released and its worktree is reclaimed.`);
     }

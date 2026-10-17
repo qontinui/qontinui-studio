@@ -46,10 +46,51 @@ describe("S5 trace fields", () => {
     expect(errorsOf(stray)).toContain('events.16.resource: "s3" releases "sync/worker.ts" without holding it');
   });
 
+  it("orders claims by time, then by position, whatever the array order", () => {
+    // The release listed first but later in time is accepted.
+    const json = traceJson();
+    const release = json.events.splice(16, 1)[0]!;
+    json.events.unshift(release);
+    expect(errorsOf(json)).toEqual([]);
+    // An acquire at the release's instant: refused before it, accepted after it.
+    const before = traceJson();
+    const grab = { id: "e98", at: before.events[16]!.at, kind: "claim.acquired", session: "s2", resource: "sync/worker.ts" };
+    before.events.splice(16, 0, grab as never);
+    expect(errorsOf(before)).toContain('events.16.resource: "sync/worker.ts" is already held by "s1"');
+    const after = traceJson();
+    after.events.splice(17, 0, grab as never);
+    expect(errorsOf(after)).toEqual([]);
+  });
+
+  it("releases a session's claims when it ends, and refuses acting outside its life", () => {
+    const json = traceJson();
+    json.events = json.events.filter((e) => e.id !== "e17");
+    json.events.push({ id: "e98", at: "2026-09-17T10:00:00Z", kind: "claim.acquired", session: "s2", resource: "sync/worker.ts" } as never);
+    expect(errorsOf(json)).toEqual([]);
+    const late = traceJson();
+    late.events.push({ id: "e99", at: "2026-09-17T10:00:00Z", kind: "intent.declared", session: "s1", intent: "one more thing" } as never);
+    expect(errorsOf(late)).toContain('events.18.session: "s1" acts after it ended (intent.declared)');
+    const early = traceJson();
+    early.events[10]!.at = "2026-09-17T09:13:30Z";
+    expect(errorsOf(early)).toContain('events.11.session: "s3" acts before it started (worktree.allocated)');
+  });
+
+  it("refuses a holder re-acquiring its own claim", () => {
+    const json = traceJson();
+    json.events.push({ id: "e99", at: "2026-09-17T09:04:00Z", kind: "claim.acquired", session: "s1", resource: "sync/worker.ts" } as never);
+    expect(errorsOf(json)).toContain('events.18.resource: "s1" already holds "sync/worker.ts"');
+  });
+
   it("lets a released claim be taken again", () => {
     const json = traceJson();
     json.events.push({ id: "e99", at: "2026-09-17T10:00:00Z", kind: "claim.acquired", session: "s2", resource: "sync/worker.ts" } as never);
     expect(errorsOf(json)).toEqual([]);
+  });
+
+  it("needs every acting session to have started", () => {
+    const json = traceJson();
+    json.events = json.events.filter((e) => e.id !== "e11");
+    expect(missingRequirements(s5Fleet, parseTrace(json))).toContain("a session.started for every session that acts (not: s3)");
   });
 
   it("checks machines and sessions per machine", () => {
@@ -70,7 +111,7 @@ describe("S5 scene model", () => {
   it("puts sessions on their machines as they start, each with its worktree", () => {
     expect(s5State(trace, tl, 0).machines.every((m) => m.sessions.length === 0)).toBe(true);
     const state = at("e02");
-    expect(state.machines[0]?.sessions).toMatchObject([{ text: "Session 1 · worktree of example/sync-service", detail: "in its own worktree" }]);
+    expect(state.machines[0]?.sessions).toMatchObject([{ text: "Session 1 · example/sync-service", detail: "in its own worktree" }]);
     expect(state.caption?.title).toBe("Its own worktree");
   });
 
@@ -90,7 +131,22 @@ describe("S5 scene model", () => {
     expect(state.machines.map((m) => m.sessions.length)).toEqual([2, 1, 1]);
     const end = s5State(trace, tl, tl.durationInFrames - 1);
     expect(end.running).toBe(3);
-    expect(end.machines[0]?.sessions[0]).toMatchObject({ level: "done", detail: "done" });
+    expect(end.machines[0]?.sessions[0]).toMatchObject({
+      text: "Session 1",
+      level: "done",
+      detail: "done · claims released, worktree reclaimed",
+    });
+  });
+
+  it("shows everything a session holds, not only its latest event", () => {
+    const json = traceJson();
+    json.events.push({ id: "e98", at: "2026-09-17T09:19:00Z", kind: "claim.acquired", session: "s4", resource: "sync/cli.ts" } as never);
+    json.events.push({ id: "e99", at: "2026-09-17T09:20:00Z", kind: "claim.released", session: "s4", resource: "sync/config.ts" } as never);
+    const more = parseTrace(json);
+    const mtl = s5Timeline(more, STUDIO_FPS);
+    const s4 = (id: string) => s5State(more, mtl, findBeat(mtl, (e) => e.id === id)!.startFrame + 5).machines[0]?.sessions[1];
+    expect(s4("e98")?.detail).toBe("holds sync/config.ts, sync/cli.ts");
+    expect(s4("e99")?.detail).toBe("holds sync/cli.ts");
   });
 
   it("keeps the log to its capacity", () => {

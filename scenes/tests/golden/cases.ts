@@ -218,11 +218,11 @@ const S4_CASES: readonly GoldenCase[] = [
 ];
 
 /**
- * S5 (588 frames: 36-frame intro, one beat every 27): 0 intro, 260 the
+ * S5 (588 frames: 36-frame intro, one beat every 27): 0 intro, 240 the
  * avoided collision (Session 2 finds sync/worker.ts held), 467 the poster
  * (every session at work), 587 the end (Session 1 done).
  */
-const S5_CASES = illustrativeCases("s5-fleet", { "16:9": [0, 260, 467, 587], "9:16": [467], "1:1": [467] });
+const S5_CASES = illustrativeCases("s5-fleet", { "16:9": [0, 240, 467, 587], "9:16": [467], "1:1": [240, 467] });
 
 export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES, ...S4_CASES, ...S5_CASES];
 

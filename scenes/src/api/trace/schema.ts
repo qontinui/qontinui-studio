@@ -207,7 +207,17 @@ export const traceEvent = z.discriminatedUnion("kind", [
     .object({ ...eventBase, kind: z.literal("intent.declared"), session: id, intent: z.string().min(1).max(80) })
     .strict(),
   z
-    .object({ ...eventBase, kind: z.literal("claim.acquired"), session: id, resource: z.string().min(1).max(60) })
+    .object({
+      ...eventBase,
+      kind: z.literal("claim.acquired"),
+      session: id,
+      /**
+       * What is claimed, as display text. Illustrative traces may name a file;
+       * a replay adapter must not feed real paths here (they can leak private
+       * structure) — map to a coarse kind instead.
+       */
+      resource: z.string().min(1).max(60),
+    })
     .strict(),
   z
     .object({
@@ -412,20 +422,6 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       });
     }
   });
-  /** Is `resource` held by `session` just before event `i` (timeline order)? */
-  const holds = (session: string, resource: string, i: number) => {
-    let held = false;
-    trace.events
-      .map((e, j) => ({ e, j }))
-      .filter(({ j }) => precedes(j, i))
-      .sort((a, b) => (precedes(a.j, b.j) ? -1 : 1))
-      .forEach(({ e }) => {
-        if ((e.kind === "claim.acquired" || e.kind === "claim.released") && e.session === session && e.resource === resource) {
-          held = e.kind === "claim.acquired";
-        }
-      });
-    return held;
-  };
   unique("events", trace.events.map((e) => e.id));
   const eventsById = new Map(trace.events.map((e) => [e.id, e]));
   const answeredQuestions = new Set<string>();
@@ -443,6 +439,38 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     });
     return first;
   };
+
+  // The fleet (S5), in one pass in timeline order: who holds each claim, and
+  // where each session is in its life, just before every event. A session's
+  // end releases its claims (its worktree is reclaimed with them).
+  const FLEET_KINDS: readonly EventKind[] = [
+    "worktree.allocated",
+    "intent.declared",
+    "claim.acquired",
+    "claim.contended",
+    "claim.released",
+  ];
+  const holderBefore = new Map<number, string | undefined>();
+  const lifeBefore = new Map<number, "unstarted" | "running" | "ended">();
+  {
+    const order = trace.events.map((_, j) => j).sort((a, b) => (precedes(a, b) ? -1 : precedes(b, a) ? 1 : 0));
+    const holder = new Map<string, string>();
+    const life = new Map<string, "running" | "ended">();
+    for (const j of order) {
+      const e = trace.events[j] as TraceEvent;
+      if ("resource" in e) holderBefore.set(j, holder.get(e.resource));
+      if (FLEET_KINDS.includes(e.kind) && "session" in e && e.session !== undefined) {
+        lifeBefore.set(j, life.get(e.session) ?? "unstarted");
+      }
+      if (e.kind === "session.started") life.set(e.session, "running");
+      else if (e.kind === "session.ended") {
+        life.set(e.session, "ended");
+        for (const [resource, who] of [...holder]) if (who === e.session) holder.delete(resource);
+      } else if (e.kind === "claim.acquired" && !holder.has(e.resource)) holder.set(e.resource, e.session);
+      else if (e.kind === "claim.released" && holder.get(e.resource) === e.session) holder.delete(e.resource);
+    }
+  }
+  const startedSessions = new Set(trace.events.flatMap((e) => (e.kind === "session.started" ? [e.session] : [])));
 
   trace.entities.prs.forEach((pr, i) => {
     if (!plans.has(pr.plan)) {
@@ -501,34 +529,27 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
     }
-    if (event.kind === "claim.contended") {
-      ref("holder", sessions, event.holder);
-      if (event.holder === event.session) {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["events", i, "holder"], message: "a session cannot contend with itself" });
-      } else if (sessions.has(event.holder) && !holds(event.holder, event.resource, i)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["events", i, "holder"],
-          message: `"${event.holder}" does not hold "${event.resource}" at that point`,
-        });
+    if (FLEET_KINDS.includes(event.kind) && "session" in event && event.session !== undefined) {
+      const life = lifeBefore.get(i);
+      if (life === "ended") issue("session", `"${event.session}" acts after it ended (${event.kind})`);
+      else if (life === "unstarted" && startedSessions.has(event.session)) {
+        issue("session", `"${event.session}" acts before it started (${event.kind})`);
       }
     }
-    if (event.kind === "claim.released" && !holds(event.session, event.resource, i)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["events", i, "resource"],
-        message: `"${event.session}" releases "${event.resource}" without holding it`,
-      });
+    if (event.kind === "claim.contended") {
+      ref("holder", sessions, event.holder, "session");
+      if (event.holder === event.session) issue("holder", "a session cannot contend with itself");
+      else if (sessions.has(event.holder) && holderBefore.get(i) !== event.holder) {
+        issue("holder", `"${event.holder}" does not hold "${event.resource}" at that point`);
+      }
+    }
+    if (event.kind === "claim.released" && holderBefore.get(i) !== event.session) {
+      issue("resource", `"${event.session}" releases "${event.resource}" without holding it`);
     }
     if (event.kind === "claim.acquired") {
-      const other = trace.entities.sessions.find((s) => s.id !== event.session && holds(s.id, event.resource, i));
-      if (other) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["events", i, "resource"],
-          message: `"${event.resource}" is already held by "${other.id}"`,
-        });
-      }
+      const held = holderBefore.get(i);
+      if (held === event.session) issue("resource", `"${event.session}" already holds "${event.resource}"`);
+      else if (held !== undefined) issue("resource", `"${event.resource}" is already held by "${held}"`);
     }
     if (prs.has("pr" in event ? event.pr : "") && "pr" in event) {
       const pr = event.pr;

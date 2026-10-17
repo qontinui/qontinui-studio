@@ -220,9 +220,11 @@ The validator also checks that:
 - in the merge train, a resolution answers an unresolved conflict of the same
   PR, a conflicted PR is neither rebased nor landed until it is resolved, and
   a PR lands at most once;
-- a claim is acquired only when no other session holds it, released only by
-  a session that holds it, and contended only against a session that holds
-  it at that point;
+- a claim is acquired only when no session holds it (the holder may not
+  re-acquire it), released only by its holder, and contended only against the
+  session holding it at that point; a session's end releases its claims; and
+  a session allocates worktrees, declares intent and handles claims only
+  between its start and its end;
 - replay events fall inside `date_range`;
 - an illustrative trace never claims a build-record source, and a replay never
   claims a hand-authored one;
@@ -237,7 +239,7 @@ Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
 may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
 sessions, S4 at most four PRs, S5 at most three machines with two sessions
-each, every session on a machine).
+each, every session on a machine and started before it acts).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The
