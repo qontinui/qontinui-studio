@@ -115,6 +115,10 @@ class AdapterSet:
     unavailable: dict[str, str] = field(default_factory=dict)
     refusal: GatewayRefusal | None = None
     route: str | None = None
+    # Adapters that may only COLLECT jobs already submitted to them (poll and
+    # download), never take a new one: the image-generation dial's
+    # ``local_only`` puts cloud and gateway adapters here.
+    poll_only: dict[str, ProviderAdapter] = field(default_factory=dict)
 
 
 def build_adapters(

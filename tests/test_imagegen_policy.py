@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,14 @@ from qontinui_studio.imagegen_policy import (
     PolicyDecision,
     restrict,
 )
-from qontinui_studio.pipeline import Context, drive_batch, new_batch, resume_all, run_brief
+from qontinui_studio.pipeline import (
+    Context,
+    _request_for,
+    drive_batch,
+    new_batch,
+    resume_all,
+    run_brief,
+)
 from qontinui_studio.providers import load_providers
 
 from .conftest import FakeClock
@@ -86,9 +94,14 @@ OPENAI_ROW = """
 """
 
 
-def _jwt(exp: float) -> str:
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=")
+def _jwt(exp: object, **claims: object) -> str:
+    raw = json.dumps({"exp": exp, **claims}).encode()  # NaN/Infinity allowed
+    payload = base64.urlsafe_b64encode(raw).rstrip(b"=")
     return f"h.{payload.decode()}.s"
+
+
+TENANT = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+MINT_URL = "http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token"
 
 
 class Dial:
@@ -124,8 +137,8 @@ def _status(ctx: Context, batch: str) -> str:
 
 
 class Counting(FakeImageAdapter):
-    def __init__(self, pid: str) -> None:
-        super().__init__(pid, "m")
+    def __init__(self, pid: str, pending_polls: int = 0) -> None:
+        super().__init__(pid, "m", pending_polls=pending_polls)
         self.calls = 0
 
     def submit(self, request: Any, staging_dir: Path) -> Any:
@@ -211,9 +224,10 @@ def test_the_runner_mint_is_the_last_rung_for_production_coord(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv("COORD_DEVICE_JWT", raising=False)
-    monkeypatch.setenv("STUDIO_COORD_TENANT_ID", "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a")
-    mint = respx.post("http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token").mock(
-        return_value=httpx.Response(200, json={"success": True, "data": "minted.jwt.token"})
+    monkeypatch.setenv("STUDIO_COORD_TENANT_ID", TENANT)
+    minted = _jwt(time.time() + 3600, tenant_id=TENANT.upper())
+    mint = respx.post(MINT_URL).mock(
+        return_value=httpx.Response(200, json={"success": True, "data": minted})
     )
     read = respx.get("https://coord.qontinui.io/coord/fleet-policy").mock(
         return_value=httpx.Response(
@@ -229,15 +243,61 @@ def test_the_runner_mint_is_the_last_rung_for_production_coord(
     assert json.loads(mint.calls.last.request.content) == {
         "args": {"tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"}
     }
-    assert read.calls.last.request.headers["Authorization"] == "Bearer minted.jwt.token"
-    # A runner URL off this machine is never asked.
+    assert read.calls.last.request.headers["Authorization"] == f"Bearer {minted}"
+    # A runner URL off this machine is never asked — including a NAME that only
+    # looks like a loopback address.
+    for url in ("http://10.0.0.5:9876", "http://127.evil.example:9876", "http://127.0.0.1.nip.io"):
+        r = CoordDialReader(
+            "https://coord.qontinui.io", jwt_file=tmp_path / "none", runner=lambda u=url: u
+        )(None)
+        assert r.level is None and "not loopback" in r.reason, url
+    assert mint.call_count == 1
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("token", "why"),
+    [
+        (_jwt(time.time() + 3600, tenant_id="0e7c0000-0000-0000-0000-000000000000"), "tenant_id"),
+        (_jwt(time.time() + 3600), "tenant_id"),
+        (_jwt(time.time() - 60, tenant_id=TENANT), "expired"),
+        (_jwt(float("nan"), tenant_id=TENANT), "expired"),
+        (_jwt("tomorrow", tenant_id=TENANT), "expired"),
+    ],
+    ids=["other-tenant", "no-tenant-claim", "expired", "nan-exp", "string-exp"],
+)
+def test_a_minted_token_for_another_tenant_or_expired_is_discarded(
+    token: str, why: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("COORD_DEVICE_JWT", raising=False)
+    monkeypatch.setenv("STUDIO_COORD_TENANT_ID", TENANT)
+    respx.post(MINT_URL).mock(return_value=httpx.Response(200, json={"data": token}))
+    read = respx.get("https://coord.qontinui.io/coord/fleet-policy").mock(
+        return_value=httpx.Response(200, json={"effective_level": "on"})
+    )
     r = CoordDialReader(
         "https://coord.qontinui.io",
         jwt_file=tmp_path / "none",
-        runner=lambda: "http://10.0.0.5:9876",
+        runner=lambda: "http://127.0.0.1:9876",
     )(None)
-    assert r.level is None and "not loopback" in r.reason
-    assert mint.call_count == 1
+    assert r.level is None and why in r.reason
+    assert read.call_count == 0, "a discarded token is never sent to coord"
+
+
+def test_only_literal_loopback_or_localhost_counts_as_loopback() -> None:
+    loop = imagegen_policy._is_loopback_url
+    assert loop("http://localhost:9876") and loop("http://127.0.0.2:9876")
+    assert loop("http://[::1]:9876")
+    assert not loop("http://127.evil.example:9876") and not loop("http://localhost.evil:1")
+
+
+def test_a_non_numeric_exp_counts_as_expired() -> None:
+    assert imagegen_policy.jwt_expired(_jwt(float("nan")))
+    assert imagegen_policy.jwt_expired(_jwt(float("inf")))
+    assert imagegen_policy.jwt_expired(_jwt("9999999999"))
+    assert imagegen_policy.jwt_expired(_jwt(True))
+    assert not imagegen_policy.jwt_expired(_jwt(time.time() + 60))
+    assert not imagegen_policy.jwt_expired("not-a-jwt")
 
 
 @respx.mock
@@ -352,6 +412,10 @@ def test_a_reading_is_reused_for_one_poll_then_read_again(
 # ---------------------------------------------------------------------------
 # Enforcement: which adapters each level admits
 # ---------------------------------------------------------------------------
+
+
+def _template(loaded: Any) -> Any:
+    return _request_for(loaded)[1]
 
 
 def _decision(level: str) -> PolicyDecision:
@@ -471,6 +535,95 @@ def test_a_running_batch_stops_within_one_poll_of_the_dial_going_off(
     assert calls == calls_at_flip, "no provider call after the dial went off"
     [batch] = [r[0] for r in ctx.conn.execute("SELECT id FROM batches")]
     assert _status(ctx, batch) == "generating"
+
+
+@pytest.mark.parametrize("poll_interval_s", [0.0, 60.0])
+def test_the_dial_is_checked_before_every_provider_call_within_one_step(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    clock: FakeClock,
+    poll_interval_s: float,
+) -> None:
+    """Four variants are due in ONE scheduler step. The dial flips off during
+    the first submit (a slow cloud call: 61 s pass, past the 60 s cache): no
+    other variant is submitted, and the batch is not generated."""
+    dial = Dial("on")
+    ctx = make_context(imagegen=ImagegenPolicy(dial, poll_interval_s=poll_interval_s))
+    submits: list[str] = []
+
+    class Slow(FakeImageAdapter):
+        def submit(self, request: Any, staging_dir: Path) -> Any:
+            submits.append(request.job_id)
+            clock.sleep(61)
+            dial.level = "off"
+            return super().submit(request, staging_dir)
+
+    ctx.adapters.adapters["fake"] = Slow("fake", "m")
+    with pytest.raises(ImageGenerationRefused):
+        run_brief(ctx, write_brief(variants=4), publish=False)
+    assert len(submits) == 1, f"submits after the dial went off: {submits[1:]}"
+    [batch] = [r[0] for r in ctx.conn.execute("SELECT id FROM batches")]
+    assert _status(ctx, batch) == "generating"
+    queued = ctx.conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'queued' AND provider IS NULL"
+    ).fetchone()[0]
+    assert queued == 3
+
+
+def test_a_batch_with_no_job_due_is_still_refused_typed(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path], clock: FakeClock
+) -> None:
+    dial = Dial("on")
+    ctx = make_context(imagegen=ImagegenPolicy(dial, poll_interval_s=0))
+    batch = new_batch(ctx, load_brief(write_brief()), publish=False)
+    later = (clock() + timedelta(hours=6)).isoformat()
+    ctx.conn.execute("UPDATE jobs SET next_attempt_at = ?", (later,))
+    ctx.conn.commit()
+    dial.level = "off"
+    with pytest.raises(ImageGenerationRefused):
+        drive_batch(ctx, batch, publish=False)
+
+
+def test_local_only_still_collects_a_job_already_submitted_to_a_cloud_provider(
+    studio_root: Path,
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    _with(studio_root, OPENAI_ROW)
+    inv = load_providers(studio_root / "providers.yaml")
+    dial = Dial("on")
+    ctx = make_context(inventory=inv, imagegen=ImagegenPolicy(dial, poll_interval_s=0))
+    ctx.adapters = build_adapters(inv)
+    cloud = Counting("openai", pending_polls=1)
+    ctx.adapters.adapters["openai"] = cloud
+    loaded = load_brief(write_brief(providers="openai, fake", variants=2))
+    batch = new_batch(ctx, loaded, publish=False)
+    # One variant is submitted to the cloud while the dial is on...
+    one = ctx.conn.execute("SELECT id FROM jobs ORDER BY id").fetchall()
+    ctx.conn.execute(
+        "UPDATE jobs SET next_attempt_at = ? WHERE id = ?",
+        ((ctx.clock() + timedelta(hours=1)).isoformat(), one[1]["id"]),
+    )
+    ctx.conn.commit()
+    ctx.scheduler().step({batch: (loaded.brief.provider_preference, _template(loaded))})
+    assert cloud.calls == 1
+    in_flight = ctx.conn.execute(
+        "SELECT status, provider FROM jobs WHERE id = ?", (one[0]["id"],)
+    ).fetchone()
+    assert tuple(in_flight) == ("submitted", "openai"), "the cloud job is still in flight"
+    ctx.conn.execute("UPDATE jobs SET next_attempt_at = ?", (ctx.clock().isoformat(),))
+    ctx.conn.commit()
+    # ...then the dial goes local_only: that job is still collected from the
+    # cloud (paid work is not lost); the other variant goes to the local host.
+    dial.level = "local_only"
+    out = drive_batch(ctx, batch, publish=False)
+    assert out.status == "generated", out
+    assert cloud.calls == 1, "no NEW submission to the cloud under local_only"
+    providers = dict(ctx.conn.execute("SELECT id, provider FROM jobs").fetchall())
+    assert providers[one[0]["id"]] == "openai", "collected from the cloud, not re-generated"
+    assert sorted(providers.values()) == ["fake", "openai"]
 
 
 @respx.mock

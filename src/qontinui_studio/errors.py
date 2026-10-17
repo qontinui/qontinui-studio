@@ -118,8 +118,9 @@ class ImageGenerationRefused(StudioError):
     """Image calls refused by the image-generation off-switch: coord's
     ``image_generation`` dial for the tenant (or for the consumer repo), or this
     machine's ``QONTINUI_IMAGEGEN=0`` (plan 2026-10-13 Phase 12, D1.7). No
-    provider call is made and the batch stays ``generating``, so turning the
-    switch back on resumes it. ``code`` says which refusal:
+    further provider call is made for the batch (calls already made before the
+    refusal stand), and the batch stays ``generating``, so turning the switch
+    back on resumes it. ``code`` says which refusal:
 
     * ``image_generation_off`` — the effective level is ``off``;
     * ``image_generation_local_only`` — the level is ``local_only`` and none of

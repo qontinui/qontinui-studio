@@ -99,8 +99,8 @@ class Context:
     # Told about every wait before it is slept (seconds, why) — the CLI prints it.
     on_wait: Callable[[float, str], None] | None = None
     # The image-generation off-switches (coord's dial + QONTINUI_IMAGEGEN),
-    # consulted before every batch is driven and before every scheduler
-    # iteration (plan 2026-10-13 Phase 12).
+    # consulted before every batch is driven and before every provider call
+    # (each submit and each poll/download) (plan 2026-10-13 Phase 12).
     imagegen: ImagegenPolicy = field(default_factory=ImagegenPolicy)
 
     def scheduler(self, adapters: AdapterSet | None = None) -> Scheduler:
@@ -569,8 +569,9 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
             ctx.conn.commit()
         raise ConfigError(reason)
     outcome = BatchOutcome(batch_id=batch_id, status=row["status"])
-    # The off-switches, before any provider call; read again before every
-    # scheduler iteration below.
+    # The off-switches, decided before driving: a batch with no job due yet is
+    # still refused (typed) rather than returning silently. Decided again before
+    # every provider call the scheduler makes (``guard`` below).
     repos = target_repos(ctx, _batch_sites(row))
     preference = loaded.brief.provider_preference
     adapters, decision = policy_adapters(ctx, repos, preference)
@@ -578,19 +579,19 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
     outcome.imagegen = decision.describe()
     scheduler = ctx.scheduler(adapters)
 
-    def before_iteration() -> None:
-        lease.renew()
-        # Within one poll of the dial changing: ``off`` raises (stopping the
-        # run before the next provider call), ``local_only``/``on`` swap the
-        # adapters the next step may use.
+    def guard() -> None:
+        # Before EACH submit and poll/download, through the dial's poll cache:
+        # ``off`` raises (no further provider call for this batch);
+        # ``local_only``/``on`` swap the adapters the call may use.
         scheduler.adapters, now = policy_adapters(ctx, repos, preference)
         outcome.unavailable_providers = dict(scheduler.adapters.unavailable)
         outcome.imagegen = now.describe()
 
+    scheduler.guard = guard
     report = scheduler.run(
         {batch_id: _request_for(loaded)},
         sleep=ctx.sleep,
-        on_iteration=before_iteration,
+        on_iteration=lease.renew,
         on_wait=ctx.on_wait,
     )
     outcome.stopped_waiting = report.stopped_waiting

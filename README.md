@@ -515,15 +515,17 @@ runner that cannot say, refuses every image call with `gateway_has_no_image_rout
 `gateway-tenants-route-every-model-call-through-the-gateway`).
 
 **The image-generation off-switches** (plan 2026-10-13 Phase 12). Image
-generation ships on. Before a batch is driven, and again before every scheduler
-iteration (a reading is reused for 60 s), studio reads coord's
+generation ships on. Before a batch is driven, and again before every provider
+call — each submit and each poll/download (a reading is reused for 60 s) —
+studio reads coord's
 `image_generation` dial — `GET /coord/fleet-policy?domain=image_generation`,
 naming each target site's `repo` (`owner/name`) so a per-repo override governs
 it; a site with no `repo` reads the tenant level, and a batch takes the most
 restrictive level of its sites. `off` refuses with `image_generation_off`.
 `local_only` admits only the fleet's own image host (an `unmetered` row on the
 local network, called directly) and refuses every cloud adapter and anything
-riding a gateway route; a brief none of whose providers qualifies is refused
+riding a gateway route for new work (a job already submitted there is still
+collected, so paid work is not lost); a brief none of whose providers qualifies is refused
 with `image_generation_local_only`. `QONTINUI_IMAGEGEN=0` is `off` on this
 machine without asking coord. An unreadable dial is the level coord last
 answered for that repo (kept in `.studio/studio.db`), and with none,
