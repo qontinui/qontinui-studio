@@ -21,8 +21,13 @@ src/api/          the studio scene API — the only thing scenes import (besides
   tokens.ts       vendored design tokens (see "Design tokens")
   engine.ts       EngineAdapter / PlayerEmbedProps — the engine seam (D7)
   scene-root.tsx  what every adapter renders: canvas + scene + mode label
+  composition.ts  compositions -> a playable program (segments, narration warp, omitted b-roll)
+  program-root.tsx  what an adapter renders for a program frame (scene, card or b-roll + mode label)
+  narration-timing.ts  the narration timing table (kept apart from scene code)
+  captions.ts     aligned words -> WebVTT captions
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header, label (a small pill on a point)
+src/compositions/ the teaser, the explainer and the factory pulse (plan Phase 5)
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
                   S3 "Gates and continuations", S4 "The merge train", S5 "The fleet",
                   S6 "Self-correction", S7 "Model-based GUI automation")
@@ -445,6 +450,80 @@ mp4 runs, compared by SHA-256). What it rests on:
   (for example with `Object.fromEntries`); that escape is left to the
   order-independence tests, which would catch any blur it smuggled in.
 - **Pure scenes:** scenes are pure, as described under "Scene purity".
+
+## Compositions (plan Phase 5)
+
+A composition plays segments back to back: a window of a scene (at a playback
+rate), a title or closing card, or an AI b-roll still in a named slot. The
+registered ones are in `src/compositions/`:
+
+| Composition | Segments | Length |
+| --- | --- | --- |
+| `teaser` | card, S1, S4, S6 at 2x, b-roll slot `teaser-closing`, card | about 30 s |
+| `explainer` | card, S2, b-roll `explainer-twin`, S1, S4, b-roll `explainer-fleet`, S6, card | about 75 s silent; narration stretches it towards 90 s |
+| `factory-pulse` | card `{{week}}`, S1, S6, S4 at 1.5x, card `{{status_line}}` | about 40 s |
+
+```sh
+pnpm studio-scenes compose explainer --format mp4 --aspect 16:9 --out out/explainer.mp4 \
+  [--trace <segment>=<file>]... | [--build-record <export>] \
+  [--broll <slot>=<image>]... [--narration <timing.json>] [--var <name>=<value>]... [--force]
+pnpm studio-scenes compositions
+```
+
+- **Scenes are not changed.** A scene segment renders through `SceneRoot`,
+  exactly as a lone render does, so its D2 mode label comes with it. Cards
+  and b-roll carry the mode label of their nearest scene. Card copy quotes
+  the served `product_intent/vision` (`src/compositions/copy.ts`, plan D5).
+- **Traces.** Each scene segment uses its scene's illustrative trace unless
+  `--trace <segment>=<file>` names another. `--build-record` makes every
+  scene segment a replay through `fromBuildRecord`; while replays are
+  unavailable it exits **5** (not 2), so a scheduled caller can fall back
+  to an illustrative render and say so.
+- **B-roll is optional.** A slot with no `--broll` image is omitted and the
+  omission is recorded, so every composition renders with zero b-roll. An
+  image needs the studio's `<image>.provenance.json` beside it
+  (`ai_generated: true`, a `provider.id`, and `file.sha256` equal to the
+  image's). Every b-roll frame carries an "AI-GENERATED IMAGERY" badge
+  (sibling plan D6).
+- **Narration is optional.** `--narration` takes a timing table
+  (`src/api/narration-timing.ts`): per segment, a clip beside the table (by
+  name and SHA-256; a clip that does not hash is refused), its length, its
+  `[#mark]` times and, optionally, the aligned words and the independent
+  speech check. Re-voicing writes a new table and never edits a scene. A
+  narrated segment lasts at least its clip plus a 250 ms lead and a 500 ms
+  tail; the scene plays at its rate and then holds its last frame. A mark
+  named after an event id of the segment's trace pins that event's beat to
+  the moment the mark is spoken (a piecewise-linear warp between pins); a
+  mark that names nothing is ignored and noted, and marks spoken out of the
+  scene's order, or so early or late that the scene would have to run
+  faster than 4x or slower than 0.25x to meet them, are refused. A word that
+  ends past its clip is refused by the table's schema (a narration lead of
+  250 ms means a mark spoken in the first quarter-second will usually ask
+  for more than 4x; speak a few words before the first mark), and a caption never
+  outlasts its clip.
+- **Outputs.** `<out>` (mp4/H.264 or webm/VP8, with the narration mixed in
+  by the engine), `<out>.composition.json` (the manifest the publish gate
+  reads: each segment's place and mode, what was omitted and why, notes, and
+  the SHA-256 of every trace, image, clip and the output), and, when the
+  narration carries words, `<out>.vtt` (WebVTT captions, cues split at
+  sentence ends, silences and 42 characters). Existing outputs are refused
+  without `--force`. The manifest and captions are written inside the
+  same interruptible step as the render, so a first Ctrl-C lets them be
+  written; a second signal (which exits at once) or a failed write can
+  still leave a video without a manifest, and the publish gate then
+  refuses it. A
+  `--force` run with no captions leaves an older `<out>.vtt` in place (it
+  deletes nothing it did not write) and says so; the manifest is the
+  authority on whether captions exist.
+- **Engine.** Compose renders through the Remotion adapter
+  (`EngineAdapter.renderComposition`, optional on the interface; the
+  HyperFrames adapter does not implement it yet). Media is staged into a
+  fresh directory for that bundle and removed file by file after bundling,
+  also when bundling fails; a media name colliding with a bundled asset is
+  refused.
+- **Reproducible.** Program resolution is pure, and a composed mp4 with a
+  b-roll still and a narration clip is byte-identical across two runs
+  (`tests/golden/compose.test.ts`).
 
 ## Tests
 

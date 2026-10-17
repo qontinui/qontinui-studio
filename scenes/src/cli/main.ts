@@ -18,20 +18,19 @@
  * The CLI reaches the engine adapter only through a dynamic import (lint
  * forbids static imports of src/adapters from here).
  */
-import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { parseArgs } from "node:util";
 
-import { OUTPUT_FORMATS, type EngineAdapter, type OutputFormat } from "../api/engine";
+import { OUTPUT_FORMATS, type OutputFormat } from "../api/engine";
 import { ASPECTS, STUDIO_FPS, isAspect, scaleProblem } from "../api/layout";
 import { missingRequirements } from "../api/scene";
 import { fromBuildRecord, type BuildRecordExport } from "../api/trace/from-build-record";
 import { renderRefusal } from "../api/trace/provenance";
-import { validateTrace, type SceneTrace } from "../api/trace/schema";
-import { getScene, scenes } from "../scenes";
+import type { SceneTrace } from "../api/trace/schema";
+import { scenes } from "../scenes";
+import { COMPOSE_USAGE, ReplayUnavailable, compose, listCompositions } from "./compose";
+import { ENGINES, intOption, loadAdapter, loadTrace, parse, readJson, requireScene, type Engine } from "./common";
+import { Interrupted, UsageError, exitCodeFor, runInterruptible } from "./interruptible";
 
-const ENGINES = ["remotion", "hyperframes"] as const;
-type Engine = (typeof ENGINES)[number];
 
 const USAGE = `usage:
   studio-scenes render <scene> (--trace <file> | --build-record <export>)
@@ -40,6 +39,7 @@ const USAGE = `usage:
                        [--engine ${ENGINES.join("|")}]
   studio-scenes validate <trace-file> [--scene <scene>]
   studio-scenes list
+${COMPOSE_USAGE}
 
 png: with --frame, one still at --out (file); without it, a PNG frame sequence in --out (directory).
 --force replaces an existing output file, or a previous element-*.png sequence; nothing else.
@@ -48,85 +48,6 @@ and must give even pixel dimensions for every aspect (e.g. 0.25, 0.5, 2).
 A --trace file must be illustrative; replays come only from --build-record (plan D2).
 --engine defaults to remotion; hyperframes renders in its pinned Docker image
 (build it once with \`pnpm hyperframes:image\`) and supports scale 1 only.`;
-
-class UsageError extends Error {}
-
-/** The render was stopped by a signal; the process exits 128 + signal number. */
-class Interrupted extends Error {
-  constructor(
-    readonly signal: NodeJS.Signals,
-    outcome: string,
-  ) {
-    super(`interrupted by ${signal}: ${outcome}`);
-  }
-}
-
-/** A signal this soon after the first is the same interrupt relayed, not a second one. */
-const REPEAT_SIGNAL_MS = 1000;
-
-/**
- * The signals that stop a render: Ctrl-C, a kill, and a terminal hang-up.
- * SIGHUP matters because every docker client runs in its own process group
- * (the HyperFrames adapter), so a hang-up no longer reaches the container
- * through the client: the CLI must stop it itself.
- */
-const STOP_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
-
-function exitCodeFor(signal: NodeJS.Signals): number {
-  if (signal === "SIGTERM") return 143;
-  if (signal === "SIGHUP") return 129;
-  return 130;
-}
-
-function requireScene(id: string) {
-  if (!scenes[id]) {
-    throw new UsageError(`unknown scene "${id}" (known: ${Object.keys(scenes).join(", ")})`);
-  }
-  return getScene(id);
-}
-
-async function readJson(file: string, what: string): Promise<unknown> {
-  try {
-    return JSON.parse(await readFile(file, "utf8"));
-  } catch (err) {
-    throw new UsageError(`cannot read ${what} ${file}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
-async function loadTrace(file: string): Promise<SceneTrace> {
-  const result = validateTrace(await readJson(file, "trace"));
-  if (!result.ok) {
-    throw new UsageError(`invalid trace ${file}:\n  ${result.errors.join("\n  ")}`);
-  }
-  return result.trace;
-}
-
-/** parseArgs with its errors (unknown option, missing value) as usage errors. */
-function parse<T extends Parameters<typeof parseArgs>[0]>(config: T) {
-  try {
-    return parseArgs(config);
-  } catch (err) {
-    throw new UsageError(err instanceof Error ? err.message : String(err));
-  }
-}
-
-function intOption(name: string, value: string | undefined): number | undefined {
-  if (value === undefined) return undefined;
-  if (!/^\d+$/.test(value)) throw new UsageError(`--${name} must be a non-negative integer`);
-  return Number(value);
-}
-
-/** The adapter for `engine`, loaded only when used (lint: dynamic import only). */
-async function loadAdapter(engine: Engine): Promise<EngineAdapter> {
-  if (engine === "hyperframes") {
-    const { HyperFramesAdapter } = await import("../adapters/hyperframes/render");
-    return new HyperFramesAdapter();
-  }
-  const { RemotionAdapter } = await import("../adapters/remotion/render");
-  // The CLI handles SIGINT itself (see render()), so Remotion's exit-at-once
-  // listener is removed and an interrupted render cleans up.
-  return new RemotionAdapter({ interrupts: "caller" });
-}
 
 async function render(args: string[]) {
   const { values, positionals } = parse({
@@ -208,44 +129,7 @@ async function render(args: string[]) {
   const adapter = await loadAdapter(engine as Engine);
   const outPath = path.resolve(out);
   let lastPct = -1;
-  // Ctrl-C / SIGTERM / SIGHUP: adapter.close() stops the render (an adapter publishes
-  // nothing after close), the render unwinds through its own cleanup
-  // (staging and project directories, containers, exactly as on any other
-  // failure), and the CLI exits 130 / 143 / 129 saying which happened: stopped
-  // with nothing published, or finished before the signal took effect. A
-  // second signal exits at once, skipping cleanup — but only one that comes
-  // REPEAT_SIGNAL_MS or more after the first: one Ctrl-C can arrive twice
-  // (a wrapper such as pnpm or the tsx CLI relays the signal the terminal
-  // already sent to the whole group), and that must not skip the cleanup.
-  let interrupted: NodeJS.Signals | null = null;
-  let interruptedAt = 0;
-  const onSignal = (signal: NodeJS.Signals) => {
-    if (interrupted) {
-      if (Date.now() - interruptedAt >= REPEAT_SIGNAL_MS) process.exit(exitCodeFor(signal));
-      return;
-    }
-    interrupted = signal;
-    interruptedAt = Date.now();
-    process.stderr.write(`\n${signal}: stopping the render (send it again to exit at once, skipping cleanup)\n`);
-    void adapter.close().catch(() => undefined);
-  };
-  // While stopping, an engine can reject a promise nobody awaits any more
-  // (Remotion's helper processes are torn down under work it abandoned on
-  // cancel, e.g. a write that fails with EPIPE). That must not crash the
-  // process past the cleanup still running, so after a signal such errors
-  // are reported and the shutdown continues. Before a signal they still crash.
-  const onStrayRejection = (reason: unknown) => {
-    if (!interrupted) throw reason;
-    process.stderr.write(`note: ignored an engine error while stopping: ${reason instanceof Error ? reason.message : String(reason)}\n`);
-  };
-  for (const signal of STOP_SIGNALS) process.on(signal, onSignal);
-  // After a hang-up the terminal is gone and writing to it fails (EIO); that
-  // must not crash the process in the middle of its cleanup.
-  const ignoreStreamError = () => undefined;
-  process.stdout.on("error", ignoreStreamError);
-  process.stderr.on("error", ignoreStreamError);
-  process.on("unhandledRejection", onStrayRejection);
-  try {
+  await runInterruptible(adapter, outPath, "render", async () => {
     const result = await adapter.render({
       scene: sceneId,
       trace,
@@ -267,34 +151,7 @@ async function render(args: string[]) {
       `${result.files.length === 1 ? result.files[0] : `${result.files.length} frames in ${outPath}`}\n` +
         `  ${result.width}x${result.height} @ ${result.fps} fps, ${result.durationInFrames} frames (${trace.meta.mode})\n`,
     );
-    if (interrupted) {
-      // The render had already published when the signal took effect.
-      throw new Interrupted(interrupted, `the render had already finished; ${outPath} is complete`);
-    }
-  } catch (err) {
-    if (err instanceof Interrupted) throw err;
-    if (interrupted) {
-      // AdapterClosed: close() stopped the render before it published. Any
-      // other error: the render failed on its own (possibly while stopping);
-      // either way publishing is the last step, so nothing reached --out.
-      const what =
-        err instanceof Error && err.name === "AdapterClosed"
-          ? "the render was stopped"
-          : `the render failed while stopping (${err instanceof Error ? err.message : String(err)})`;
-      throw new Interrupted(interrupted, `${what}; nothing was published to ${outPath} and its temporary files were removed`);
-    }
-    if (err instanceof Error && err.name === "OutputRefused") throw new UsageError(`render: ${err.message}`);
-    throw err;
-  } finally {
-    await adapter.close();
-    for (const signal of STOP_SIGNALS) process.off(signal, onSignal);
-    // After a signal these stay until the process exits (130 / 143 / 129).
-    if (!interrupted) {
-      process.stdout.off("error", ignoreStreamError);
-      process.stderr.off("error", ignoreStreamError);
-    }
-    if (!interrupted) process.off("unhandledRejection", onStrayRejection);
-  }
+  });
 }
 
 async function validate(args: string[]) {
@@ -324,6 +181,10 @@ async function main(argv: string[]) {
       return render(rest);
     case "validate":
       return validate(rest);
+    case "compose":
+      return compose(rest);
+    case "compositions":
+      return listCompositions();
     case "list":
       for (const scene of Object.values(scenes)) process.stdout.write(`${scene.id}\t${scene.title}\n`);
       return;
@@ -342,6 +203,10 @@ main(process.argv.slice(2)).catch((err: unknown) => {
   if (err instanceof Interrupted) {
     process.stderr.write(`${err.message}\n`);
     process.exit(exitCodeFor(err.signal));
+  }
+  if (err instanceof ReplayUnavailable) {
+    process.stderr.write(`${err.message}\n`);
+    process.exit(5);
   }
   if (err instanceof UsageError) {
     process.stderr.write(`${err.message}\n\n${USAGE}\n`);

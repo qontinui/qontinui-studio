@@ -16,3 +16,6 @@ export * from "./trace/schema";
 export * from "./trace/from-build-record";
 export { assertRenderable, renderRefusal, REPLAY_REFUSAL } from "./trace/provenance";
 export * from "./text-coverage";
+export * from "./composition";
+export * from "./captions";
+export * from "./narration-timing";

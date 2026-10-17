@@ -24,7 +24,10 @@
  * or Lambda rendering is used.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { constants as fsConstants } from "node:fs";
+import { copyFile, cp, lstat, mkdir, mkdtemp, readdir, rmdir, unlink } from "node:fs/promises";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,6 +48,7 @@ import {
 
 import {
   AdapterClosed,
+  type CompositionRenderRequest,
   type EngineAdapter,
   type OutputFormat,
   type RenderRequest,
@@ -63,7 +67,60 @@ import {
   publishSequence,
   withStaging,
 } from "../output";
+import { PROGRAM_COMPOSITION_ID } from "./program-id";
 import type { StudioCompositionProps } from "./StudioComposition";
+import type { StudioProgramProps } from "./StudioProgram";
+
+/** A published media name a program may refer to (b-roll, narration). */
+export const MEDIA_NAME = /^media\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Bundle the scenes with `media` (published name -> local path) served
+ * beside the bundled fonts. The files are copied into a fresh directory this
+ * function creates (`mkdtemp`); the bundler copies that into its output.
+ * Afterwards — also when anything fails part-way — every file inside that
+ * directory, all of which this function wrote, is unlinked one by one and
+ * its directories removed deepest first (never a recursive delete). A media
+ * name that collides with a bundled asset is refused, never overwritten.
+ */
+export async function bundleWithMedia(
+  media: Readonly<Record<string, string>>,
+  bundler: (publicDir: string) => Promise<string> = (publicDir) => bundle({ entryPoint: ENTRY_POINT, publicDir }),
+): Promise<string> {
+  for (const name of Object.keys(media)) {
+    if (!MEDIA_NAME.test(name)) throw new Error(`media name "${name}" must look like media/<file>`);
+  }
+  const staging = await mkdtemp(path.join(tmpdir(), "studio-public-"));
+  const publicDir = path.join(staging, "public");
+  try {
+    await cp(PUBLIC_DIR, publicDir, { recursive: true, errorOnExist: true, force: false });
+    if (Object.keys(media).length) await mkdir(path.join(publicDir, "media"), { recursive: true });
+    for (const [name, source] of Object.entries(media)) {
+      await copyFile(source, path.join(publicDir, name), fsConstants.COPYFILE_EXCL);
+    }
+    return await bundler(publicDir);
+  } finally {
+    await emptyOwnDirectory(staging);
+  }
+}
+
+/** Unlink every file under `dir` (a directory this module created), then remove its directories deepest first. */
+async function emptyOwnDirectory(dir: string): Promise<void> {
+  const dirs: string[] = [];
+  try {
+    for (const entry of await readdir(dir, { recursive: true, withFileTypes: true })) {
+      const full = path.join(entry.parentPath, entry.name);
+      if (entry.isDirectory()) dirs.push(full);
+      else await unlink(full).catch(() => undefined);
+    }
+  } catch {
+    // Nothing was created (or it is already gone).
+  }
+  for (const d of dirs.sort((a, b) => b.length - a.length)) await rmdir(d).catch(() => undefined);
+  await rmdir(dir).catch(async () => {
+    if (await lstat(dir).then(() => true, () => false)) process.stderr.write(`note: left staging directory ${dir} (not empty)\n`);
+  });
+}
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const ENTRY_POINT = path.join(PACKAGE_ROOT, "src/adapters/remotion/entry.ts");
@@ -165,6 +222,8 @@ export class RemotionAdapter implements EngineAdapter {
   private readonly logLevel: LogLevel;
   private readonly interrupts: Interrupts;
   private serveUrl: Promise<string> | null;
+  /** Program bundles, by media set (see renderComposition). */
+  private readonly programBundles = new Map<string, Promise<string>>();
   private browser: Promise<HeadlessBrowser> | null = null;
   private port: Promise<number>;
   /** Cancels in-flight renders when close() is called (e.g. on Ctrl-C). */
@@ -383,6 +442,93 @@ export class RemotionAdapter implements EngineAdapter {
       }
       this.assertOpen();
       return result([await publishFile(staged, outPath, overwrite)]);
+    });
+  }
+
+  /**
+   * Render a composition (plan Phase 5) to mp4/webm with its narration mixed
+   * in. Every replay trace in the program must be attested in this process
+   * (`assertRenderable`), and every media name it uses must be given.
+   */
+  renderComposition(request: CompositionRenderRequest): Promise<RenderResult> {
+    return this.track(renderContext.run(this, () => this.renderCompositionUntracked(request)));
+  }
+
+  private async renderCompositionUntracked(request: CompositionRenderRequest): Promise<RenderResult> {
+    this.assertOpen();
+    const overwrite = request.overwrite ?? false;
+    const outPath = path.resolve(request.outPath);
+    await checkFileTarget(outPath, overwrite);
+    const { program } = request;
+    const used = new Set<string>();
+    for (const segment of program.segments) {
+      if (segment.kind === "scene") {
+        assertRenderable(segment.trace);
+        const problems = missingRequirements(getScene(segment.sceneId), segment.trace);
+        if (problems.length) {
+          throw new Error(`segment "${segment.id}": trace cannot drive scene "${segment.sceneId}"; it needs: ${problems.join("; ")}`);
+        }
+      } else if (segment.kind === "broll") {
+        used.add(segment.src);
+      }
+    }
+    for (const clip of program.audio) used.add(clip.src);
+    for (const name of used) {
+      if (!(name in request.media)) throw new Error(`the program uses media "${name}", which was not given`);
+    }
+    for (const name of Object.keys(request.media)) {
+      if (!used.has(name)) throw new Error(`media "${name}" is given but the program does not use it`);
+    }
+
+    // One bundle per distinct media set (a scene bundle serves no media).
+    const mediaKey = JSON.stringify(Object.entries(request.media).sort(([a], [b]) => a.localeCompare(b)));
+    let bundled = this.programBundles.get(mediaKey);
+    if (!bundled) {
+      bundled = bundleWithMedia(request.media);
+      this.programBundles.set(mediaKey, bundled);
+      bundled.catch(() => this.programBundles.delete(mediaKey));
+    }
+    const serveUrl = await bundled;
+    this.assertOpen();
+    const puppeteerInstance = await this.getBrowser();
+    this.assertOpen();
+    const inputProps: StudioProgramProps = { program, aspect: request.aspect };
+    const selecting = this.onPort((port) => selectComposition({
+      port,
+      serveUrl,
+      id: PROGRAM_COMPOSITION_ID,
+      inputProps,
+      puppeteerInstance,
+      chromiumOptions: CHROMIUM_OPTIONS,
+      logLevel: this.logLevel,
+    }));
+    this.selecting = selecting;
+    const composition = await selecting;
+    this.assertOpen();
+    const progress = (fraction: number) => renderContext.exit(() => request.onProgress?.(fraction));
+    return withStaging(outPath, async (staging) => {
+      const staged = path.join(staging, `output.${request.format}`);
+      await this.rendering((port) => renderMedia({
+        cancelSignal: this.cancel.cancelSignal,
+        serveUrl,
+        composition,
+        inputProps,
+        puppeteerInstance,
+        chromiumOptions: CHROMIUM_OPTIONS,
+        logLevel: this.logLevel,
+        port,
+        codec: CODECS[request.format],
+        outputLocation: staged,
+        onProgress: ({ progress: fraction }) => progress(fraction),
+      }));
+      this.assertOpen();
+      return {
+        files: [await publishFile(staged, outPath, overwrite)],
+        width: composition.width,
+        height: composition.height,
+        fps: composition.fps,
+        durationInFrames: composition.durationInFrames,
+      };
     });
   }
 

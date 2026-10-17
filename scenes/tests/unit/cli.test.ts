@@ -119,3 +119,75 @@ describe("studio-scenes CLI refusals", () => {
     expect(r.stdout).toMatch(/NOT renderable/);
   });
 });
+
+describe("studio-scenes compose refusals", () => {
+  const compose = (...args: string[]) => cli("compose", "teaser", "--format", "mp4", "--aspect", "16:9", ...args);
+  const out = () => path.join(mkdtempSync(path.join(tmpdir(), "studio-compose-")), "teaser.mp4");
+
+  it("lists the compositions", () => {
+    const r = cli("compositions");
+    expect(r.status).toBe(0);
+    expect(r.stdout.split("\n").map((l) => l.split("\t")[0])).toEqual(expect.arrayContaining(["teaser", "explainer", "factory-pulse"]));
+  });
+
+  it("refuses an unknown composition and a format that carries no audio", () => {
+    expect(cli("compose", "nope", "--format", "mp4", "--aspect", "16:9", "--out", out()).stderr).toMatch(/unknown composition "nope"/);
+    expect(cli("compose", "teaser", "--format", "gif", "--aspect", "16:9", "--out", out()).stderr).toMatch(/--format must be one of mp4, webm/);
+  });
+
+  it("exits 5 when --build-record cannot build a replay, so a caller can fall back", () => {
+    const r = compose("--build-record", tmpFile("export.json", { export_version: "1" }), "--out", out());
+    expect(r.status).toBe(5);
+    expect(r.stderr).toMatch(/not implemented: needs the sibling plan's build-record export/);
+  });
+
+  it("refuses --trace for a segment the composition does not have, and a replay trace", () => {
+    expect(compose("--trace", `ghost=${S1_TRACE}`, "--out", out()).stderr).toMatch(/no scene segment "ghost"/);
+    const r = compose("--trace", `lifecycle=${tmpFile("replay.json", replayTraceJson())}`, "--out", out());
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/refusing to render a replay trace/);
+  });
+
+  it("refuses b-roll without a provenance sidecar, or one that does not match the image", () => {
+    const image = tmpFile("still.png", "not really a png");
+    expect(compose("--broll", `teaser-closing=${image}`, "--out", out()).stderr).toMatch(/b-roll provenance/);
+    writeFileSync(`${image}.provenance.json`, JSON.stringify({ ai_generated: true, provider: { id: "local" }, file: { sha256: "0".repeat(64) } }));
+    expect(compose("--broll", `teaser-closing=${image}`, "--out", out()).stderr).toMatch(/file\.sha256 0+ is not the image's/);
+    expect(compose("--broll", `nope=${image}`, "--out", out()).stderr).toMatch(/b-roll slot "nope" is not a slot of teaser/);
+  });
+
+  it("refuses narration voiced for another composition, or a clip that does not hash", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "studio-narration-"));
+    writeFileSync(path.join(dir, "open.wav"), "audio");
+    const table = (composition: string) => {
+      const file = path.join(dir, `${composition}.json`);
+      writeFileSync(
+        file,
+        JSON.stringify({
+          timing_version: 1,
+          composition,
+          script_sha256: "0".repeat(64),
+          voice: "test",
+          segments: { open: { audio: "open.wav", audio_sha256: "1".repeat(64), duration_seconds: 1 } },
+        }),
+      );
+      return file;
+    };
+    expect(compose("--narration", table("explainer"), "--out", out()).stderr).toMatch(/voiced for "explainer", not "teaser"/);
+    expect(compose("--narration", table("teaser"), "--out", out()).stderr).toMatch(/does not hash to the table's audio_sha256/);
+  });
+
+  it("needs every card variable of the factory pulse", () => {
+    const r = cli("compose", "factory-pulse", "--format", "mp4", "--aspect", "16:9", "--out", out(), "--var", "week=2026-W41");
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/variable "status_line" is not set/);
+  });
+
+  it("refuses to overwrite an existing manifest without --force", () => {
+    const file = out();
+    writeFileSync(`${file}.composition.json`, "{}");
+    const r = compose("--out", file);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/refusing to overwrite .*teaser\.mp4\.composition\.json/);
+  });
+});

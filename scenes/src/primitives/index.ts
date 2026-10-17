@@ -10,3 +10,5 @@ export { PrCard, type PrCardProps } from "./PrCard";
 export { SceneHeader, type SceneHeaderProps } from "./SceneHeader";
 export { SessionLane, type SessionLaneProps } from "./SessionLane";
 export { Timeline, type TimelineProps, type TimelineTick } from "./Timeline";
+export { AI_IMAGERY_LABEL, BrollStill, type BrollStillProps, type ImageComponent } from "./BrollStill";
+export { TitleCard, type TitleCardProps } from "./TitleCard";
