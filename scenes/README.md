@@ -255,7 +255,9 @@ sessions, S4 at most four PRs, S5 at most three machines with two sessions
 each, every session on a machine and started before it acts, S6 exactly
 one PR, a closed loop (red, a fix, then green) and no operator step, S7 only graphs its layouts can
 draw honestly: at most six states found, no self-loop, one transition per pair
-of states, and no edge running through another state at any aspect).
+of states, no edge running through another state and no action label
+overlapping another or a state at any aspect; with states placed in discovery
+order, a triangle among the first three states found cannot be drawn).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

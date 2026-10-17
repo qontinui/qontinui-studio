@@ -16,6 +16,7 @@ export const s7GuiAutomation = defineScene({
   check: graphProblems,
   timeline: s7Timeline,
   // The poster: the traversal complete, the path lit through the learned graph.
+  // (The last frame is a fallback only: the scene requires a taken transition.)
   poster: (timeline) => {
     const taken = timeline.beats.filter((b) => b.event.kind === "gui.transition_taken");
     const last = taken[taken.length - 1];

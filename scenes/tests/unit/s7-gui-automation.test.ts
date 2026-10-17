@@ -68,6 +68,20 @@ describe("S7 trace fields", () => {
     // Sign in (slot 0) → Search (slot 2) would run behind Home (slot 1).
     expect(withEdge("t-skip", "st-login", "st-search").join("\n")).toMatch(/t-skip would run through "st-home" at 16:9/);
   });
+
+  it("refuses two edges that cross as an X (their labels would land on each other)", () => {
+    const json = traceJson();
+    // Home (slot 1) → Results (slot 3) crosses Search (slot 2) → Cart (slot 4).
+    json.entities!.transitions!.push(
+      { id: "t-x1", from: "st-home", to: "st-results", action: "open Settings" },
+      { id: "t-x2", from: "st-search", to: "st-cart", action: "press the Back key" },
+    );
+    json.events.push(
+      { id: "e90", at: "2026-09-19T10:02:40Z", kind: "gui.transition_found", transition: "t-x1" } as never,
+      { id: "e91", at: "2026-09-19T10:02:41Z", kind: "gui.transition_found", transition: "t-x2" } as never,
+    );
+    expect(missingRequirements(s7GuiAutomation, parseTrace(json)).join("\n")).toMatch(/the labels of t-x1 and t-x2 overlap/);
+  });
 });
 
 describe("S7 scene model", () => {
@@ -131,6 +145,8 @@ describe("S7 scene model", () => {
     expect(end.steps).toBe(5);
   });
 
+  // Unreachable for a trace the scene accepts (it requires a taken
+  // transition), but posterFrame must still return a frame for such a trace.
   it("puts the poster on the last frame when nothing is taken", () => {
     const json = traceJson();
     json.events = json.events.filter((e) => e.kind !== "gui.transition_taken");

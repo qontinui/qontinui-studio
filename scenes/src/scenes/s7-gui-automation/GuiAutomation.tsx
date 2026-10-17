@@ -1,6 +1,6 @@
 import type { Layout, SceneProps } from "../../api";
 import { Caption, Counter, Edge, Feed, Label, Node, SceneHeader, type Point } from "../../primitives";
-import { graphSlots } from "./graph-layout";
+import { graphSlots, labelPlacement } from "./graph-layout";
 import { MODEL_ROWS, s7State } from "./model";
 
 interface Box {
@@ -14,8 +14,6 @@ interface Placement {
   /** Centre of each state slot, in discovery order (see graph-layout.ts). */
   slots: Point[];
   node: { width: number; height: number };
-  /** Put an in-row edge's action on its line instead of above the row. */
-  inRowLabelsOnLine: boolean;
   /** The learned-model panel; null where there is no room (square). */
   model: Box | null;
   counters: Point[];
@@ -32,7 +30,6 @@ function place(layout: Layout): Placement {
     return {
       header: { x: safe.x, y: 140 * u, width: safe.width, titleSize: 48 },
       ...graphSlots(layout),
-      inRowLabelsOnLine: false,
       model: { x: sideX, y: 330 * u, width: right - sideX },
       counters: [
         { x: sideX, y: 650 * u },
@@ -46,8 +43,6 @@ function place(layout: Layout): Placement {
     return {
       header: { x: safe.x, y: 170 * u, width: safe.width, titleSize: 48 },
       ...graphSlots(layout),
-      // Rows are far apart here, so an in-row action sits on its own line.
-      inRowLabelsOnLine: true,
       model: { x: safe.x, y: 1140 * u, width: safe.width },
       counters: [
         { x: safe.x, y: 1460 * u },
@@ -61,7 +56,6 @@ function place(layout: Layout): Placement {
   return {
     header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
     ...graphSlots(layout),
-    inRowLabelsOnLine: false,
     model: null,
     counters: [
       { x: safe.x, y: 850 * u },
@@ -124,18 +118,8 @@ export function GuiAutomation({ trace, frame, layout, timeline }: SceneProps) {
       {state.edges.map((edge) => {
         const a = at(edge.fromSlot);
         const b = at(edge.toSlot);
-        const across = Math.abs(b.y - a.y) < p.node.height;
-        // An edge within a row has its action above the line, clear of the
-        // nodes; any other edge has it on the middle of its line.
-        const x = (a.x + b.x) / 2;
-        const above = across && !p.inRowLabelsOnLine;
-        const y = above ? Math.min(a.y, b.y) - p.node.height / 2 - 22 * u : (a.y + b.y) / 2;
-        const maxWidth = above
-          ? Math.abs(b.x - a.x) - 20 * u
-          : across
-            ? Math.abs(b.x - a.x) - p.node.width - 20 * u
-            : p.node.width + 40 * u;
-        return <Label key={`label-${edge.id}`} x={x} y={y} text={edge.action} maxWidth={maxWidth} appear={edge.appear} unit={u} />;
+        const place = labelPlacement(layout, p, a, b);
+        return <Label key={`label-${edge.id}`} x={place.x} y={place.y} text={edge.action} maxWidth={place.maxWidth} appear={edge.appear} unit={u} />;
       })}
 
       {p.model ? (

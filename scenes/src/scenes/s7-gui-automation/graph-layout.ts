@@ -66,15 +66,78 @@ export function discoverySlots(trace: SceneTrace): Map<string, number> {
   return slots;
 }
 
-/** Does the segment a→b pass through the box centred on c (sampled, so deterministic)? */
-function crosses(a: { x: number; y: number }, b: { x: number; y: number }, c: { x: number; y: number }, w: number, h: number) {
-  for (let i = 1; i < 64; i++) {
-    const t = i / 64;
-    const x = a.x + (b.x - a.x) * t;
-    const y = a.y + (b.y - a.y) * t;
-    if (Math.abs(x - c.x) < w / 2 && Math.abs(y - c.y) < h / 2) return true;
+interface P {
+  x: number;
+  y: number;
+}
+
+/** Does the segment a→b enter the w x h box centred on c? (Liang–Barsky, exact.) */
+function crosses(a: P, b: P, c: P, w: number, h: number): boolean {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  let t0 = 0;
+  let t1 = 1;
+  const edges: [number, number][] = [
+    [-dx, a.x - (c.x - w / 2)],
+    [dx, c.x + w / 2 - a.x],
+    [-dy, a.y - (c.y - h / 2)],
+    [dy, c.y + h / 2 - a.y],
+  ];
+  for (const [pp, q] of edges) {
+    if (pp === 0) {
+      if (q <= 0) return false;
+      continue;
+    }
+    const r = q / pp;
+    if (pp < 0) t0 = Math.max(t0, r);
+    else t1 = Math.min(t1, r);
+    if (t0 >= t1) return false;
   }
-  return false;
+  return true;
+}
+
+export interface LabelPlacement {
+  x: number;
+  y: number;
+  maxWidth: number;
+}
+
+/**
+ * Where an edge's action label goes: above the row for an in-row edge where
+ * the rows are close (landscape, square), otherwise on the middle of its line.
+ */
+export function labelPlacement(layout: Layout, g: GraphSlots, a: P, b: P): LabelPlacement {
+  const u = layout.unit;
+  const across = Math.abs(b.y - a.y) < g.node.height;
+  const above = across && layout.orientation !== "portrait";
+  const x = (a.x + b.x) / 2;
+  const y = above ? Math.min(a.y, b.y) - g.node.height / 2 - 22 * u : (a.y + b.y) / 2;
+  // Room: an in-row label above spans the gap between centres; on the line it
+  // must stay between the two nodes; an up-and-down one may be a little wider
+  // than a node; a diagonal one stays within the gap between columns.
+  const columnGap = Math.min(
+    ...g.slots.flatMap((p, i) => g.slots.slice(i + 1).map((q) => Math.abs(q.x - p.x)).filter((d) => d > 1)),
+  );
+  const maxWidth = above
+    ? Math.abs(b.x - a.x) - 20 * u
+    : across
+      ? Math.abs(b.x - a.x) - g.node.width - 20 * u
+      : Math.abs(b.x - a.x) < 1
+        ? g.node.width + 40 * u
+        : Math.max(80 * u, columnGap - g.node.width - 20 * u);
+  return { x, y, maxWidth };
+}
+
+/** The box a label will occupy (its text estimated, capped at its room), for overlap checks. */
+function labelBox(layout: Layout, place: LabelPlacement, text: string) {
+  const u = layout.unit;
+  const estimated = text.length * 0.56 * 22 * 0.85 * u + 22 * u;
+  const width = Math.min(Math.max(80 * u, place.maxWidth), Math.max(80 * u, estimated));
+  return { x: place.x, y: place.y, w: width, h: 30 * u };
+}
+
+function overlap(p: { x: number; y: number; w: number; h: number }, q: { x: number; y: number; w: number; h: number }) {
+  return Math.abs(p.x - q.x) < (p.w + q.w) / 2 && Math.abs(p.y - q.y) < (p.h + q.h) / 2;
 }
 
 /**
@@ -111,6 +174,28 @@ export function graphProblems(trace: SceneTrace): string[] {
         problems.push(`${t.id} would run through "${blocked[0]}" at ${aspect}`);
         break;
       }
+    }
+  }
+  // Every action label must sit clear of every other label and every state.
+  for (const aspect of ASPECTS) {
+    const layout = layoutFor(aspect);
+    const g = graphSlots(layout);
+    const boxes = edges.flatMap((t) => {
+      const a = g.slots[slotOf.get(t.from) ?? -1];
+      const b = g.slots[slotOf.get(t.to) ?? -1];
+      return a && b && t.from !== t.to ? [{ id: t.id, box: labelBox(layout, labelPlacement(layout, g, a, b), t.action) }] : [];
+    });
+    const nodes = [...slotOf.entries()].flatMap(([id, slot]) => {
+      const c = g.slots[slot];
+      return c ? [{ id, box: { x: c.x, y: c.y, w: g.node.width, h: g.node.height } }] : [];
+    });
+    const clash = boxes.flatMap((p, i) => [
+      ...boxes.slice(i + 1).filter((q) => overlap(p.box, q.box)).map((q) => `the labels of ${p.id} and ${q.id} overlap at ${aspect}`),
+      ...nodes.filter((n) => overlap(p.box, n.box)).map((n) => `the label of ${p.id} covers "${n.id}" at ${aspect}`),
+    ]);
+    if (clash.length) {
+      problems.push(...clash);
+      break;
     }
   }
   return problems;
