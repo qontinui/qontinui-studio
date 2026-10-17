@@ -91,6 +91,9 @@ CONNECT_TIMEOUT_S = 10.0
 TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # Kept back from the dispatch timeout when telling the wrapper its budget.
 BUDGET_MARGIN_S = 20
+# The runner's readiness wait for a browser wrapper (qontinui-runner
+# BROWSER_SPAWN_READY_TIMEOUT, 30 s) plus a little.
+SPAWN_ALLOWANCE_S = 35.0
 # No runner listening, or a wrapper it cannot start, is not a busy site: park
 # the job past the scheduler's run horizon (30 min) so ``brief run`` returns at
 # once and reports it, rather than re-dialling a dead door for the whole run
@@ -196,7 +199,11 @@ class UIBridgeWrapperAdapter:
         self.known_host = known_host
         self.clock = clock
         self.dispatch_timeout_s = dispatch_timeout_s
-        self.hard_timeout_s = dispatch_timeout_s + CONNECT_TIMEOUT_S
+        # The runner's dispatch timeout covers only the wrapper's answer; a cold
+        # wrapper is spawned (and its browser launched) BEFORE that clock
+        # starts, so the read timeout allows for the spawn on top.
+        self.read_timeout_s = dispatch_timeout_s + SPAWN_ALLOWANCE_S + 5.0
+        self.hard_timeout_s = self.read_timeout_s + CONNECT_TIMEOUT_S
         self._client = client
 
     def sent_prompt(self, request: GenerationRequest) -> str:
@@ -216,7 +223,7 @@ class UIBridgeWrapperAdapter:
             # adapter asks the runner for, so a slow success is answered
             # before the runner gives up on it (a success lost on the wire is
             # still counted against the day's cap).
-            "budgetS": int(self.dispatch_timeout_s) - BUDGET_MARGIN_S,
+            "budgetS": max(1, int(self.dispatch_timeout_s) - BUDGET_MARGIN_S),
         }
 
     def _space(self) -> None:
@@ -252,7 +259,7 @@ class UIBridgeWrapperAdapter:
         self._space()
         body = {"action": ACTION, "params": self._params(request)}
         url = f"{self.runner_url}/wrappers/{self.wrapper_id}/dispatch"
-        timeout = httpx.Timeout(self.dispatch_timeout_s + 5.0, connect=CONNECT_TIMEOUT_S)
+        timeout = httpx.Timeout(self.read_timeout_s, connect=CONNECT_TIMEOUT_S)
         headers = {TIMEOUT_HEADER: str(int(self.dispatch_timeout_s))}
         client = self._client or httpx.Client()
         try:
@@ -355,6 +362,16 @@ class UIBridgeWrapperAdapter:
                 f"{self.provider_id}: human-pace interval not yet elapsed",
                 clamp_retry_after(result.get("retry_after_s")),
                 code="paced",
+            )
+        if state == "timeout":
+            # The wrapper's budget ran out (a slow site or machine). Not the
+            # operator's to resolve, so never a hand-off: a typed refusal that
+            # refunds the unit and lets an interactive job fall back.
+            raise ProviderBusy(
+                f"{self.provider_id}: the wrapper's run budget ran out"
+                f"{' after the prompt was sent' if result.get('typed') is True else ''}",
+                clamp_retry_after(result.get("retry_after_s")),
+                code="timeout",
             )
         if state == "cap_reached":
             raise QuotaExhaustedError(f"{self.provider_id}: the wrapper's daily cap is spent")
