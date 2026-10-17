@@ -24,7 +24,9 @@ from qontinui_studio.errors import ConfigError
 
 Verdict = Literal["yes", "no", "unknown"]
 Media = Literal["image", "video"]
-AdapterKind = Literal["gemini_api", "openai_images", "openai_compatible_images", "fake", "none"]
+AdapterKind = Literal[
+    "gemini_api", "openai_images", "openai_compatible_images", "ui_bridge_wrapper", "fake", "none"
+]
 # API adapters: an adapter that needs ``api_available: yes`` and is at most one
 # row per kind (one account per provider, D4).
 API_ADAPTERS = ("gemini_api", "openai_images")
@@ -34,6 +36,10 @@ API_ADAPTERS = ("gemini_api", "openai_images")
 # ``busy``/``deferred`` refusals — plan 2026-10-13 Phase 11 step 2).
 Capacity = Literal["daily_quota", "unmetered"]
 UNMETERED_ADAPTERS = ("openai_compatible_images",)
+# A UI Bridge wrapper driving the operator's own web account, spawned by the
+# runner on the operator's machine. It runs only under an ``operator_override``
+# (plan 2026-10-17-free-image-generation-local-gpu-and-private-ui-bridge-wrappers D2).
+WRAPPER_ADAPTERS = ("ui_bridge_wrapper",)
 
 
 # Literal address ranges that count as "this machine or the local network".
@@ -156,6 +162,26 @@ class SourcedVerdict(BaseModel):
         return self
 
 
+class OperatorOverride(BaseModel):
+    """The operator's dated decision to drive a provider whose terms say
+    ``automation_allowed: no``. The terms verdict stays on the row unchanged
+    (every asset's provenance still records it); this block records the
+    decision and the bounds that keep the use at manual volume."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decided: date
+    # Where the decision is written down (a plan path or a coord record id).
+    record: str = Field(min_length=1)
+    # The manual-equivalent daily cap. The row's ``daily_quota`` must equal it.
+    max_per_day: int = Field(ge=1)
+    # Human pace: the least time between two prompts, enforced by the wrapper.
+    min_interval_s: int = Field(ge=30)
+    # A login wall, CAPTCHA or bot challenge stops the run and hands it to the
+    # operator. No other value exists: nothing ever tries to get past one.
+    on_challenge: Literal["stop_and_hand_off"]
+
+
 class Provider(BaseModel):
     """One provider row. One row == one account (D4: one account per provider)."""
 
@@ -195,6 +221,9 @@ class Provider(BaseModel):
     domains: list[str] = Field(min_length=1)
     sources: list[str] = Field(default_factory=list)
     notes: str | None = None
+    # The runner wrapper id a ``ui_bridge_wrapper`` row dispatches to.
+    wrapper_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    operator_override: OperatorOverride | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -217,6 +246,24 @@ class Provider(BaseModel):
                 )
         if self.adapter == "openai_compatible_images" and not (self.base_url or self.base_url_env):
             raise ValueError(f"provider '{self.id}': openai_compatible_images needs a base_url")
+        if self.operator_override is not None:
+            if self.adapter not in WRAPPER_ADAPTERS:
+                raise ValueError(
+                    f"provider '{self.id}': an operator_override applies only to a "
+                    f"{list(WRAPPER_ADAPTERS)} adapter, not '{self.adapter}'"
+                )
+            if self.daily_quota != self.operator_override.max_per_day:
+                raise ValueError(
+                    f"provider '{self.id}': daily_quota ({self.daily_quota}) must equal "
+                    f"operator_override.max_per_day ({self.operator_override.max_per_day})"
+                )
+        if self.adapter in WRAPPER_ADAPTERS:
+            if not self.wrapper_id:
+                raise ValueError(f"provider '{self.id}': ui_bridge_wrapper needs a wrapper_id")
+            if self.capacity == "unmetered":
+                raise ValueError(f"provider '{self.id}': a ui_bridge_wrapper is never unmetered")
+        elif self.wrapper_id is not None:
+            raise ValueError(f"provider '{self.id}': wrapper_id is only for ui_bridge_wrapper")
         return self
 
     def resolved_base_url(self) -> str | None:
@@ -282,7 +329,7 @@ class Provider(BaseModel):
         # Terms first: they are the reason an adapter may not exist at all.
         if self.tos_reviewed is None:
             return "terms not reviewed (tos_reviewed is unset)"
-        if self.automation_allowed.value != "yes":
+        if self.automation_allowed.value != "yes" and not self.overridden():
             return f"automation_allowed is '{self.automation_allowed.value}'"
         if self.adapter == "none":
             return "no adapter exists for this provider"
@@ -294,6 +341,11 @@ class Provider(BaseModel):
         if self.adapter != "fake" and not self.model:
             return "no model configured"
         return None
+
+    def overridden(self) -> bool:
+        """Whether the operator's override lets this row's adapter run despite
+        its terms verdict: only a wrapper row, only with the bounds present."""
+        return self.adapter in WRAPPER_ADAPTERS and self.operator_override is not None
 
     def schedulable_reason(self) -> str | None:
         """Why the scheduler must not assign work here, or ``None``."""

@@ -33,6 +33,20 @@ class QuotaExhaustedError(ProviderError):
     the job is deferred."""
 
 
+class OperatorHandoff(QuotaExhaustedError):
+    """A wrapper driving the operator's own web account stopped at a login
+    wall, CAPTCHA, bot challenge, usage limit or an unrecognised page, and
+    handed the run to the operator. Typed as a spent quota on purpose: the
+    provider leaves the rotation until its reset (no retry loop against the
+    site), and an interactive job falls through to the next provider."""
+
+    REASONS = ("login_wall", "captcha", "bot_challenge", "rate_limited", "ui_changed")
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class PermanentProviderError(ProviderError):
     """A failure retrying will not fix (4xx other than 429, safety refusal, no image)."""
 

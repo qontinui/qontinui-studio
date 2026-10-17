@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from qontinui_studio.adapters.base import (
@@ -10,7 +11,12 @@ from qontinui_studio.adapters.base import (
     ProviderAdapter,
     SubmittedJob,
 )
-from qontinui_studio.errors import AdapterDisabledError, GatewayRefusal, MissingCredentialError
+from qontinui_studio.errors import (
+    AdapterDisabledError,
+    GatewayRefusal,
+    MissingCredentialError,
+    PermanentProviderError,
+)
 from qontinui_studio.gateway import GATEWAY_CREDENTIAL_ENV, GatewayState, credential_env_acceptable
 from qontinui_studio.providers import Provider, ProviderInventory, is_local_network
 
@@ -65,6 +71,18 @@ def build_adapter(
         if not base:
             raise AdapterDisabledError(f"{provider.id}: no base_url configured")
         return OpenAICompatibleImageAdapter(provider.id, model, base, provider.api_key_env)
+    if provider.adapter == "ui_bridge_wrapper":
+        from qontinui_studio.adapters.ui_bridge_wrapper import (
+            DEFAULT_RUNNER_URL,
+            RUNNER_URL_ENV,
+            UIBridgeWrapperAdapter,
+        )
+
+        runner = base or os.environ.get(RUNNER_URL_ENV, "").strip() or DEFAULT_RUNNER_URL
+        try:
+            return UIBridgeWrapperAdapter(provider.id, model, provider.wrapper_id or "", runner)
+        except PermanentProviderError as e:  # a non-local runner URL
+            raise AdapterDisabledError(str(e)) from e
     if provider.adapter == "fake":
         from qontinui_studio.adapters.fake import FakeImageAdapter
 

@@ -168,6 +168,18 @@ def _coord_dial_on(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_live_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``ui_bridge_wrapper`` row dispatches to the runner on 127.0.0.1:9876 by
+    default, and a ``local_http`` test may connect to loopback: point the
+    wrapper door at a port nothing listens on, so no test ever reaches (and
+    drives a browser through) a real runner. Tests that serve their own runner
+    stub set ``STUDIO_RUNNER_URL`` again."""
+    from .imagehost import closed_port
+
+    monkeypatch.setenv("STUDIO_RUNNER_URL", f"http://127.0.0.1:{closed_port()}")
+
+
 def notice_text(notices_dir: Path, batch_id: str, outcome: str) -> str:
     """The newest notice for (batch, outcome); notices are timestamped."""
     matches = sorted(notices_dir.glob(f"{batch_id}-{outcome}-*.md"))
