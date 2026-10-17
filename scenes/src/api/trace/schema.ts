@@ -566,12 +566,6 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       if (held === event.session) issue("resource", `"${event.session}" already holds "${event.resource}"`);
       else if (held !== undefined) issue("resource", `"${event.resource}" is already held by "${held}"`);
     }
-    if ((event.kind === "ci.diagnosed" || event.kind === "fix.pushed") && prs.has(event.pr)) {
-      // A diagnosis follows a red run; a fix follows a diagnosis (of the same PR).
-      const needs = event.kind === "ci.diagnosed" ? "ci.failed" : "ci.diagnosed";
-      const prior = trace.events.findIndex((e, j) => e.kind === needs && "pr" in e && e.pr === event.pr && precedes(j, i));
-      if (prior < 0) issue("pr", `${event.kind} before any ${needs} for "${event.pr}"`);
-    }
     if (prs.has("pr" in event ? event.pr : "") && "pr" in event) {
       const pr = event.pr;
       // Two independent flags, replayed in timeline order up to this event:
@@ -580,6 +574,10 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       // re-queue).
       let conflict = false;
       let red = false;
+      // Self-correction (S6): a diagnosis since the latest red run, and a fix
+      // since that diagnosis.
+      let diagnosed = false;
+      let fixed = false;
       trace.events
         .map((e, j) => ({ e, j }))
         .filter(({ e, j }) => "pr" in e && e.pr === pr && precedes(j, i))
@@ -587,10 +585,20 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
         .forEach(({ e }) => {
           if (e.kind === "merge_train.conflicted") conflict = true;
           else if (e.kind === "merge_train.resolved") conflict = false;
-          else if (e.kind === "ci.failed") red = true;
-          else if (e.kind === "ci.passed") red = false;
+          else if (e.kind === "ci.failed") {
+            red = true;
+            diagnosed = fixed = false;
+          } else if (e.kind === "ci.passed") red = false;
           else if (e.kind === "merge_train.queued") conflict = red = false;
+          else if (e.kind === "ci.diagnosed") {
+            diagnosed = true;
+            fixed = false;
+          } else if (e.kind === "fix.pushed") fixed = true;
         });
+      if (event.kind === "ci.diagnosed" && !red) issue("pr", `ci.diagnosed while "${pr}" is not red`);
+      if (event.kind === "fix.pushed" && (!diagnosed || fixed)) {
+        issue("pr", `fix.pushed without a diagnosis of "${pr}"'s latest red run that is not yet fixed`);
+      }
       if (event.kind === "merge_train.resolved" && !conflict) {
         issue("pr", `merge_train.resolved without an unresolved merge_train.conflicted for "${pr}"`);
       }

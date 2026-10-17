@@ -196,8 +196,8 @@ as an unknown event. A trace contains:
   - `session.started|ended` (`session.started` may name the gate it
     `continues`)
   - `pr.opened`
-  - `ci.started|passed|failed`, and `ci.diagnosed` / `fix.pushed` (a
-    diagnosis follows a red run of the same PR; a fix follows a diagnosis)
+  - `ci.started|passed|failed`
+  - `ci.diagnosed` and `fix.pushed`
   - `merge_train.queued|rebased|conflicted|resolved`
   - `pr.landed`
   - `twin.mirrored` (a fact from a source) and `twin.decided` (a decision and
@@ -223,6 +223,8 @@ The validator also checks that:
 - in the merge train, a resolution answers an unresolved conflict of the same
   PR, a conflicted PR is neither rebased nor landed until it is resolved, and
   a PR lands at most once;
+- a diagnosis is made only while its PR is red, and a fix answers the latest
+  red run's diagnosis, once;
 - a claim is acquired only when no session holds it (the holder may not
   re-acquire it), released only by its holder, and contended only against the
   session holding it at that point; a session's end releases its claims; and
@@ -244,7 +246,7 @@ may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
 sessions, S4 at most four PRs, S5 at most three machines with two sessions
 each, every session on a machine and started before it acts, S6 exactly
-one PR).
+one PR, a closed loop (red, a fix, then green) and no operator step).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

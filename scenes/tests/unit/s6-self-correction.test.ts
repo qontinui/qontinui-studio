@@ -27,8 +27,42 @@ describe("S6 trace fields", () => {
     json.events[3]!.at = "2026-09-18T14:10:00Z";
     json.events[4]!.at = "2026-09-18T14:09:00Z";
     const errors = errorsOf(json);
-    expect(errors).toContain('events.3.pr: ci.diagnosed before any ci.failed for "pr-430"');
-    expect(errors).toContain('events.4.pr: fix.pushed before any ci.diagnosed for "pr-430"');
+    expect(errors).toContain('events.3.pr: ci.diagnosed while "pr-430" is not red');
+    expect(errors.join("\n")).toMatch(/events.4.pr: fix.pushed without a diagnosis/);
+  });
+
+  it("refuses a diagnosis of a green PR and a second fix for one diagnosis", () => {
+    const base = traceJson();
+    const run = (...kinds: string[]) =>
+      errorsOf({
+        ...base,
+        events: kinds.map((kind, n) => ({
+          id: `x${n}`,
+          at: `2026-09-18T12:${String(n).padStart(2, "0")}:00Z`,
+          kind,
+          pr: "pr-430",
+          ...(kind === "ci.diagnosed" ? { cause: "c" } : kind === "fix.pushed" ? { summary: "s" } : {}),
+        })),
+      });
+    expect(run("ci.failed", "ci.passed", "ci.diagnosed").join("\n")).toMatch(/is not red/);
+    expect(run("ci.failed", "ci.diagnosed", "fix.pushed", "fix.pushed").join("\n")).toMatch(/events.3.pr: fix.pushed without/);
+    expect(run("ci.failed", "ci.diagnosed", "fix.pushed", "ci.failed", "ci.diagnosed", "fix.pushed", "ci.passed")).toEqual([]);
+  });
+
+  it("judges a diagnosis by its own PR only", () => {
+    const json = traceJson();
+    json.entities!.prs!.push({ id: "pr-b", plan: "plan-retry", repo: "example/sync-service", number: 431, title: "t" });
+    json.events.push({ id: "e90", at: "2026-09-18T14:22:00Z", kind: "ci.diagnosed", pr: "pr-b", cause: "c" } as never);
+    expect(errorsOf(json)).toContain('events.12.pr: ci.diagnosed while "pr-b" is not red');
+  });
+
+  it("needs a closed loop and no operator step", () => {
+    const open = traceJson();
+    open.events = open.events.filter((e) => e.kind !== "ci.passed" && e.kind !== "pr.landed");
+    open.events.push({ id: "e90", at: "2026-09-18T13:59:00Z", kind: "ci.passed", pr: "pr-430" } as never);
+    expect(missingRequirements(s6SelfCorrection, parseTrace(open))).toContain(
+      "a closed loop: a red run, a fix after it, and a green run after the last fix",
+    );
   });
 
   it("follows exactly one PR", () => {
@@ -43,6 +77,16 @@ describe("S6 scene model", () => {
   const tl = s6Timeline(trace, STUDIO_FPS);
   const at = (id: string, offset = 5) => s6State(trace, tl, findBeat(tl, (e) => e.id === id)!.startFrame + offset);
   const level = (state: ReturnType<typeof s6State>, id: string) => state.steps.find((s) => s.id === id)?.level;
+
+  it("counts a result with no open run as a run", () => {
+    const json = traceJson();
+    json.events = json.events.filter((e) => e.id !== "e02");
+    const t = parseTrace(json);
+    const ttl = s6Timeline(t, STUDIO_FPS);
+    const red = s6State(t, ttl, findBeat(ttl, (e) => e.id === "e03")!.startFrame + 5);
+    expect(red.log[0]?.text).toBe("Run 1 red · 14 checks");
+    expect(red.runs).toBe(1);
+  });
 
   it("starts with every step inert", () => {
     const state = s6State(trace, tl, 0);
@@ -66,6 +110,7 @@ describe("S6 scene model", () => {
 
   it("draws the loop-back edge only once CI runs again", () => {
     expect(at("e05").runs).toBe(1);
+    expect(at("e05", 20).edges.run).toBe(0);
     const rerun = at("e06", 20);
     expect(rerun.runs).toBe(2);
     expect(rerun.edges.run).toBeGreaterThan(0);
@@ -82,6 +127,9 @@ describe("S6 scene model", () => {
     expect(state.toGreenMs).toBe(46 * 60_000);
     expect(state.isGreen).toBe(true);
     expect(at("e07").isGreen).toBe(false);
-    expect(state.log.at(-1)).toMatchObject({ text: "Run 3 green · 14 checks", detail: "no human step" });
+    expect(state.log.at(-1)).toMatchObject({ text: "Run 3 green · 14 checks", detail: "fixed by the session · no human step" });
+    // The exit edge to green does not redraw at the landing.
+    const landed = at("e12", 0);
+    expect(landed.edges.green).toBe(1);
   });
 });

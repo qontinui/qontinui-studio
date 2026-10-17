@@ -62,11 +62,11 @@ function place(layout: Layout): Placement {
   }
 
   // square: the ring on the left, the PR and the log on the right.
-  const sideX = safe.x + 580 * u;
+  const sideX = safe.x + 500 * u;
   return {
     header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
-    at: ring({ x: safe.x + 250 * u, y: 540 * u }, 160 * u, 150 * u, 200 * u),
-    node: { width: 180 * u, height: 72 * u },
+    at: ring({ x: safe.x + 215 * u, y: 540 * u }, 135 * u, 150 * u, 175 * u),
+    node: { width: 160 * u, height: 68 * u },
     pr: { x: sideX, y: 300 * u, width: right - sideX },
     log: { x: sideX, y: 450 * u, width: right - sideX, rows: LOG_ROWS },
     counters: null,
@@ -125,7 +125,7 @@ export function SelfCorrection({ trace, frame, layout, timeline }: SceneProps) {
       {edge("run-red", p.at.run, p.at.red, state.edges.red)}
       {edge("red-diagnosed", p.at.red, p.at.diagnosed, state.edges.diagnosed)}
       {edge("diagnosed-fixed", p.at.diagnosed, p.at.fixed, state.edges.fixed)}
-      {edge("fixed-run", p.at.fixed, p.at.run, state.runs > 1 ? state.edges.run : 0)}
+      {edge("fixed-run", p.at.fixed, p.at.run, state.edges.run)}
       {edge("run-green", p.at.run, green, state.edges.green)}
 
       {node("run", p.at.run)}
