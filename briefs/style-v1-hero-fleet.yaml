@@ -1,0 +1,20 @@
+# The studio-style-v1 brand reference set (style/guide.yaml, plan
+# 2026-10-09-qontinui-marketing-studio-animated-process-explainers Phase 1).
+# Campaign-only: a candidate for the reference set, never published to a site.
+id: style-v1-hero-fleet
+purpose: "Hero illustration: a fleet of agent sessions coordinating through the twin"
+targets:
+  - campaign: studio-style-v1
+aspect_ratio: "16:9"
+prompt: >-
+  Many small identical solid workstations arranged in a loose arc on a dark grid floor, each sending a thin pulse of light up into one shared glowing wireframe structure above them that links them all. Calm, orderly, wide negative space on the left for a headline.
+negative_prompt: >-
+  text, letters, numbers, logos, watermarks, people, faces, hands, user
+  interface, screenshots, charts, neon, lens flare
+style_guide: ../style/studio-style-v1.md
+reference_images: []
+# The fleet's own GPU only: bulk work never spills onto a metered provider.
+provider_preference: [local-gpu]
+priority: bulk
+variants: 4
+tags: [studio-style-v1]

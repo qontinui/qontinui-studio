@@ -1,0 +1,169 @@
+# The studio style guide, version 1 (plan
+# 2026-10-09-qontinui-marketing-studio-animated-process-explainers, D4).
+#
+# This file holds only what is studio-specific: the twin metaphor, the icon
+# set, the prompt fragments ("looks") and the reference set. Palette, motion and
+# typography are NAMED here and valued only in @qontinui/design-tokens, so the
+# studio never becomes another source of brand values. Render it with
+#   studio style render --tokens-css <design-tokens>/src/tokens.css
+# A token named here that the given tokens.css does not declare refuses the
+# render.
+format: qontinui-studio/style-guide
+version: 1
+id: studio-style-v1
+title: Qontinui studio style v1
+summary: >-
+  One visual system for Qontinui's animated process explainers, hero
+  illustrations and social cards. Qontinui is a software factory with a digital
+  twin of the development process at its core; every piece shows the factory
+  and its twin. Generated images give the atmosphere; diagrams, labels, numbers
+  and UI are drawn by scene code from the tokens below.
+
+tokens:
+  package: "@qontinui/design-tokens"
+  min_version: "1.3.0"
+  palette:
+    - token: --qontinui-surface-canvas
+      role: The ground of every scene and every generated image. Nothing sits on pure black.
+    - token: --qontinui-surface-raised
+      role: The real factory layer. Sessions, PR cards and gates are solid shapes in this surface.
+    - token: --qontinui-border-default
+      role: The edge of a real-layer shape.
+    - token: --qontinui-brand-primary
+      role: The twin. Its line work and the event pulses that travel into it.
+    - token: --qontinui-glow-primary
+      role: The twin's halo. Use it only behind brand-primary line work.
+    - token: --qontinui-brand-secondary
+      role: A second twin accent, kept for the vet and build modes. Use it sparingly.
+    - token: --qontinui-brand-success
+      role: A rare atmospheric accent in generated imagery. On the real layer, "done" comes from the attention layer.
+    - token: --qontinui-text-primary
+      role: Headlines and labels drawn by scene code.
+    - token: --qontinui-text-secondary
+      role: Body copy and captions.
+    - token: --qontinui-attention-fg
+      role: State, real layer only. Someone must act now.
+    - token: --qontinui-waiting-fg
+      role: State, real layer only. Waiting on something else; it will clear itself.
+    - token: --qontinui-running-fg
+      role: State, real layer only. Work in flight, nobody is blocked.
+    - token: --qontinui-landing-fg
+      role: State, real layer only. In motion, on its way to done.
+    - token: --qontinui-done-fg
+      role: State, real layer only. Finished.
+  motion:
+    - token: --qontinui-duration-fast
+      role: A label or counter tick.
+    - token: --qontinui-duration-base
+      role: An event pulse travelling from a real element into its twin.
+    - token: --qontinui-duration-slow
+      role: A card or gate changing state.
+    - token: --qontinui-duration-deliberate
+      role: A scene beat, such as a PR joining the merge train.
+    - token: --qontinui-ease-standard
+      role: The default for anything that moves and stays on screen.
+    - token: --qontinui-ease-enter
+      role: Entrances.
+    - token: --qontinui-ease-exit
+      role: Exits.
+  typography:
+    - token: --qontinui-font-sans
+      role: The one family (Inter, bundled by the scene renderer).
+    - token: --qontinui-font-size-display
+      role: A scene or hero headline.
+    - token: --qontinui-font-size-title
+      role: A section title or a card's headline.
+    - token: --qontinui-font-size-body
+      role: Captions that carry meaning.
+    - token: --qontinui-font-size-label
+      role: Node and edge labels.
+    - token: --qontinui-font-size-counter
+      role: The big number in a counter.
+    - token: --qontinui-font-weight-semibold
+      role: Titles and labels.
+  reduced_motion: >-
+    Under prefers-reduced-motion every duration token collapses to 0ms (the
+    token package's own @media block). An embed must also stop autoplay and show
+    a poster frame with a play control, because CSS cannot do that.
+
+metaphor:
+  name: The factory and its twin
+  summary: >-
+    Two layers, always both on screen. The real factory is solid: sessions,
+    plans, PRs and gates as raised shapes. Its digital twin is light: the same
+    shapes redrawn as luminous line work, mirrored above or beside the real
+    layer. When something happens in the factory, a pulse travels from the
+    real element into its twin, and the twin brightens. That is what Qontinui
+    is: a factory that records and reasons about its own process.
+  rules:
+    - Real things are solid and twin things are line. Real shapes use surface-raised with a border-default edge. The twin uses brand-primary strokes over a glow-primary halo, with no fill.
+    - Every twin element mirrors exactly one real element, and a thin edge joins the two. The twin never shows something that has no real counterpart.
+    - An event is a pulse along that edge, from real to twin. It takes duration-base and uses ease-standard. The twin element brightens on arrival.
+    - State colour encodes who must act, and only the attention layer carries it (attention, waiting, running, landing, done). It lives on the real layer. The twin stays brand-primary, or brand-secondary in the vet or build modes.
+    - Place the real layer low or left and the twin high or right. A faint grid floor in border-subtle gives depth. Leave generous negative space for headlines drawn by code.
+    - Generated imagery is atmosphere only, meaning backgrounds, textures and hero illustrations. It never contains text, numbers, logos, product UI or recognisable people (plan D3). Real product UI appears only as real screen capture.
+    - Every rendered scene carries its trace mode (replay or illustrative) on screen. The scene framework's mode label owns this (plan D2).
+  do:
+    - Keep one light source, the twin. Everything else is lit by it.
+    - Use isometric or gentle three-quarter views, clean geometry and quiet haze.
+    - Reuse the icon set for any glyph a scene needs.
+  dont:
+    - "Don't use neon overload, lens flares, holograms of faces or sci-fi chrome."
+    - "Don't use red for \"not finished yet\". A failed check is attention; in-flight work is running."
+    - "Don't draw a twin element with no real counterpart, or a real element with a fake state."
+    - "Don't put a generated image where a diagram, a number or a UI belongs."
+
+icons:
+  - id: twin
+    meaning: A real element and its mirrored twin, joined by an edge.
+  - id: factory
+    meaning: The software factory as a whole.
+  - id: plan
+    meaning: A plan document.
+  - id: vet
+    meaning: A vetted plan, reviewed by an independent context.
+  - id: session
+    meaning: An agent session at work.
+  - id: fleet
+    meaning: Several sessions coordinating through the twin.
+  - id: pr
+    meaning: A pull request.
+  - id: gate
+    meaning: A gate. Work waits here until a condition holds.
+  - id: merge-train
+    meaning: The merge train, with PRs queued to land in order.
+  - id: land
+    meaning: Landed on main.
+  - id: trace
+    meaning: An event trace, the data a scene animates.
+  - id: policy
+    meaning: Served policy, the rules the developer twin answers from.
+
+looks:
+  - id: studio-style-v1
+    prompt_fragment: studio-style-v1.md
+    used_for: >-
+      Qontinui's own explainers, hero illustrations and social-card art. Its
+      colours are token values, and the page checks them against tokens.css.
+  - id: warm-minimal
+    prompt_fragment: warm-minimal.md
+    used_for: >-
+      The small-business template sites (cafe, barber) only. It is an example
+      look for those products and is not the Qontinui brand.
+
+references:
+  tag: studio-style-v1
+  target_approved: 20
+  briefs:
+    - briefs/style-v1-background-wide.yaml
+    - briefs/style-v1-background-tall.yaml
+    - briefs/style-v1-background-square.yaml
+    - briefs/style-v1-hero-twin.yaml
+    - briefs/style-v1-hero-fleet.yaml
+    - briefs/style-v1-social-card.yaml
+    - briefs/style-v1-social-square.yaml
+  note: >-
+    These briefs tag everything they generate studio-style-v1. Approval is a
+    separate decision, recorded with `studio library approve`. The binaries and
+    approvals live in the brand project's library (`<root>/.studio/`, never in
+    git; plan D6a), not in this tool repository.

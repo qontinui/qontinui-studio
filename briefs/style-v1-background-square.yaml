@@ -1,0 +1,20 @@
+# The studio-style-v1 brand reference set (style/guide.yaml, plan
+# 2026-10-09-qontinui-marketing-studio-animated-process-explainers Phase 1).
+# Campaign-only: a candidate for the reference set, never published to a site.
+id: style-v1-background-square
+purpose: "Scene background, square: the ground a 1:1 explainer scene is drawn over"
+targets:
+  - campaign: studio-style-v1
+aspect_ratio: "1:1"
+prompt: >-
+  A square, centred composition: a small cluster of solid geometric blocks on a fine grid floor, with a faint glowing wireframe twin of the cluster hovering above it. Wide calm margins on every side for diagrams.
+negative_prompt: >-
+  text, letters, numbers, logos, watermarks, people, faces, hands, user
+  interface, screenshots, charts, neon, lens flare
+style_guide: ../style/studio-style-v1.md
+reference_images: []
+# The fleet's own GPU only: bulk work never spills onto a metered provider.
+provider_preference: [local-gpu]
+priority: bulk
+variants: 4
+tags: [studio-style-v1]

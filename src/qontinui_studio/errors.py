@@ -174,3 +174,8 @@ class ApprovalRefused(StudioError):
     """``studio library approve``/``reject`` refused: unknown asset, a reviewer
     alias that is not an alias, or (D5) approving an asset whose licence does
     not allow commercial use."""
+
+
+class TagRefused(StudioError):
+    """``studio library tag`` refused: unknown asset, a malformed tag, or a
+    tagger that is neither an alias nor ``brief:<brief id>``."""
