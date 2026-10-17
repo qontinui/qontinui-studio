@@ -3,7 +3,18 @@ caller (or the CLI) can branch on it rather than on message text."""
 
 from __future__ import annotations
 
+import hashlib
 import math
+
+
+def omitted(text: object) -> str:
+    """Free text from outside the studio (a runner, a wrapper, a gateway
+    reading), never echoed into a message, a file or a log: its length and a
+    sha256 prefix only, so two reports of the same text can be correlated."""
+    if text is None or text == "":
+        return "no detail"
+    raw = str(text).encode("utf-8", "replace")
+    return f"detail omitted ({len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:12]})"
 
 
 class StudioError(Exception):

@@ -68,7 +68,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from qontinui_studio.errors import GatewayRefusal
+from qontinui_studio.errors import GatewayRefusal, omitted
 from qontinui_studio.providers import is_local_network
 
 RUNNER_URL_ENV = "QONTINUI_RUNNER_URL"
@@ -108,7 +108,13 @@ class GatewayState:
         if self.state == "declared":
             why = "the declared model gateway names no images-capable route"
         else:
-            why = f"the runner cannot say whether a model gateway is declared ({self.reason})"
+            # ``source`` is a closed code set; ``reason`` can carry runner text
+            # (a body's reason, a state value, an httpx error), so it is never
+            # printed — only its digest.
+            why = (
+                "the runner cannot say whether a model gateway is declared "
+                f"({self.source}; {omitted(self.reason)})"
+            )
         return GatewayRefusal(
             f"{GatewayRefusal.code}: {why}; no direct vendor or local image call is made",
             self.state,

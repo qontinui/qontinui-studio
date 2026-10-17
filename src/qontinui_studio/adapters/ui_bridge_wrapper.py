@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import json
 import time
 from collections.abc import Callable
@@ -77,6 +76,7 @@ from qontinui_studio.errors import (
     ProviderOutcomeUnknown,
     QuotaExhaustedError,
     clamp_retry_after,
+    omitted,
 )
 from qontinui_studio.notify import Notice, Notifier
 from qontinui_studio.providers import OperatorOverride, is_local_network
@@ -94,14 +94,6 @@ TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # once and reports it, rather than re-dialling a dead door for the whole run
 # (the same rule as the local facade's refused connection).
 UNREACHABLE_RETRY_AFTER_S = 3600.0
-MAX_DETAIL_CHARS = 300
-
-
-def omitted(text: object) -> str:
-    """Free text from the runner or wrapper, never echoed: its length and a
-    sha256 prefix only, so two reports of the same text can be correlated."""
-    raw = str(text).encode("utf-8", "replace")
-    return f"detail omitted ({len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:12]})"
 
 
 class HandoffLatch:
@@ -268,6 +260,12 @@ class UIBridgeWrapperAdapter:
             raise ProviderOutcomeUnknown(
                 f"{self.provider_id}: dispatch dropped after sending (transport_error "
                 f"{type(e).__name__})"
+            ) from e
+        except httpx.HTTPError as e:
+            # e.g. httpx.DecodingError (a body that fails its content-encoding):
+            # not a TransportError, but still a request that may have run.
+            raise ProviderOutcomeUnknown(
+                f"{self.provider_id}: dispatch answer unreadable ({type(e).__name__})"
             ) from e
         finally:
             if self._client is None:

@@ -810,3 +810,31 @@ def test_job_rows_carry_no_wrapper_text(
     )  # the hand-off happened
     for bad in FORBIDDEN:
         assert bad not in joined, bad
+
+
+# --- review round 5 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("leak", LEAKS)
+def test_the_gateway_refusal_never_prints_runner_text(leak: str) -> None:
+    from qontinui_studio.gateway import GatewayState
+
+    refusal = GatewayState("unknown", "unreadable", leak).refusal()
+    assert refusal is not None
+    for bad in FORBIDDEN:
+        assert bad not in str(refusal), (leak, bad)
+    assert "unreadable" in str(refusal) and "detail omitted" in str(refusal)
+
+
+@respx.mock
+def test_a_body_that_fails_decoding_is_unknown(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(side_effect=httpx.DecodingError("bad gzip"))
+    with pytest.raises(ProviderOutcomeUnknown, match="DecodingError"):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@respx.mock
+def test_a_missing_error_reads_no_detail(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(return_value=httpx.Response(404, json={"success": False}))
+    with pytest.raises(PermanentProviderError, match="no detail"):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
