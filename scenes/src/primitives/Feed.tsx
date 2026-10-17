@@ -30,15 +30,24 @@ export interface FeedProps {
   unit: number;
 }
 
+const ROW = 58;
+const PAD = 16;
+const HEADING = 36;
+
+/** Height in pixels of a Feed with room for `capacity` rows, for layouts. */
+export function feedHeight(capacity: number, unit: number): number {
+  return Math.round(HEADING * unit) + 2 * Math.round(PAD * unit) + capacity * Math.round(ROW * unit);
+}
+
 /**
  * A titled panel of short rows, each with a state dot: a log of what has
  * happened (facts mirrored into the twin, claims taken, a diagnosis). Text is
  * one line per row, ellipsised, so the panel's height is fixed by `capacity`.
  */
 export function Feed({ x, y, width, title, rows, capacity, empty, appear = 1, unit }: FeedProps) {
-  const rowHeight = Math.round(58 * unit);
-  const pad = Math.round(16 * unit);
-  const heading = Math.round(36 * unit);
+  const rowHeight = Math.round(ROW * unit);
+  const pad = Math.round(PAD * unit);
+  const heading = Math.round(HEADING * unit);
   const dot = Math.round(12 * unit);
   const line = Math.max(1, Math.round(1.5 * unit));
   return (
@@ -49,7 +58,7 @@ export function Feed({ x, y, width, title, rows, capacity, empty, appear = 1, un
         left: x,
         top: y,
         width,
-        height: heading + pad * 2 + capacity * rowHeight,
+        height: feedHeight(capacity, unit),
         boxSizing: "border-box",
         padding: pad,
         background: surface.raised,

@@ -1,5 +1,5 @@
 import type { Layout, SceneProps } from "../../api";
-import { Caption, Edge, Feed, Node, SceneHeader, type Point } from "../../primitives";
+import { Caption, Edge, Feed, Node, SceneHeader, feedHeight, type Point } from "../../primitives";
 import { DECISION_ROWS, DEVELOPER_ROWS, TWIN_ROWS, s2State } from "./model";
 
 interface Box {
@@ -12,7 +12,7 @@ interface Placement {
   header: Box & { titleSize: number };
   /** Centres of the source nodes, in trace order (up to four). */
   sources: Point[];
-  sourceNode: { width: number; height: number };
+  sourceNode: { width: number; height: number; labelLines: number };
   /** Where each source's edge meets the twin panel. */
   sourceEdgeEnds: Point[];
   twin: Box;
@@ -25,13 +25,9 @@ interface Placement {
   /** twin → decisions and twin → developer-twin edges. */
   decisionEdge: { from: Point; to: Point };
   developerEdge: { from: Point; to: Point };
-  operator: Point & { width: number; height: number };
-  caption: Box;
-}
-
-/** Height of a Feed panel with `rows` rows at `u` (mirrors Feed's own sizing). */
-function feedHeight(rows: number, u: number): number {
-  return Math.round(36 * u) + 2 * Math.round(16 * u) + rows * Math.round(58 * u);
+  operator: Point & { width: number; height: number; short: boolean };
+  /** `lines`: the caption body's clamp, so it stays inside the safe area. */
+  caption: Box & { lines: number };
 }
 
 /**
@@ -57,7 +53,7 @@ function place(layout: Layout, sourceCount: number): Placement {
     return {
       header: { x: safe.x, y: 140 * u, width: safe.width, titleSize: 48 },
       sources,
-      sourceNode: { width: 300 * u, height: nodeHeight },
+      sourceNode: { width: 300 * u, height: nodeHeight, labelLines: 2 },
       sourceEdgeEnds: sources.map((p) => ({ x: twin.x, y: p.y })),
       twin,
       twinRows: TWIN_ROWS,
@@ -74,8 +70,8 @@ function place(layout: Layout, sourceCount: number): Placement {
         from: { x: twin.x + twin.width, y: developer.y + 40 * u },
         to: { x: developer.x, y: developer.y + 40 * u },
       },
-      operator: { x: sideX + (right - sideX) / 2, y: 915 * u, width: right - sideX, height: 96 * u },
-      caption: { x: safe.x, y: top + twinHeight + 50 * u, width: twin.x + twin.width - safe.x },
+      operator: { x: sideX + (right - sideX) / 2, y: 915 * u, width: right - sideX, height: 96 * u, short: false },
+      caption: { x: safe.x, y: top + twinHeight + 50 * u, width: twin.x + twin.width - safe.x, lines: 3 },
     };
   }
 
@@ -84,13 +80,14 @@ function place(layout: Layout, sourceCount: number): Placement {
     const sourcesY = 410 * u;
     const sources = Array.from({ length: n }, (_, i) => ({ x: safe.x + nodeWidth * (i + 0.5), y: sourcesY }));
     const twin = { x: safe.x, y: 520 * u, width: safe.width };
-    const decisions = { x: safe.x, y: twin.y + feedHeight(TWIN_ROWS, u) + 56 * u, width: safe.width };
+    // The decisions panel leaves a lane on its right for the developer edge.
+    const decisions = { x: safe.x, y: twin.y + feedHeight(TWIN_ROWS, u) + 56 * u, width: safe.width - 48 * u };
     const developer = { x: safe.x, y: decisions.y + feedHeight(DECISION_ROWS, u) + 56 * u, width: safe.width };
     const operatorY = developer.y + feedHeight(DEVELOPER_ROWS, u) + 100 * u;
     return {
       header: { x: safe.x, y: 170 * u, width: safe.width, titleSize: 48 },
       sources,
-      sourceNode: { width: nodeWidth - 20 * u, height: 84 * u },
+      sourceNode: { width: nodeWidth - 20 * u, height: 84 * u, labelLines: 2 },
       sourceEdgeEnds: sources.map((p) => ({ x: p.x, y: twin.y })),
       twin,
       twinRows: TWIN_ROWS,
@@ -103,48 +100,59 @@ function place(layout: Layout, sourceCount: number): Placement {
         to: { x: safe.x + safe.width * 0.3, y: decisions.y },
       },
       developerEdge: {
-        // Down the right-hand side, past the decisions panel.
-        from: { x: right - 24 * u, y: decisions.y - 56 * u },
-        to: { x: right - 24 * u, y: developer.y },
+        // Down the lane right of the decisions panel, never behind it.
+        from: { x: right - 20 * u, y: decisions.y - 56 * u },
+        to: { x: right - 20 * u, y: developer.y },
       },
-      operator: { x: safe.x + safe.width / 2, y: operatorY, width: safe.width, height: 96 * u },
-      caption: { x: safe.x, y: operatorY + 110 * u, width: safe.width },
+      operator: { x: safe.x + safe.width / 2, y: operatorY, width: safe.width, height: 96 * u, short: false },
+      caption: { x: safe.x, y: operatorY + 110 * u, width: safe.width, lines: 3 },
     };
   }
 
-  // square: the twin on the left, decisions and the developer twin on the
-  // right, the operator under the twin and the caption across the bottom.
-  const nodeWidth = safe.width / n;
-  const sourcesY = 318 * u;
-  const sources = Array.from({ length: n }, (_, i) => ({ x: safe.x + nodeWidth * (i + 0.5), y: sourcesY }));
-  const top = 400 * u;
+  // square: the sources and the operator in a column on the left, each
+  // source edge running straight into the twin beside them; decisions and
+  // the developer twin side by side below; the caption across the bottom.
+  const top = 290 * u;
+  const colWidth = 210 * u;
+  const nodeHeight = 52 * u;
+  const nodeStep = 60 * u;
+  const sources = Array.from({ length: n }, (_, i) => ({ x: safe.x + colWidth / 2, y: top + nodeHeight / 2 + nodeStep * i }));
   const twinRows = 4;
-  const twin = { x: safe.x, y: top, width: 440 * u };
+  const twin = { x: safe.x + colWidth + 30 * u, y: top, width: right - (safe.x + colWidth + 30 * u) };
   const twinBottom = top + feedHeight(twinRows, u);
-  const sideX = twin.x + twin.width + 40 * u;
-  const decisions = { x: sideX, y: top, width: right - sideX };
-  const developer = { x: sideX, y: top + feedHeight(2, u) + 16 * u, width: right - sideX };
+  const rowY = twinBottom + 20 * u;
+  const half = (safe.width - 20 * u) / 2;
+  const decisions = { x: safe.x, y: rowY, width: half };
+  const developer = { x: safe.x + half + 20 * u, y: rowY, width: half };
+  const rowBottom = rowY + feedHeight(2, u);
   return {
     header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
     sources,
-    sourceNode: { width: nodeWidth - 16 * u, height: 72 * u },
-    sourceEdgeEnds: sources.map((p) => ({ x: p.x, y: top })),
+    sourceNode: { width: colWidth, height: nodeHeight, labelLines: 1 },
+    sourceEdgeEnds: sources.map((p) => ({ x: twin.x, y: p.y })),
     twin,
     twinRows,
     decisionRows: 2,
     shortTitles: true,
     decisions,
     developer,
+    // Short vertical edges from the twin's bottom into each panel below.
     decisionEdge: {
-      from: { x: twin.x + twin.width, y: decisions.y + 100 * u },
-      to: { x: decisions.x, y: decisions.y + 100 * u },
+      from: { x: decisions.x + decisions.width * 0.75, y: twinBottom },
+      to: { x: decisions.x + decisions.width * 0.75, y: rowY },
     },
     developerEdge: {
-      from: { x: twin.x + twin.width, y: developer.y + 40 * u },
-      to: { x: developer.x, y: developer.y + 40 * u },
+      from: { x: developer.x + developer.width * 0.5, y: twinBottom },
+      to: { x: developer.x + developer.width * 0.5, y: rowY },
     },
-    operator: { x: twin.x + twin.width / 2, y: twinBottom + 16 * u + 34 * u, width: twin.width, height: 68 * u },
-    caption: { x: safe.x, y: twinBottom + 16 * u + 68 * u + 30 * u, width: safe.width },
+    operator: {
+      x: safe.x + colWidth / 2,
+      y: twinBottom - nodeHeight / 2,
+      width: colWidth,
+      height: nodeHeight,
+      short: true,
+    },
+    caption: { x: safe.x, y: rowBottom + 26 * u, width: safe.width, lines: 2 },
   };
 }
 
@@ -197,6 +205,7 @@ export function DigitalTwin({ trace, frame, layout, timeline }: SceneProps) {
             label={source.label}
             level={source.level}
             emphasis={source.emphasis}
+            labelLines={p.sourceNode.labelLines}
             unit={u}
           />
         );
@@ -239,7 +248,7 @@ export function DigitalTwin({ trace, frame, layout, timeline }: SceneProps) {
         width={p.operator.width}
         height={p.operator.height}
         label="Operator"
-        sublabel={state.operator.sublabel}
+        sublabel={p.operator.short ? state.operator.short : state.operator.sublabel}
         level={state.operator.level}
         unit={u}
       />
@@ -252,6 +261,7 @@ export function DigitalTwin({ trace, frame, layout, timeline }: SceneProps) {
           title={state.caption.title}
           body={state.caption.body}
           appear={state.caption.appear}
+          maxBodyLines={p.caption.lines}
           unit={u}
         />
       ) : null}

@@ -160,7 +160,19 @@ const S1_CASES: readonly GoldenCase[] = [
  * S2 (609 frames: 36-frame intro, one beat every 39): 0 intro, 200 the first
  * decision, 503 the poster (the last answer, every panel full), 608 the end.
  */
-const S2_CASES = illustrativeCases("s2-digital-twin", { "16:9": [0, 200, 503, 608], "9:16": [503], "1:1": [230] });
+/** S2 with every source label at the schema's maximum length (they clamp inside their nodes). */
+export function s2LongLabelsTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(illustrativeTraceFile("s2-digital-twin"), "utf8"));
+  const labels = ["GitHub Enterprise EU", "Continuous checks CI", "Build machines (x6)", "Agent sessions, all"];
+  json.entities.sources.forEach((source: { label: string }, i: number) => (source.label = labels[i] as string));
+  return parseTrace(json);
+}
+
+const S2_CASES: readonly GoldenCase[] = [
+  ...illustrativeCases("s2-digital-twin", { "16:9": [0, 200, 503, 608], "9:16": [503], "1:1": [230, 503] }),
+  { id: "s2-digital-twin-9x16-long-labels", scene: "s2-digital-twin", aspect: "9:16", frames: [503], trace: s2LongLabelsTrace },
+  { id: "s2-digital-twin-1x1-long-labels", scene: "s2-digital-twin", aspect: "1:1", frames: [503], trace: s2LongLabelsTrace },
+];
 
 export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES];
 

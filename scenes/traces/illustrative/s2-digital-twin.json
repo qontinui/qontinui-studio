@@ -30,8 +30,8 @@
     { "id": "e08", "at": "2026-09-14T19:04:00Z", "kind": "twin.decided", "decision": "Run the rebase build on the build box", "basis": "it has free build slots" },
     { "id": "e09", "at": "2026-09-14T19:20:00Z", "kind": "question.asked", "session": "session-impl", "question": "May I rebase a peer's branch to unblock mine?" },
     { "id": "e10", "at": "2026-09-14T19:20:30Z", "kind": "question.answered", "question": "e09", "answer": "No: route around it on a fresh branch", "from": "policy", "document": "policy git-operations" },
-    { "id": "e11", "at": "2026-09-14T19:31:00Z", "kind": "question.asked", "session": "session-impl", "question": "Who is the changelog entry written for?" },
-    { "id": "e12", "at": "2026-09-14T19:31:20Z", "kind": "question.answered", "question": "e11", "answer": "Experienced programmers who run the factory", "from": "intent", "document": "audience profile external-operator" },
+    { "id": "e11", "at": "2026-09-14T19:31:00Z", "kind": "question.asked", "session": "session-impl", "question": "Who is the changelog written for?" },
+    { "id": "e12", "at": "2026-09-14T19:31:20Z", "kind": "question.answered", "question": "e11", "answer": "Experienced programmers who run it", "from": "intent", "document": "audience profile external-operator" },
     { "id": "e13", "at": "2026-09-14T20:05:00Z", "kind": "twin.mirrored", "source": "src-github", "fact": "PR #412 landed on main" }
   ]
 }

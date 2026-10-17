@@ -21,7 +21,8 @@ src/api/          the studio scene API — the only thing scenes import (besides
   tokens.ts       vendored design tokens (see "Design tokens")
   engine.ts       EngineAdapter / PlayerEmbedProps — the engine seam (D7)
   scene-root.tsx  what every adapter renders: canvas + scene + mode label
-src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label
+src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
+                  feed (a panel of short rows), scene header
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin", ...)
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
@@ -29,7 +30,7 @@ docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockf
 docs/             hyperframes-spike.md: the HyperFrames adapter spike result
 src/cli/          the studio-scenes CLI
 traces/           illustrative traces (fixtures)
-tests/unit/       schema, motion, timeline, S1 model, safety, catalogue and CLI-refusal tests (vitest)
+tests/unit/       schema, motion, timeline, per-scene model, safety, catalogue and CLI-refusal tests (vitest)
 tests/golden/     golden-frame + determinism tests and the committed goldens (every scene)
 tests/embed/      the embed test page (the web player as a consumer mounts it) and its server
 tests/matrix/     the scene matrix: every scene x aspect renders, embeds, shows its D2 label, honours reduced motion
@@ -169,7 +170,10 @@ only when vitest builds the page, as the scene matrix does; under
 ## Traces
 
 `src/api/trace/schema.ts` is the schema. It uses zod, it is strict, and it
-carries `trace_version: 1`. A trace contains:
+carries `trace_version: 1`. The version is bumped only on a breaking change;
+additions (new entity lists, new event kinds) keep it, so every older v1 trace
+still parses, while a trace using a newer kind is refused by an older studio
+as an unknown event. A trace contains:
 
 - `meta`:
   - `mode` (`illustrative` | `replay`) and `title`;
@@ -190,11 +194,14 @@ carries `trace_version: 1`. A trace contains:
     the twin state it was made from)
   - `question.asked` and `question.answered` (the answer, and whether it came
     from a served `policy` or `intent` document or from the `operator`; the
-    answer must reference an earlier `question.asked` event)
+    answer cites the document unless the operator gave it)
 
 The validator also checks that:
 
 - every id is unique and every reference resolves;
+- an answer references a `question.asked` event that comes strictly before
+  it (by time, then by position in the trace), and each question is answered
+  at most once;
 - replay events fall inside `date_range`;
 - an illustrative trace never claims a build-record source, and a replay never
   claims a hand-authored one;
@@ -206,7 +213,8 @@ The validator also checks that:
   test fails if a font changes without the table being regenerated.
 
 Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
-may add shape checks (`check`; S1 needs exactly one plan and at most one PR).
+may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
+S2 at most four sources).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The
@@ -401,7 +409,7 @@ pnpm typecheck
 pnpm lint            # includes the engine-seam and purity rules
 pnpm lint:selftest   # proves those rules refuse (lint-fixtures/)
 pnpm test:graph      # the engine seam on the resolved module graph
-pnpm test            # unit: schema, motion, timeline, S1 model, safety, CLI refusals
+pnpm test            # unit: schema, motion, timeline, scene models, safety, catalogue, CLI refusals
 pnpm test:golden     # golden frames, determinism, order independence, CLI path (needs browser:ensure)
 pnpm test:hyperframes  # opt-in (HYPERFRAMES=1, needs `pnpm hyperframes:image`): HyperFrames determinism
 pnpm test:matrix     # the scene matrix (needs browser:ensure); SCENE_MATRIX_ASPECTS=16:9 limits it

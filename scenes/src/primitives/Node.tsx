@@ -16,6 +16,8 @@ export interface NodeProps {
   appear?: number;
   /** 0..1 highlight (glow + scale) for the active node. */
   emphasis?: number;
+  /** The label is clamped to this many lines with an ellipsis (default 2). */
+  labelLines?: number;
   unit: number;
 }
 
@@ -30,6 +32,7 @@ export function Node({
   level,
   appear = 1,
   emphasis = 0,
+  labelLines = 2,
   unit,
 }: NodeProps) {
   const palette = attention[level];
@@ -70,6 +73,16 @@ export function Node({
           fontSize: Math.round(typeScale.label * unit),
           fontWeight: fontWeights.semibold,
           lineHeight: 1.15,
+          // Clamped, so a label never spills out of its box.
+          maxWidth: "100%",
+          padding: `0 ${Math.round(8 * unit)}px`,
+          boxSizing: "border-box",
+          display: "-webkit-box",
+          WebkitBoxOrient: "vertical",
+          WebkitLineClamp: labelLines,
+          overflow: "hidden",
+          overflowWrap: labelLines === 1 ? "normal" : "anywhere",
+          wordBreak: labelLines === 1 ? "break-all" : "normal",
         }}
       >
         {label}

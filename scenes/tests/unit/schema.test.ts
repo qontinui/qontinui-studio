@@ -33,6 +33,7 @@ describe("scene trace schema", () => {
     const trace = parseTrace(replayTraceJson());
     expect(trace.entities.prs).toEqual([]);
     expect(trace.entities.sessions).toEqual([]);
+    expect(trace.entities.sources).toEqual([]);
   });
 
   it("rejects a replay without a date range (plan D2)", () => {

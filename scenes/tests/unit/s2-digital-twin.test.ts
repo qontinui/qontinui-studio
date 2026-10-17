@@ -4,7 +4,15 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { STUDIO_FPS, findBeat, missingRequirements, parseTrace, validateTrace, type SceneTraceInput } from "../../src/api";
+import {
+  SOURCE_LABEL_MAX,
+  STUDIO_FPS,
+  findBeat,
+  missingRequirements,
+  parseTrace,
+  validateTrace,
+  type SceneTraceInput,
+} from "../../src/api";
 import { posterFrame } from "../../src/api/scene-root";
 import { s2DigitalTwin } from "../../src/scenes/s2-digital-twin";
 import { DECISION_ROWS, TWIN_ROWS, s2State, s2Timeline } from "../../src/scenes/s2-digital-twin/model";
@@ -42,6 +50,37 @@ describe("S2 trace fields", () => {
     expect(errorsOf(json)).toContain('events.9.at: answered before question "e09" was asked');
   });
 
+  it("refuses an answer at the same instant but listed before its question", () => {
+    const json = traceJson();
+    const answer = json.events.splice(9, 1)[0]!;
+    answer.at = json.events[8]!.at;
+    json.events.splice(8, 0, answer);
+    expect(errorsOf(json)).toContain('events.8.at: answered before question "e09" was asked');
+  });
+
+  it("refuses a second answer to one question", () => {
+    const json = traceJson();
+    json.events.push({ ...(json.events[9] as object), id: "e99", at: "2026-09-14T19:40:00Z" } as never);
+    expect(errorsOf(json)).toContain('events.13.question: question "e09" is answered more than once');
+  });
+
+  it("requires a document for a policy or intent answer and refuses one for the operator", () => {
+    const missing = traceJson();
+    delete (missing.events[9] as { document?: string }).document;
+    expect(errorsOf(missing)).toContain("events.9.document: an answer from policy must cite its document");
+    const operator = traceJson();
+    (operator.events[9] as { from: string }).from = "operator";
+    expect(errorsOf(operator)).toContain("events.9.document: an operator's answer cites no document");
+  });
+
+  it(`caps a source label at ${SOURCE_LABEL_MAX} characters`, () => {
+    const json = traceJson();
+    json.entities!.sources![0]!.label = "x".repeat(SOURCE_LABEL_MAX);
+    expect(validateTrace(json).ok).toBe(true);
+    json.entities!.sources![0]!.label = "x".repeat(SOURCE_LABEL_MAX + 1);
+    expect(validateTrace(json).ok).toBe(false);
+  });
+
   it("caps the scene at four sources", () => {
     const json = traceJson();
     json.entities!.sources!.push({ id: "src-5", kind: "ci", label: "Another CI" });
@@ -54,11 +93,33 @@ describe("S2 scene model", () => {
   const tl = s2Timeline(trace, STUDIO_FPS);
   const last = tl.durationInFrames - 1;
 
-  it("starts with every source inert and nothing in the twin", () => {
+  it("starts with every source inert, nothing in the twin and the operator simply not woken", () => {
     const state = s2State(trace, tl, 0);
     expect(state.sources.every((s) => s.level === "inert" && s.pulse === 0)).toBe(true);
     expect(state.twin).toEqual([]);
     expect(state.caption).toBeNull();
+    expect(state.operator.sublabel).toBe("not woken");
+    expect(state.decisionPulse).toBe(0);
+    expect(state.developerPulse).toBe(0);
+  });
+
+  it("keeps a source's edge drawn through a repeat report (no blank frame)", () => {
+    const repeat = tl.beats.filter((b) => b.event.kind === "twin.mirrored" && b.event.source === "src-github")[1]!;
+    for (const frame of [repeat.startFrame - 1, repeat.startFrame, repeat.startFrame + 1]) {
+      expect(s2State(trace, tl, frame).sources.find((s) => s.id === "src-github")?.pulse, `frame ${frame}`).toBe(1);
+    }
+    expect(s2State(trace, tl, repeat.startFrame + 2).sources.find((s) => s.id === "src-github")?.level).toBe("running");
+  });
+
+  it("draws the decision edge at the first decision and keeps it, with a decision caption", () => {
+    const first = findBeat(tl, (e) => e.kind === "twin.decided")!;
+    expect(s2State(trace, tl, first.startFrame - 1).decisionPulse).toBe(0);
+    const later = s2State(trace, tl, first.startFrame + tl.beatFrames * 3);
+    expect(later.decisionPulse).toBe(1);
+    expect(s2State(trace, tl, first.startFrame).caption).toMatchObject({
+      title: "Decided from the twin, not guessed",
+      body: "Queue PR #412 in the merge train: every required check is green.",
+    });
   });
 
   it("lights the reporting source and adds its fact to the twin", () => {
@@ -88,21 +149,26 @@ describe("S2 scene model", () => {
   });
 
   it("never wakes the operator when documents answer, and says so when one must", () => {
-    expect(s2State(trace, tl, last).operator).toEqual({ level: "inert", sublabel: "not woken · 2 answers from documents" });
+    expect(s2State(trace, tl, last).operator).toEqual({ level: "inert", sublabel: "not woken · 2 answers from documents", short: "not woken" });
     const json = traceJson();
     (json.events[11] as { from: string }).from = "operator";
+    delete (json.events[11] as { document?: string }).document;
     const woken = parseTrace(json);
     const wokenTl = s2Timeline(woken, STUDIO_FPS);
     const state = s2State(woken, wokenTl, wokenTl.durationInFrames - 1);
-    expect(state.operator).toEqual({ level: "attention", sublabel: "woken to answer" });
+    expect(state.operator).toEqual({ level: "attention", sublabel: "woken to answer", short: "woken" });
     expect(state.developer.at(-1)?.detail).toBe("from the operator");
   });
 
   it("puts the poster on the last answer, with every panel full", () => {
     const poster = posterFrame(s2DigitalTwin, trace);
-    const answers = tl.beats.filter((b) => b.event.kind === "question.answered");
-    expect(poster).toBe(answers[answers.length - 1]!.startFrame + tl.beatFrames - 1);
+    expect(poster).toBe(503);
+    expect(tl.beats.find((b) => b.startFrame === 504)?.event.id).toBe("e13");
     const state = s2State(trace, tl, poster);
+    expect(state.caption).toMatchObject({
+      title: "Answered from declared intent",
+      body: "Experienced programmers who run it. Cited: audience profile external-operator. The operator is not woken.",
+    });
     expect(state.decisions).toHaveLength(DECISION_ROWS);
     expect(state.developer).toHaveLength(2);
   });
