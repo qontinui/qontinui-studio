@@ -596,7 +596,7 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
           } else if (e.kind === "fix.pushed") fixed = true;
         });
       if (event.kind === "ci.diagnosed" && !red) issue("pr", `ci.diagnosed while "${pr}" is not red`);
-      if (event.kind === "fix.pushed" && (!diagnosed || fixed)) {
+      if (event.kind === "fix.pushed" && (!red || !diagnosed || fixed)) {
         issue("pr", `fix.pushed without a diagnosis of "${pr}"'s latest red run that is not yet fixed`);
       }
       if (event.kind === "merge_train.resolved" && !conflict) {
