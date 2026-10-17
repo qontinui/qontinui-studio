@@ -1,0 +1,36 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "Blocked work waits on a gate, not on a running session",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s3-gates-continuations.json"
+    }
+  },
+  "entities": {
+    "sessions": [
+      { "id": "s-impl", "label": "Session 1 · implementing" },
+      { "id": "s-cont", "label": "Session 2 · continuation" },
+      { "id": "s-close", "label": "Session 3 · continuation" }
+    ],
+    "gates": [
+      { "id": "g-upstream", "condition": "the upstream PR example/api#88 has landed" },
+      { "id": "g-train", "condition": "PR #415 has landed on main" }
+    ]
+  },
+  "events": [
+    { "id": "e01", "at": "2026-09-15T09:00:00Z", "kind": "session.started", "session": "s-impl" },
+    { "id": "e02", "at": "2026-09-15T11:40:00Z", "kind": "gate.registered", "gate": "g-upstream", "session": "s-impl" },
+    { "id": "e03", "at": "2026-09-15T11:41:00Z", "kind": "session.ended", "session": "s-impl" },
+    { "id": "e04", "at": "2026-09-15T16:05:00Z", "kind": "gate.observed", "gate": "g-upstream" },
+    { "id": "e05", "at": "2026-09-15T16:05:20Z", "kind": "gate.cleared", "gate": "g-upstream" },
+    { "id": "e06", "at": "2026-09-15T16:06:00Z", "kind": "session.started", "session": "s-cont", "continues": "g-upstream" },
+    { "id": "e07", "at": "2026-09-15T17:50:00Z", "kind": "gate.registered", "gate": "g-train", "session": "s-cont" },
+    { "id": "e08", "at": "2026-09-15T17:51:00Z", "kind": "session.ended", "session": "s-cont" },
+    { "id": "e09", "at": "2026-09-15T19:30:00Z", "kind": "gate.observed", "gate": "g-train" },
+    { "id": "e10", "at": "2026-09-15T19:30:20Z", "kind": "gate.cleared", "gate": "g-train" },
+    { "id": "e11", "at": "2026-09-15T19:31:00Z", "kind": "session.started", "session": "s-close", "continues": "g-train" },
+    { "id": "e12", "at": "2026-09-15T20:10:00Z", "kind": "session.ended", "session": "s-close" }
+  ]
+}

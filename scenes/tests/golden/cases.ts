@@ -174,7 +174,14 @@ const S2_CASES: readonly GoldenCase[] = [
   { id: "s2-digital-twin-1x1-long-labels", scene: "s2-digital-twin", aspect: "1:1", frames: [503], trace: s2LongLabelsTrace },
 ];
 
-export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES];
+/**
+ * S3 (528 frames: 36-frame intro, one beat every 36): 0 intro, 150 the
+ * condition observed after the wait (no session running), 251 the poster
+ * (the first continuation running), 527 the end.
+ */
+const S3_CASES = illustrativeCases("s3-gates-continuations", { "16:9": [0, 150, 251, 527], "9:16": [251], "1:1": [251] });
+
+export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES];
 
 export function goldenName(c: GoldenCase, frame: number): string {
   return `${c.id}-f${String(frame).padStart(4, "0")}.png`;

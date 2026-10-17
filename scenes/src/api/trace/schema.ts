@@ -65,12 +65,22 @@ export const sourceEntity = z
   })
   .strict();
 
+/** A condition a session waits on without running (S3). */
+export const gateEntity = z
+  .object({
+    id,
+    /** What must become true, e.g. "qontinui-web#1810 has landed". */
+    condition: z.string().min(1).max(60),
+  })
+  .strict();
+
 export const traceEntities = z
   .object({
     plans: z.array(planEntity).default([]),
     prs: z.array(prEntity).default([]),
     sessions: z.array(sessionEntity).default([]),
     sources: z.array(sourceEntity).default([]),
+    gates: z.array(gateEntity).default([]),
   })
   .strict();
 
@@ -97,7 +107,16 @@ export const traceEvent = z.discriminatedUnion("kind", [
     .object({ ...eventBase, kind: z.literal("plan.implementing"), ...planRef, session: id.optional() })
     .strict(),
   z.object({ ...eventBase, kind: z.literal("plan.shipped"), ...planRef }).strict(),
-  z.object({ ...eventBase, kind: z.literal("session.started"), session: id, plan: id.optional() }).strict(),
+  z
+    .object({
+      ...eventBase,
+      kind: z.literal("session.started"),
+      session: id,
+      plan: id.optional(),
+      /** The gate whose clearing started this session (a continuation, S3). */
+      continues: id.optional(),
+    })
+    .strict(),
   z.object({ ...eventBase, kind: z.literal("session.ended"), session: id }).strict(),
   z.object({ ...eventBase, kind: z.literal("pr.opened"), ...prRef }).strict(),
   z.object({ ...eventBase, kind: z.literal("ci.started"), ...prRef }).strict(),
@@ -154,6 +173,12 @@ export const traceEvent = z.discriminatedUnion("kind", [
       document: z.string().min(1).max(60).optional(),
     })
     .strict(),
+  // Gates and continuations (S3): a session registers a gate on a condition
+  // and ends; coord observes the condition and clears the gate; a new
+  // session continues the work (session.started with `continues`).
+  z.object({ ...eventBase, kind: z.literal("gate.registered"), gate: id, session: id }).strict(),
+  z.object({ ...eventBase, kind: z.literal("gate.observed"), gate: id }).strict(),
+  z.object({ ...eventBase, kind: z.literal("gate.cleared"), gate: id }).strict(),
 ]);
 
 export type TraceEvent = z.infer<typeof traceEvent>;
@@ -177,6 +202,9 @@ export const EVENT_KINDS = [
   "twin.decided",
   "question.asked",
   "question.answered",
+  "gate.registered",
+  "gate.observed",
+  "gate.cleared",
 ] as const satisfies readonly EventKind[];
 
 // ---------------------------------------------------------------------------
@@ -322,9 +350,19 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   const prs = unique("prs", trace.entities.prs.map((p) => p.id));
   const sessions = unique("sessions", trace.entities.sessions.map((s) => s.id));
   const sources = unique("sources", trace.entities.sources.map((s) => s.id));
+  const gates = unique("gates", trace.entities.gates.map((g) => g.id));
   unique("events", trace.events.map((e) => e.id));
   const eventsById = new Map(trace.events.map((e) => [e.id, e]));
   const answeredQuestions = new Set<string>();
+  /** Timeline order: by time, then by position in the trace. */
+  const precedes = (a: number, b: number) => {
+    const ta = Date.parse((trace.events[a] as TraceEvent).at);
+    const tb = Date.parse((trace.events[b] as TraceEvent).at);
+    return ta < tb || (ta === tb && a < b);
+  };
+  /** Index of the first event of `kind` for gate `gate`, or -1. */
+  const gateEvent = (kind: EventKind, gate: string) =>
+    trace.events.findIndex((e) => e.kind === kind && "gate" in e && e.gate === gate);
 
   trace.entities.prs.forEach((pr, i) => {
     if (!plans.has(pr.plan)) {
@@ -350,6 +388,34 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     if ("pr" in event) ref("pr", prs, event.pr);
     if ("session" in event) ref("session", sessions, event.session);
     if ("source" in event) ref("source", sources, event.source);
+    if ("gate" in event) ref("gate", gates, event.gate);
+    if (event.kind === "session.started") ref("continues", gates, event.continues);
+    const mustFollow = (kind: EventKind, gate: string, field: string, what: string) => {
+      const at = gateEvent(kind, gate);
+      if (gates.has(gate) && (at < 0 || !precedes(at, i))) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["events", i, field], message: `${what} "${gate}"` });
+      }
+    };
+    if (event.kind === "gate.observed" || event.kind === "gate.cleared") {
+      mustFollow("gate.registered", event.gate, "gate", `${event.kind} before gate.registered for`);
+      if (gateEvent(event.kind, event.gate) !== i) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["events", i, "gate"],
+          message: `${event.kind} occurs more than once for "${event.gate}"`,
+        });
+      }
+    }
+    if (event.kind === "gate.registered" && gateEvent("gate.registered", event.gate) !== i) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["events", i, "gate"],
+        message: `gate "${event.gate}" is registered more than once`,
+      });
+    }
+    if (event.kind === "session.started" && event.continues !== undefined) {
+      mustFollow("gate.cleared", event.continues, "continues", "a continuation starts before gate.cleared for");
+    }
     if (event.kind === "question.answered") {
       const asked = eventsById.get(event.question);
       const askedAt = trace.events.findIndex((e) => e.id === event.question);

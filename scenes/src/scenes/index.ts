@@ -2,8 +2,9 @@
 import type { SceneDefinition } from "../api";
 import { s1PlanLifecycle } from "./s1-plan-lifecycle";
 import { s2DigitalTwin } from "./s2-digital-twin";
+import { s3GatesContinuations } from "./s3-gates-continuations";
 
-const ALL: readonly SceneDefinition[] = [s1PlanLifecycle, s2DigitalTwin];
+const ALL: readonly SceneDefinition[] = [s1PlanLifecycle, s2DigitalTwin, s3GatesContinuations];
 
 export const scenes: Readonly<Record<string, SceneDefinition>> = Object.fromEntries(
   ALL.map((scene) => [scene.id, scene]),
