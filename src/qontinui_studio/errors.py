@@ -114,6 +114,27 @@ class GatewayRefusal(StudioError):
         self.state = state
 
 
+class ImageGenerationRefused(StudioError):
+    """Image calls refused by the image-generation off-switch: coord's
+    ``image_generation`` dial for the tenant (or for the consumer repo), or this
+    machine's ``QONTINUI_IMAGEGEN=0`` (plan 2026-10-13 Phase 12, D1.7). No
+    provider call is made and the batch stays ``generating``, so turning the
+    switch back on resumes it. ``code`` says which refusal:
+
+    * ``image_generation_off`` — the effective level is ``off``;
+    * ``image_generation_local_only`` — the level is ``local_only`` and none of
+      the brief's preferred providers is the fleet's own (unmetered, local
+      network, not through a gateway), so every one it would use is refused.
+
+    ``decision`` is the :class:`~qontinui_studio.imagegen_policy.PolicyDecision`
+    that refused, so a report can say where the level came from."""
+
+    def __init__(self, message: str, code: str, decision: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.decision = decision
+
+
 class MissingCredentialError(ProviderError):
     """The adapter's API key env var is unset."""
 

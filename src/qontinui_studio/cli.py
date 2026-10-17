@@ -5,10 +5,14 @@ Exit codes: 0 ok; 1 config/usage error; 2 publication refused by a gate;
 ``unknown`` outcome being retried) or failed; 4 no build record yet (the
 factory's record route answered 404 or was unreachable); 5 a launch trigger was
 registered but its read-back did not confirm it; 6 image generation refused
-before any provider call (``gateway_has_no_image_route``: this install routes
-model calls through a gateway with no images route, or the runner cannot say) —
+before any provider call — ``gateway_has_no_image_route`` (this install routes
+model calls through a gateway with no images route, or the runner cannot say),
 from ``brief run``, ``jobs run``, and ``launch build``/``launch run`` unless
-``--no-generate``.
+``--no-generate``; or the image-generation off-switch (coord's
+``image_generation`` dial, or ``QONTINUI_IMAGEGEN=0``): ``image_generation_off``,
+or ``image_generation_local_only`` when none of a brief's providers is the
+fleet's own image host, from ``brief run`` and ``jobs run``. A refused batch
+stays ``generating`` and resumes once the switch allows it.
 """
 
 from __future__ import annotations
@@ -24,7 +28,13 @@ import click
 from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.briefs import load_brief, validate_brief
-from qontinui_studio.errors import GatewayRefusal, ImportRefused, PublicationRefused, StudioError
+from qontinui_studio.errors import (
+    GatewayRefusal,
+    ImageGenerationRefused,
+    ImportRefused,
+    PublicationRefused,
+    StudioError,
+)
 from qontinui_studio.gateway import read_gateway_state
 from qontinui_studio.inbox import import_inbox
 from qontinui_studio.launch.facts import derive_facts
@@ -90,6 +100,10 @@ def _refuse_on_gateway(ctx: Context, hint: str | None = None) -> None:
         sys.exit(6)
 
 
+def _echo_policy_refusal(refusal: ImageGenerationRefused) -> None:
+    click.echo(f"refused: {refusal.code}: {refusal}", err=True)
+
+
 _LAUNCH_HINT = (
     "the launch kit generates its decoration first; rerun with --no-generate to assemble "
     "the launch without it"
@@ -98,6 +112,11 @@ _LAUNCH_HINT = (
 
 def _report(outcome: BatchOutcome) -> int:
     click.echo(f"batch {outcome.batch_id}: {outcome.status}")
+    if outcome.refused is not None:
+        _echo_policy_refusal(outcome.refused)
+        return 6
+    if outcome.imagegen:
+        click.echo(f"  image generation: {outcome.imagegen}")
     if outcome.error:
         click.echo(f"  error: {outcome.error}")
         return 1
@@ -179,6 +198,9 @@ def brief_run(obj: Obj, path: Path, no_publish: bool) -> None:
     _refuse_on_gateway(ctx)
     try:
         outcome = run_brief(ctx, path, publish=not no_publish)
+    except ImageGenerationRefused as e:
+        _echo_policy_refusal(e)
+        sys.exit(6)
     except StudioError as e:
         raise click.ClickException(str(e)) from e
     sys.exit(_report(outcome))

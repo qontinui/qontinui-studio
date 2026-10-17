@@ -23,17 +23,18 @@ from typing import Any
 
 from PIL import Image
 
-from qontinui_studio import provenance
+from qontinui_studio import imagegen_policy, provenance
 from qontinui_studio.adapters import AdapterSet, GenerationRequest, SubmittedJob
 from qontinui_studio.adapters.base import staged_provenance
 from qontinui_studio.briefs import LoadedBrief, load_brief, validate_brief
-from qontinui_studio.errors import ConfigError, LeaseLost, StudioError
+from qontinui_studio.errors import ConfigError, ImageGenerationRefused, LeaseLost, StudioError
 from qontinui_studio.gates import (
     BridgeFactory,
     HttpUiBridge,
     ManifestFetch,
     http_manifest_fetch,
 )
+from qontinui_studio.imagegen_policy import ImagegenPolicy, PolicyDecision
 from qontinui_studio.library import Library, TermsSnapshot
 from qontinui_studio.notify import Notifier
 from qontinui_studio.postprocess import crop_to_slot, export, remove_background, sha256_file
@@ -68,6 +69,12 @@ class BatchOutcome:
     # (a host answering ``busy`` again and again): why, and how to resume.
     stopped_waiting: str | None = None
     unavailable_providers: dict[str, str] = field(default_factory=dict)
+    # The image-generation level this run drove the batch under, and where it
+    # came from (``PolicyDecision.describe``).
+    imagegen: str | None = None
+    # Set when the image-generation off-switch refused the batch: no provider
+    # call was made and the batch is still ``generating``.
+    refused: ImageGenerationRefused | None = None
     publish: PublishResult | None = None
     error: str | None = None
     # False when this call did not drive the batch (claimed elsewhere, or no
@@ -91,12 +98,16 @@ class Context:
     fetch: ManifestFetch = http_manifest_fetch
     # Told about every wait before it is slept (seconds, why) — the CLI prints it.
     on_wait: Callable[[float, str], None] | None = None
+    # The image-generation off-switches (coord's dial + QONTINUI_IMAGEGEN),
+    # consulted before every batch is driven and before every scheduler
+    # iteration (plan 2026-10-13 Phase 12).
+    imagegen: ImagegenPolicy = field(default_factory=ImagegenPolicy)
 
-    def scheduler(self) -> Scheduler:
+    def scheduler(self, adapters: AdapterSet | None = None) -> Scheduler:
         return Scheduler(
             self.conn,
             self.inventory,
-            self.adapters,
+            self.adapters if adapters is None else adapters,
             self.workspace.staging_dir,
             self.workspace.raw_dir,
             clock=self.clock,
@@ -161,6 +172,30 @@ def _adapter_kind(ctx: Context, job: sqlite3.Row) -> str:
         return ctx.inventory.get(str(job["provider"])).adapter
     except ConfigError:
         return "unrecorded (claimed before schema v2)"
+
+
+def target_repos(ctx: Context, site_ids: list[str]) -> set[str | None]:
+    """The consumer repos the image-generation dial is read for: each target
+    site's ``repo``, or None (the tenant-wide level) for a site that declares
+    none or is unknown here. No targets reads the tenant-wide level."""
+    repos: set[str | None] = set()
+    for sid in site_ids:
+        site = ctx.sites.get(sid)
+        repos.add(site.repo if site is not None else None)
+    return repos or {None}
+
+
+def policy_adapters(
+    ctx: Context, repos: set[str | None], preference: list[str]
+) -> tuple[AdapterSet, PolicyDecision]:
+    """Read the off-switches and return the adapters they allow, with the
+    decision. Raises :class:`ImageGenerationRefused` when they allow no call."""
+    decision = ctx.imagegen.decide(ctx.conn, repos, ctx.clock())
+    return imagegen_policy.restrict(ctx.adapters, decision, ctx.inventory, preference), decision
+
+
+def _batch_sites(row: sqlite3.Row) -> list[str]:
+    return [str(site) for site, _ in json.loads(row["targets_json"])]
 
 
 INGEST_LEASE_S = 600.0
@@ -534,11 +569,28 @@ def _drive_leased(ctx: Context, row: sqlite3.Row, lease: _Lease) -> BatchOutcome
             ctx.conn.commit()
         raise ConfigError(reason)
     outcome = BatchOutcome(batch_id=batch_id, status=row["status"])
-    outcome.unavailable_providers = dict(ctx.adapters.unavailable)
-    report = ctx.scheduler().run(
+    # The off-switches, before any provider call; read again before every
+    # scheduler iteration below.
+    repos = target_repos(ctx, _batch_sites(row))
+    preference = loaded.brief.provider_preference
+    adapters, decision = policy_adapters(ctx, repos, preference)
+    outcome.unavailable_providers = dict(adapters.unavailable)
+    outcome.imagegen = decision.describe()
+    scheduler = ctx.scheduler(adapters)
+
+    def before_iteration() -> None:
+        lease.renew()
+        # Within one poll of the dial changing: ``off`` raises (stopping the
+        # run before the next provider call), ``local_only``/``on`` swap the
+        # adapters the next step may use.
+        scheduler.adapters, now = policy_adapters(ctx, repos, preference)
+        outcome.unavailable_providers = dict(scheduler.adapters.unavailable)
+        outcome.imagegen = now.describe()
+
+    report = scheduler.run(
         {batch_id: _request_for(loaded)},
         sleep=ctx.sleep,
-        on_iteration=lease.renew,
+        on_iteration=before_iteration,
         on_wait=ctx.on_wait,
     )
     outcome.stopped_waiting = report.stopped_waiting
@@ -596,6 +648,9 @@ def run_brief(ctx: Context, brief_path: Path, publish: bool = True) -> BatchOutc
     problems = validate_brief(loaded.brief, ctx.sites, ctx.inventory)
     if problems:
         raise ConfigError(f"{brief_path}: " + "; ".join(problems))
+    # Refused by an off-switch: no batch is created and no provider is called.
+    sites = [t.site for t in loaded.brief.targets if t.is_slot and t.site]
+    policy_adapters(ctx, target_repos(ctx, sites), loaded.brief.provider_preference)
     batch_id = new_batch(ctx, loaded, publish=publish)
     return drive_batch(ctx, batch_id, publish=publish)
 
@@ -637,6 +692,13 @@ def resume_all(ctx: Context, publish: bool = True) -> list[BatchOutcome]:
                 outcomes.append(stranded)
             else:
                 outcomes.append(drive_batch(ctx, r["id"], publish=publish))
+        except ImageGenerationRefused as e:
+            # Not an error of the batch: it stays generating, and resumes once
+            # the switch allows it.
+            ctx.conn.rollback()
+            outcomes.append(
+                BatchOutcome(batch_id=r["id"], status="generating", driven=False, refused=e)
+            )
         except Exception as e:  # one bad batch never stops the others
             ctx.conn.rollback()
             status = ctx.conn.execute(

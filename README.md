@@ -290,7 +290,8 @@ Exit codes: `0` ok, `1` config error, `2` publication refused by a gate,
 `3` generation deferred (quota, a host's `busy`/`deferred`, an `unknown` being
 retried) or failed, `4` no build record yet, `5` a trigger was registered but its
 read-back did not confirm it, `6` image generation refused before any provider
-call (`gateway_has_no_image_route`).
+call (`gateway_has_no_image_route`, `image_generation_off`,
+`image_generation_local_only`).
 
 ### The library: import, approval, export
 
@@ -433,6 +434,8 @@ upgraded in place the first time any command opens it.
 | `STUDIO_LOCAL_NETWORK_HOSTS` | comma-separated host names (e.g. a MagicDNS short name) the operator vouches for as local-network, for an `unmetered` row |
 | `STUDIO_LOCAL_GPU_BASE_URL` | the `local-gpu` row's facade address on this machine (`base_url_env`); unset means the row's loopback `base_url` |
 | `QONTINUI_RUNNER_URL` | where `brief run`, `jobs run`, `launch build` and `launch run` read the runner's model-gateway state (`GET /model-gateway`; default `http://127.0.0.1:9876`) |
+| `QONTINUI_IMAGEGEN` | this machine's image-generation switch: `0` turns generation off with no coord read (any value but `0`, `1` or empty is read as off too) |
+| `COORD_DEVICE_JWT` (then `~/.qontinui/coord-device-jwt`, then a runner mint) | reading coord's `image_generation` dial before generating. `COORD_HTTP_URL` overrides the coord host; a runner-minted token goes to production coord only. `STUDIO_COORD_TENANT_ID` names the tenant to a runner bound to several. |
 | `STUDIO_WEB_BEARER` or `STUDIO_WEB_BEARER_FILE` | the launch kit's authed build-record door (`record.door: authed`) |
 | `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | `studio launch register-trigger`, and operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. Notice files are timestamped and never overwritten. |
 
@@ -510,6 +513,24 @@ runner that cannot say, refuses every image call with `gateway_has_no_image_rout
 (exit 6, from `brief run`, `jobs run`, and `launch build` / `launch run` unless
 `--no-generate`) and makes no vendor or local call (decision record
 `gateway-tenants-route-every-model-call-through-the-gateway`).
+
+**The image-generation off-switches** (plan 2026-10-13 Phase 12). Image
+generation ships on. Before a batch is driven, and again before every scheduler
+iteration (a reading is reused for 60 s), studio reads coord's
+`image_generation` dial — `GET /coord/fleet-policy?domain=image_generation`,
+naming each target site's `repo` (`owner/name`) so a per-repo override governs
+it; a site with no `repo` reads the tenant level, and a batch takes the most
+restrictive level of its sites. `off` refuses with `image_generation_off`.
+`local_only` admits only the fleet's own image host (an `unmetered` row on the
+local network, called directly) and refuses every cloud adapter and anything
+riding a gateway route; a brief none of whose providers qualifies is refused
+with `image_generation_local_only`. `QONTINUI_IMAGEGEN=0` is `off` on this
+machine without asking coord. An unreadable dial is the level coord last
+answered for that repo (kept in `.studio/studio.db`), and with none,
+`local_only` — never the `on` default. A refused batch stays `generating`
+(exit 6 from `brief run` and `jobs run`); the launch kit assembles without
+decoration and says why. The switches are not the authorization; the image
+facade's loopback bind is.
 
 ### Layout
 

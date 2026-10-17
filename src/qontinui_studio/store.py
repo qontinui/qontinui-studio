@@ -237,9 +237,19 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   approval and gates nothing. ``tagged_by`` is a reviewer alias or
 #   ``brief:<brief id>`` for a tag a brief applied at ingest. Existing assets
 #   carry no tags.
+#
+# Version 4 — the image-generation dial's last-known level (plan 2026-10-13
+# Phase 12 step 3):
+#
+# * ``imagegen_dial_last_known``: one row per consumer repo the dial was read
+#   for (``repo_key`` = the lowercased ``owner/name``, or ``''`` for a
+#   tenant-wide read), holding the level coord last ANSWERED and when. A CLI
+#   run has no memory of its own, so without this row an unreadable dial could
+#   only fall to the no-last-known default (``local_only``). Written only from
+#   a successful read; never from a default.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _BATCHES_V1 = """
 CREATE TABLE batches_v1 (
@@ -388,10 +398,24 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX asset_tags_tag ON asset_tags (tag, asset_uid)")
 
 
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE imagegen_dial_last_known (
+            repo_key TEXT PRIMARY KEY,
+            level TEXT NOT NULL CHECK (level IN ('on', 'local_only', 'off')),
+            resolved_scope TEXT,
+            read_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
 }
 
 

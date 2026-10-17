@@ -106,11 +106,15 @@ def _through_gateway(
 class AdapterSet:
     """The adapters that could be built, and why each other provider is off.
     ``refusal`` is set when NO image call may be made at all (a gateway with no
-    images route, or an unknown gateway state)."""
+    images route, or an unknown gateway state). ``route`` is the declared
+    gateway's images route every adapter here was pointed at, or None when they
+    call their own hosts — the image-generation dial's ``local_only`` refuses
+    every adapter riding a gateway route (:mod:`qontinui_studio.imagegen_policy`)."""
 
     adapters: dict[str, ProviderAdapter] = field(default_factory=dict)
     unavailable: dict[str, str] = field(default_factory=dict)
     refusal: GatewayRefusal | None = None
+    route: str | None = None
 
 
 def build_adapters(
@@ -162,4 +166,5 @@ def build_adapters(
         except (AdapterDisabledError, MissingCredentialError) as e:
             result.unavailable[provider.id] = str(e)
     result.refusal = refusal
+    result.route = route
     return result
