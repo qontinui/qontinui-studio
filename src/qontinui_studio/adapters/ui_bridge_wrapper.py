@@ -37,17 +37,22 @@ past the run horizon (nothing started); 404 (wrapper not installed) and any
 other 4xx -> permanent; a drop after sending, any 5xx other than 503, or an
 unreadable body -> ``ProviderOutcomeUnknown`` (the prompt may have been typed).
 
-Every message built from the runner's or wrapper's text is redacted (query
-strings and e-mail addresses removed) and truncated before it can reach a
-job row, a log or a notice.
+Nothing the runner or the wrapper SAYS is persisted. Their free text can carry
+a conversation id, a sign-in continuation, an account name or credentials in a
+URL, and pattern-based redaction of that text leaks (review of #21, round 4).
+So every message, latch file and notice is built only from an allowlisted
+structure: an outcome code from a closed set, the provider row id, the wrapper
+id, an HTTP status, and the provider's KNOWN host from providers.yaml (never
+parsed from text). Any free text is replaced by ``omitted(text)`` — its length
+and a sha256 prefix, for correlation only.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
-import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -91,30 +96,12 @@ TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 UNREACHABLE_RETRY_AFTER_S = 3600.0
 MAX_DETAIL_CHARS = 300
 
-# A URL is reduced to scheme + host: its path can carry a conversation id
-# (gemini.google.com/app/<id>, chatgpt.com/c/<id>), its query a sign-in
-# continuation or account hint.
-# Any scheme, any case; the userinfo (``user:pw@``) is dropped with the path.
-_URL = re.compile(
-    r"\b([a-z][a-z0-9+.-]*://)(?:[^\s/@'\"]*@)?([^\s/?#'\"@]+)[^\s'\"]*", re.IGNORECASE
-)
-# A scheme-less host followed by a path (``gemini.google.com/app/<id>``): only
-# a token whose last label is alphabetic, not preceded by a path character, so
-# file paths (``dist/cli.js``, ``~/.qontinui/...``) are left alone.
-_BARE_HOST_PATH = re.compile(
-    r"(?<![\w./~@:-])((?:[a-z0-9-]+\.)+[a-z]{2,})/[^\s'\"]*", re.IGNORECASE
-)
-_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-
-def redact(text: object) -> str:
-    """Text fit for a job row, a latch file or a notice: every URL — with or
-    without a scheme, in any case — keeps only its host (and scheme), userinfo
-    and e-mail addresses are removed, and the result is bounded."""
-    out = _URL.sub(r"\1\2", str(text))
-    out = _BARE_HOST_PATH.sub(r"\1", out)
-    out = _EMAIL.sub("<email>", out)
-    return out if len(out) <= MAX_DETAIL_CHARS else out[: MAX_DETAIL_CHARS - 1] + "…"
+def omitted(text: object) -> str:
+    """Free text from the runner or wrapper, never echoed: its length and a
+    sha256 prefix only, so two reports of the same text can be correlated."""
+    raw = str(text).encode("utf-8", "replace")
+    return f"detail omitted ({len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:12]})"
 
 
 class HandoffLatch:
@@ -136,14 +123,20 @@ class HandoffLatch:
             return None
         except (OSError, ValueError):
             # Unreadable is still latched: fail closed.
-            return {"reason": "state_unreadable", "detail": "the latch file is unreadable"}
-        return data if isinstance(data, dict) else {"reason": "state_unreadable"}
+            return {"reason": "state_unreadable"}
+        if not isinstance(data, dict) or data.get("reason") not in OperatorHandoff.REASONS:
+            return {"reason": "state_unreadable"}
+        return data
 
-    def set(self, provider_id: str, reason: str, detail: str) -> bool:
-        """Latch; returns False when it was already latched (notify once)."""
+    def set(self, provider_id: str, reason: str, detail: str | None = None) -> bool:
+        """Latch; returns False when it was already latched (notify once). Only
+        the reason code, the time and an ``omitted`` digest of any detail are
+        written — never the detail itself."""
         path = self._path(provider_id)
         self.directory.mkdir(parents=True, exist_ok=True)
-        payload = {"reason": reason, "detail": detail, "at": datetime.now(UTC).isoformat()}
+        payload: dict[str, Any] = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        if detail:
+            payload["detail_omitted"] = omitted(detail)
         try:
             with path.open("x", encoding="utf-8") as f:
                 json.dump(payload, f)
@@ -162,9 +155,11 @@ class HandoffLatch:
         latch = self.get(provider_id)
         if latch is None:
             return None
+        at = latch.get("at")
+        when = at if isinstance(at, str) and len(at) <= 40 else "?"
         return (
-            f"operator hand-off latched ({latch.get('reason')}) since {latch.get('at', '?')}: "
-            f"{latch.get('detail', '')}; resolve it in the browser, then clear it with "
+            f"operator hand-off latched ({latch.get('reason')}) since {when}; resolve it in the "
+            "browser, then clear it with "
             f"`studio providers clear-handoff {provider_id}` and, on the wrapper's machine, "
             f"`node <wrappers root>/{provider_id}/dist/cli.js clear-handoff`"
         )
@@ -181,14 +176,15 @@ class UIBridgeWrapperAdapter:
         override: OperatorOverride,
         state_dir: Path,
         notifier: Notifier | None = None,
+        known_host: str | None = None,
         client: httpx.Client | None = None,
         dispatch_timeout_s: float = DISPATCH_TIMEOUT_S,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not is_local_network(runner_url):
             raise PermanentProviderError(
-                f"{provider_id}: the runner URL {redact(runner_url)!r} is not on this machine or "
-                "the local network; the wrapper drives the operator's own browser session"
+                f"{provider_id}: the configured runner URL is not on this machine or the local "
+                "network; the wrapper drives the operator's own browser session"
             )
         self.provider_id = provider_id
         self.model = model
@@ -201,6 +197,9 @@ class UIBridgeWrapperAdapter:
         self.latch = HandoffLatch(state_dir / "handoffs")
         self.pace_path = state_dir / "wrapper-pace" / f"{provider_id}.json"
         self.notifier = notifier
+        # The provider's own host as providers.yaml declares it — the only
+        # location any message may name. Never parsed from the wrapper's text.
+        self.known_host = known_host
         self.clock = clock
         self.dispatch_timeout_s = dispatch_timeout_s
         self.hard_timeout_s = dispatch_timeout_s + CONNECT_TIMEOUT_S
@@ -262,12 +261,13 @@ class UIBridgeWrapperAdapter:
         except httpx.TransportError as e:
             if never_sent(e):
                 raise ProviderBusy(
-                    f"{self.provider_id}: runner unreachable at {self.runner_url}: {redact(e)}",
+                    f"{self.provider_id}: runner unreachable (transport_error {type(e).__name__})",
                     UNREACHABLE_RETRY_AFTER_S,
                     code="runner_unreachable",
                 ) from e
             raise ProviderOutcomeUnknown(
-                f"{self.provider_id}: dispatch dropped: {redact(e)}"
+                f"{self.provider_id}: dispatch dropped after sending (transport_error "
+                f"{type(e).__name__})"
             ) from e
         finally:
             if self._client is None:
@@ -282,7 +282,7 @@ class UIBridgeWrapperAdapter:
             raise ProviderOutcomeUnknown(
                 f"{self.provider_id}: runner answered HTTP {resp.status_code} with a non-JSON body"
             ) from e
-        error = redact(envelope.get("error")) if isinstance(envelope, dict) else ""
+        error = omitted(envelope.get("error")) if isinstance(envelope, dict) else "no body"
         status = resp.status_code
         if status == 503:
             raise ProviderBusy(
@@ -309,7 +309,7 @@ class UIBridgeWrapperAdapter:
         if isinstance(result, dict) and "status" not in result and "success" in result:
             if result.get("success") is not True:
                 raise ProviderOutcomeUnknown(
-                    f"{self.provider_id}: wrapper reported failure: {redact(result.get('error'))}"
+                    f"{self.provider_id}: wrapper reported failure; {omitted(result.get('error'))}"
                 )
             result = result.get("data")
         if not isinstance(result, dict):
@@ -318,10 +318,11 @@ class UIBridgeWrapperAdapter:
             )
         return result
 
-    def _hand_off(self, reason: str, detail: str) -> OperatorHandoff:
+    def _hand_off(self, reason: str, detail: str | None) -> OperatorHandoff:
+        where = f" at {self.known_host}" if self.known_host else ""
         message = (
-            f"operator hand-off needed ({reason}): {self.provider_id} stopped and did nothing "
-            f"further; {detail}"
+            f"operator hand-off needed ({reason}): {self.provider_id}{where} stopped and did "
+            "nothing further"
         )
         if self.latch.set(self.provider_id, reason, detail):
             if self.notifier is not None:
@@ -343,8 +344,7 @@ class UIBridgeWrapperAdapter:
             reason = str(result.get("reason") or "ui_changed")
             if reason not in OperatorHandoff.REASONS:
                 reason = "ui_changed"
-            detail = redact(result.get("detail") or "resolve it in the browser")
-            raise self._hand_off(reason, detail)
+            raise self._hand_off(reason, str(result.get("detail") or ""))
         if state == "paced":
             raise ProviderBusy(
                 f"{self.provider_id}: human-pace interval not yet elapsed",
@@ -355,7 +355,7 @@ class UIBridgeWrapperAdapter:
             raise QuotaExhaustedError(f"{self.provider_id}: the wrapper's daily cap is spent")
         if state != "done":
             raise ProviderOutcomeUnknown(
-                f"{self.provider_id}: wrapper answered an unknown status {redact(state)!r}"
+                f"{self.provider_id}: wrapper answered an unknown status; {omitted(state)}"
             )
         images = result.get("images")
         if not isinstance(images, list) or not images:
