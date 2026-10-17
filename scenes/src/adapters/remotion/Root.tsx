@@ -7,8 +7,11 @@ import { getScene, scenes } from "../../scenes";
 import s1Illustrative from "../../../traces/illustrative/s1-plan-lifecycle.json";
 import { StudioComposition, type StudioCompositionProps } from "./StudioComposition";
 
-/** Default (preview) trace per scene; a CLI render always passes its own. */
-const defaultTraces: Record<string, unknown> = {
+/**
+ * Default (preview) trace per scene: its committed illustrative trace. A CLI
+ * render always passes its own. A unit test checks every scene has one.
+ */
+export const defaultTraces: Record<string, unknown> = {
   "s1-plan-lifecycle": s1Illustrative,
 };
 

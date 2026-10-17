@@ -1,11 +1,16 @@
-# Scene framework CI (plan 2026-10-09-qontinui-marketing-studio-animated-process-explainers, Phase 2).
+# Scene framework CI (plan 2026-10-09-qontinui-marketing-studio-animated-process-explainers, Phases 2-3).
 #
 # Arming gate: golden-frame fails on any visual change to S1 (exact full-size
 # SHA-256) and on any render-history or CLI-path nondeterminism;
 # import-lint runs the rules, a self-test proving they refuse, and the
 # resolved-module-graph test (the seam's authority); the
 # golden-frame job's determinism test requires two renders of one trace to be
-# byte-identical. Actions are pinned by commit SHA.
+# byte-identical. Phase 3's arming gate is the scene-matrix job: for every
+# registered scene, one job per aspect renders the whole scene and its poster,
+# embeds it in the test page, asserts the on-screen D2 mode label
+# (illustrative, and replay with date range and source), and checks that
+# prefers-reduced-motion shows the poster with a play control and never
+# autoplays. Actions are pinned by commit SHA.
 name: scenes
 
 on:
@@ -127,3 +132,39 @@ jobs:
             scenes/.golden-out/
             !scenes/.golden-out/cli/
           if-no-files-found: ignore
+
+  scene-matrix:
+    name: scene-matrix (${{ matrix.aspect }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        aspect: ["16:9", "9:16", "1:1"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          package_json_file: scenes/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: scenes/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Shared libraries for Chrome Headless Shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 libgbm1 \
+            libasound2t64 libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 \
+            libxdamage1 libpango-1.0-0 libcairo2 libcups2t64
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: scenes/node_modules/.remotion
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('scenes/pnpm-lock.yaml') }}
+      - run: pnpm browser:ensure
+      - name: Scene matrix (render, embed, D2 label, reduced motion)
+        run: pnpm test:matrix
+        env:
+          SCENE_MATRIX_ASPECTS: ${{ matrix.aspect }}

@@ -80,6 +80,17 @@ export class AdapterClosed extends Error {
 }
 
 /** Props of an adapter's embeddable web player. */
+/**
+ * Props of an adapter's embeddable web player.
+ *
+ * Reduced motion (plan Phase 3): under `prefers-reduced-motion: reduce` a
+ * player NEVER autoplays, whatever `autoPlay` says. It shows the scene's
+ * poster frame (`posterFrame`) with a play control (shown even when
+ * `controls` is false) and plays only when the viewer presses it. Until the
+ * preference is known (server rendering, no `matchMedia`) it behaves as if
+ * motion were reduced. Without the preference a player that is not
+ * autoplaying also opens on the poster frame.
+ */
 export interface PlayerEmbedProps {
   scene: string;
   /** Untrusted input: the player validates it and refuses an unproven replay. */

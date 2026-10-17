@@ -29,6 +29,7 @@ export function SceneRoot({ scene, trace, frame, aspect }: SceneRootProps) {
     <div
       data-studio-scene={scene.id}
       data-studio-aspect={aspect}
+      data-studio-frame={frame}
       style={{
         position: "relative",
         width: layout.width,
@@ -53,4 +54,16 @@ export function SceneRoot({ scene, trace, frame, aspect }: SceneRootProps) {
 /** Duration in frames of `scene` for `trace` at the studio frame rate. */
 export function sceneDuration(scene: SceneDefinition, trace: SceneTrace): number {
   return scene.timeline(trace, STUDIO_FPS).durationInFrames;
+}
+
+/**
+ * The poster frame of `scene` for `trace` (see `SceneDefinition.poster`):
+ * the scene's own choice, or its last frame, always within its duration.
+ */
+export function posterFrame(scene: SceneDefinition, trace: SceneTrace): number {
+  const timeline = scene.timeline(trace, STUDIO_FPS);
+  const last = timeline.durationInFrames - 1;
+  const chosen = scene.poster ? scene.poster(timeline) : last;
+  if (!Number.isInteger(chosen)) throw new Error(`scene "${scene.id}": poster frame ${chosen} is not an integer`);
+  return Math.min(last, Math.max(0, chosen));
 }

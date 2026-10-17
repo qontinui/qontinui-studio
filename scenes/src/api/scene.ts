@@ -36,6 +36,13 @@ export interface SceneDefinition {
   check?: (trace: SceneTrace) => string[];
   /** Trace → timeline; determines the render's duration. */
   timeline: (trace: SceneTrace, fps: number) => Timeline;
+  /**
+   * The poster frame: what an embed shows before it plays, and all it shows
+   * under `prefers-reduced-motion: reduce` until the viewer presses play.
+   * Choose a frame that tells the scene's story on its own. Default: the
+   * last frame. Clamped to the scene's duration.
+   */
+  poster?: (timeline: Timeline) => number;
   Component: ComponentType<SceneProps>;
 }
 

@@ -5,9 +5,10 @@ software factory works, drawn by code from an **event trace**. One scene renders
 both as a video file (mp4, webm, gif, png) and as an embeddable web player.
 
 Plan: `2026-10-09-qontinui-marketing-studio-animated-process-explainers`
-(qontinui-dev-notes), Phase 2. This package is the tool. Traces, renders and
-assets made for a particular production live in that production's own repository
-(plan D6a). The one trace committed here is the illustrative fixture the tests use.
+(qontinui-dev-notes), Phases 2 (framework) and 3 (scenes). This package is the
+tool. Traces, renders and assets made for a particular production live in that
+production's own repository (plan D6a). The traces committed here are the scenes' illustrative fixtures,
+one per scene, which the tests and the embed page use.
 
 ## Layout
 
@@ -28,8 +29,10 @@ docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockf
 docs/             hyperframes-spike.md: the HyperFrames adapter spike result
 src/cli/          the studio-scenes CLI
 traces/           illustrative traces (fixtures)
-tests/unit/       schema, motion, timeline, S1 model, safety and CLI-refusal tests (vitest)
-tests/golden/     golden-frame + determinism tests and the committed goldens
+tests/unit/       schema, motion, timeline, S1 model, safety, catalogue and CLI-refusal tests (vitest)
+tests/golden/     golden-frame + determinism tests and the committed goldens (every scene)
+tests/embed/      the embed test page (the web player as a consumer mounts it) and its server
+tests/matrix/     the scene matrix: every scene x aspect renders, embeds, shows its D2 label, honours reduced motion
 lint-fixtures/    files that MUST fail lint (the lint self-test); never part of the build
 fontconfig/       the fontconfig the headless browser runs under
 assets/fonts/     bundled Inter 4.1, full character set (OFL)
@@ -133,6 +136,26 @@ sideways nor reach the header. The full source always stays in the trace;
 lines. Goldens cover a 120-character realistic source, a source of 120 "W"s
 and a 160-character title. Both mode badges use neutral token colours
 (border/brand), not attention-layer state colours.
+
+## Embedding and reduced motion
+
+The adapter's web player (`StudioPlayer`, `PlayerEmbedProps` in
+`src/api/engine.ts`) validates the trace it is given and refuses an unproven
+replay (see "Traces"). Each scene declares a **poster frame**
+(`SceneDefinition.poster`, default its last frame; `posterFrame()` in
+`src/api/scene-root.tsx`): the frame that tells the scene's story on its own.
+
+- An embed that is not autoplaying opens on the poster frame.
+- Under `prefers-reduced-motion: reduce` an embed **never autoplays**, whatever
+  `autoPlay` says. It shows the poster frame and a play control (even when
+  `controls` is false) and plays only when the viewer presses it. Until the
+  preference is known (server rendering) it assumes reduced motion; a change
+  of preference remounts the player.
+
+`pnpm embed:serve` serves the embed test page (`tests/embed/page.tsx`) for a
+human: `http://127.0.0.1:4173/?scene=<id>&aspect=16:9&autoplay=1`, with
+`mode=replay` (the same events as an attested replay, to see the replay
+label) and `controls=0`.
 
 ## Traces
 
@@ -366,12 +389,32 @@ pnpm test:graph      # the engine seam on the resolved module graph
 pnpm test            # unit: schema, motion, timeline, S1 model, safety, CLI refusals
 pnpm test:golden     # golden frames, determinism, order independence, CLI path (needs browser:ensure)
 pnpm test:hyperframes  # opt-in (HYPERFRAMES=1, needs `pnpm hyperframes:image`): HyperFrames determinism
+pnpm test:matrix     # the scene matrix (needs browser:ensure); SCENE_MATRIX_ASPECTS=16:9 limits it
 ```
 
-The golden suite renders fourteen S1 frames: five in 16:9, one each in 9:16
-and 1:1, one per aspect of a replay with the longest realistic source, and at
-9:16 and 1:1 a replay whose source is 120 "W"s and a trace with a
-160-character title, all at native size (scale 1).
+The golden suite renders, for every scene, its illustrative trace at each
+aspect (`illustrativeCases` in `tests/golden/cases.ts`; the catalogue unit
+test fails if a scene lacks an aspect). For S1 that is five frames in 16:9
+and one each in 9:16 and 1:1, plus one frame per aspect of a replay with the
+longest realistic source, and at 9:16 and 1:1 a replay whose source is 120
+"W"s and a trace with a 160-character title, all at native size (scale 1).
+
+**Scene matrix** (`tests/matrix/scene-matrix.test.ts`, plan Phase 3's arming
+gate; CI runs one `scene-matrix` job per aspect). For every registered scene
+at each aspect it:
+
+- renders the whole scene to mp4 through the adapter (native size, the
+  timeline's duration) and its poster frame as a still;
+- mounts the scene in the embed test page with its illustrative trace, in the
+  pinned Chrome Headless Shell, and checks that it plays;
+- asserts the D2 mode label **on screen**: the text is the trace's own mode
+  line (ILLUSTRATIVE; and, for the same events as an attested replay, REPLAY
+  with date range and source), and the label lies inside the scene's frame,
+  is visible and opaque, and is the topmost scene element at its centre;
+- checks that an embed not asked to autoplay stays on the poster frame, and
+  that under `prefers-reduced-motion: reduce` an embed asked to autoplay with
+  no controls stays on the poster frame, shows a play control, and plays only
+  once it is pressed.
 
 - **Golden gate (exact):** each full-size frame's SHA-256 must equal the
   committed `__goldens__/<name>.png.sha256`. Beside it is a 2x2-reduced PNG

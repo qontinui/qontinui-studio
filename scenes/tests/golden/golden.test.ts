@@ -1,6 +1,6 @@
 /**
- * Golden-frame, determinism and order-independence gate for S1 (plan Phase 2
- * arming line).
+ * Golden-frame, determinism and order-independence gate for every scene
+ * (plan Phase 2 arming line; Phase 3 adds the scenes).
  *
  * - Golden: each full-size frame's SHA-256 must equal the committed
  *   `__goldens__/<name>.sha256`. A 2x2-reduced PNG is kept beside it for
@@ -29,7 +29,6 @@ import {
   GOLDEN_DOWNSAMPLE,
   OUT_DIR,
   PIXEL_THRESHOLD,
-  SCENE_ID,
   type GoldenCase,
   goldenName,
 } from "./cases";
@@ -38,20 +37,20 @@ const UPDATE = process.env.UPDATE_GOLDENS === "1";
 
 /**
  * Frames rendered alone, each in a fresh browser, for the order test: every
- * 16:9 golden frame (case 0), plus one frame each at 9:16 (case 1) and 1:1
- * (case 2).
+ * frame of each case marked `alone` (per scene: its 16:9 frames, plus its
+ * 9:16 and 1:1 frames).
  */
-const ALONE: readonly { caseIndex: number; frame: number }[] = [
-  ...(GOLDEN_CASES[0] as GoldenCase).frames.map((frame) => ({ caseIndex: 0, frame })),
-  { caseIndex: 1, frame: (GOLDEN_CASES[1] as GoldenCase).frames[0] as number },
-  { caseIndex: 2, frame: (GOLDEN_CASES[2] as GoldenCase).frames[0] as number },
-];
+const ALONE: readonly { caseIndex: number; frame: number }[] = GOLDEN_CASES.flatMap((c, caseIndex) =>
+  c.alone ? c.frames.map((frame) => ({ caseIndex, frame })) : [],
+);
 
 /**
- * beforeAll renders 14 frames three times, 7 frames alone in fresh browsers,
- * and one bundle: 93 s measured on a 48-core box. Sized for a 4-core CI runner.
+ * beforeAll renders every golden frame three times, the `alone` frames once
+ * more each in a fresh browser, and one bundle. S1 alone (14 frames, 7
+ * alone) took 93 s on a 48-core box; sized for a 4-core CI runner and all
+ * seven scenes.
  */
-const RENDER_TIMEOUT_MS = 20 * 60_000;
+const RENDER_TIMEOUT_MS = 45 * 60_000;
 
 const sha256 = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
 
@@ -65,7 +64,7 @@ async function renderCases(
   try {
     for (const { c, frames } of plan) {
       const written = await adapter.renderStills({
-        scene: SCENE_ID,
+        scene: c.scene,
         trace: c.trace(),
         aspect: c.aspect,
         frames,
@@ -111,6 +110,7 @@ let first: Map<string, string>;
 let second: Map<string, string>;
 let reversed: Map<string, string>;
 const alone = new Map<string, string>();
+// Frame numbers repeat across scenes, so each alone render gets its own dir.
 const reducedFiles = new Map<string, string>();
 
 beforeAll(async () => {
@@ -122,7 +122,7 @@ beforeAll(async () => {
   reversed = await renderCases(serveUrl, path.join(OUT_DIR, "full-reversed"), reversedOrder);
   for (const { caseIndex, frame } of ALONE) {
     const c = GOLDEN_CASES[caseIndex] as GoldenCase;
-    const files = await renderCases(serveUrl, path.join(OUT_DIR, `full-alone-${frame}`), [{ c, frames: [frame] }]);
+    const files = await renderCases(serveUrl, path.join(OUT_DIR, `full-alone-${c.id}-${frame}`), [{ c, frames: [frame] }]);
     const name = goldenName(c, frame);
     alone.set(name, files.get(name) as string);
   }
@@ -150,7 +150,7 @@ beforeAll(async () => {
   }
 }, RENDER_TIMEOUT_MS);
 
-describe("S1 golden frames", () => {
+describe("golden frames", () => {
   it.each(names)("%s matches the committed golden exactly (full-size SHA-256)", (name) => {
     const hashPath = path.join(GOLDEN_DIR, `${name}.sha256`);
     const goldenPath = path.join(GOLDEN_DIR, name);
@@ -181,7 +181,7 @@ describe("S1 golden frames", () => {
   });
 });
 
-describe("S1 determinism", () => {
+describe("determinism", () => {
   it.each(names)("%s is byte-identical across two fresh-browser renders", (name) => {
     expect(sha256(second.get(name) as string), `${name} differs between two renders of one trace`).toBe(
       sha256(first.get(name) as string),
@@ -189,7 +189,7 @@ describe("S1 determinism", () => {
   });
 });
 
-describe("S1 order independence", () => {
+describe("order independence", () => {
   it.each(names)("%s is byte-identical in suite order and in reversed order", (name) => {
     expect(sha256(reversed.get(name) as string), `${name} depends on render order`).toBe(sha256(first.get(name) as string));
   });

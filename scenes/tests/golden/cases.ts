@@ -1,7 +1,8 @@
 /**
- * The golden-frame set for S1, shared by the test and `pnpm goldens:update`.
+ * The golden-frame set, shared by the test and `pnpm goldens:update`. Every
+ * registered scene has cases at all three aspects (a unit test checks it).
  *
- * Frames are chosen to land on distinct visual states of the illustrative
+ * S1's frames are chosen to land on distinct visual states of the illustrative
  * trace (36-frame intro, then one beat every 30 frames):
  *   0   intro, every stage inert and fading in
  *   48  draft beat: first stage waiting, caption in
@@ -27,7 +28,18 @@ export const GOLDEN_DIR = path.join(PACKAGE_ROOT, "tests/golden/__goldens__");
 export const OUT_DIR = path.join(PACKAGE_ROOT, ".golden-out");
 
 export const SCENE_ID = "s1-plan-lifecycle";
-export const TRACE_FILE = path.join(PACKAGE_ROOT, "traces/illustrative/s1-plan-lifecycle.json");
+
+/** A scene's committed illustrative trace (`traces/illustrative/<scene>.json`). */
+export function illustrativeTraceFile(scene: string): string {
+  return path.join(PACKAGE_ROOT, "traces/illustrative", `${scene}.json`);
+}
+
+/** The committed illustrative trace of `scene`, validated. */
+export function loadIllustrativeTrace(scene: string): SceneTrace {
+  return parseTrace(JSON.parse(readFileSync(illustrativeTraceFile(scene), "utf8")));
+}
+
+export const TRACE_FILE = illustrativeTraceFile(SCENE_ID);
 
 /**
  * Goldens are rendered at native size (scale 1) and then reduced 2x2 by a
@@ -56,10 +68,31 @@ export const PIXEL_THRESHOLD = 0;
 export interface GoldenCase {
   /** File-name prefix for this case's goldens. */
   id: string;
+  /** Scene id from the registry. */
+  scene: string;
   aspect: Aspect;
   frames: readonly number[];
   /** Builds the trace; may attest a test-only replay. */
   trace: () => SceneTrace;
+  /** Also render each of these frames alone in a fresh browser (order test). */
+  alone?: boolean;
+}
+
+/**
+ * The cases every new scene starts with: its illustrative trace at each
+ * aspect, the 16:9 frames rendered alone too, plus one 9:16 and one 1:1
+ * frame alone.
+ */
+export function illustrativeCases(
+  scene: string,
+  frames: { "16:9": readonly number[]; "9:16": readonly number[]; "1:1": readonly number[] },
+): GoldenCase[] {
+  const trace = () => loadIllustrativeTrace(scene);
+  return [
+    { id: `${scene}-16x9`, scene, aspect: "16:9", frames: frames["16:9"], trace, alone: true },
+    { id: `${scene}-9x16`, scene, aspect: "9:16", frames: frames["9:16"], trace, alone: true },
+    { id: `${scene}-1x1`, scene, aspect: "1:1", frames: frames["1:1"], trace, alone: true },
+  ];
 }
 
 /** 120 characters: SOURCE_REF_MAX, the longest source the schema accepts. */
@@ -67,7 +100,7 @@ export const LONG_SOURCE_REF =
   "build-record export of qontinui/qontinui-design-tokens, qontinui/qontinui-studio and qontinui/qontinui-web, last 30 days";
 
 export function loadS1Trace(): SceneTrace {
-  return parseTrace(JSON.parse(readFileSync(TRACE_FILE, "utf8")));
+  return loadIllustrativeTrace(SCENE_ID);
 }
 
 /**
@@ -109,18 +142,22 @@ export function longTitleTrace(): SceneTrace {
   return parseTrace(json);
 }
 
-export const GOLDEN_CASES: readonly GoldenCase[] = [
-  { id: `${SCENE_ID}-16x9`, aspect: "16:9", frames: [0, 48, 196, 290, 425], trace: loadS1Trace },
-  { id: `${SCENE_ID}-9x16`, aspect: "9:16", frames: [250], trace: loadS1Trace },
-  { id: `${SCENE_ID}-1x1`, aspect: "1:1", frames: [250], trace: loadS1Trace },
-  { id: `${SCENE_ID}-16x9-replay-long-source`, aspect: "16:9", frames: [250], trace: longSourceReplayTrace },
-  { id: `${SCENE_ID}-9x16-replay-long-source`, aspect: "9:16", frames: [250], trace: longSourceReplayTrace },
-  { id: `${SCENE_ID}-1x1-replay-long-source`, aspect: "1:1", frames: [250], trace: longSourceReplayTrace },
-  { id: `${SCENE_ID}-9x16-replay-wide-source`, aspect: "9:16", frames: [250], trace: wideSourceReplayTrace },
-  { id: `${SCENE_ID}-1x1-replay-wide-source`, aspect: "1:1", frames: [250], trace: wideSourceReplayTrace },
-  { id: `${SCENE_ID}-9x16-long-title`, aspect: "9:16", frames: [250], trace: longTitleTrace },
-  { id: `${SCENE_ID}-1x1-long-title`, aspect: "1:1", frames: [250], trace: longTitleTrace },
+const S1_CASES: readonly GoldenCase[] = [
+  ...illustrativeCases(SCENE_ID, { "16:9": [0, 48, 196, 290, 425], "9:16": [250], "1:1": [250] }),
+  ...(
+    [
+      ["16x9-replay-long-source", "16:9", longSourceReplayTrace],
+      ["9x16-replay-long-source", "9:16", longSourceReplayTrace],
+      ["1x1-replay-long-source", "1:1", longSourceReplayTrace],
+      ["9x16-replay-wide-source", "9:16", wideSourceReplayTrace],
+      ["1x1-replay-wide-source", "1:1", wideSourceReplayTrace],
+      ["9x16-long-title", "9:16", longTitleTrace],
+      ["1x1-long-title", "1:1", longTitleTrace],
+    ] as const
+  ).map(([suffix, aspect, trace]) => ({ id: `${SCENE_ID}-${suffix}`, scene: SCENE_ID, aspect, frames: [250], trace })),
 ];
+
+export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES];
 
 export function goldenName(c: GoldenCase, frame: number): string {
   return `${c.id}-f${String(frame).padStart(4, "0")}.png`;
