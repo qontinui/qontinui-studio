@@ -139,10 +139,16 @@ class Scheduler:
         raw_dir: Path,
         clock: Clock = utc_now,
         policy: RetryPolicy | None = None,
+        guard: Callable[[], None] | None = None,
     ) -> None:
         self.conn = conn
         self.inventory = inventory
         self.adapters = adapters
+        # Called before EVERY provider call a step makes (each submit, each
+        # poll/download). It may replace ``self.adapters`` (the image-generation
+        # dial narrowing to local_only) or raise to stop the step before the
+        # call (the dial going off).
+        self.guard = guard
         self.staging_dir = staging_dir
         self.raw_dir = raw_dir
         self.clock = clock
@@ -361,6 +367,9 @@ class Scheduler:
                         "whether the provider ran the job is unknown",
                     )
                 row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
+            if row["status"] in ("queued", "submitted") and self.guard is not None:
+                self.conn.commit()
+                self.guard()
             if row["status"] == "queued":
                 self._submit(row, preference, template, now, report)
             elif row["status"] == "submitted":
@@ -787,7 +796,9 @@ class Scheduler:
         now = self.clock()  # read at the claim, never at step start
         provider_id = row["provider"]
         tried: list[str] = json.loads(row["tried_providers"])
-        adapter = self.adapters.adapters.get(provider_id)
+        adapter = self.adapters.adapters.get(provider_id) or self.adapters.poll_only.get(
+            provider_id
+        )
         if adapter is None:
             # Not built this run (key unset, D4 now off): move on rather than fail.
             self._give_up_on_provider(

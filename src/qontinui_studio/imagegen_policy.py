@@ -14,8 +14,10 @@ Levels, as coord serves them (``qontinui-coord``
 ``local_only``        only the fleet's OWN image provider: an unmetered
                       adapter on the local network, called directly. Every
                       cloud adapter, and every adapter riding a model-gateway
-                      route, is refused — nothing, prompt or image, leaves
-                      the fleet's hardware and nothing is spent
+                      route, gets no NEW work — no new prompt or reference
+                      leaves the fleet's hardware and no new quota is spent;
+                      a job already submitted there may still be polled and
+                      downloaded
 ``off``               no provider call at all; a typed refusal
 ====================  ======================================================
 
@@ -41,16 +43,24 @@ Where the level comes from, in order:
    renders as the ``on`` default ([policy: unknown-must-not-render-as-a-default]).
 
 A batch targeting several sites takes the MOST restrictive of their levels.
-A reading is reused for :data:`POLL_INTERVAL_S` and then read again, and the
-pipeline re-decides before every scheduler iteration, so a dial set to ``off``
-stops a running ``studio jobs run`` within one poll.
+A reading is reused for :data:`POLL_INTERVAL_S` and then read again. The
+pipeline decides once before driving a batch and again before EVERY provider
+call the scheduler makes (each submit and each poll/download), so a dial set
+to ``off`` stops a running ``studio jobs run`` before its next provider call
+once the cached reading is older than one poll.
+
+Under ``local_only`` a job already submitted to a cloud provider may still be
+polled and its result downloaded (``AdapterSet.poll_only``): no NEW prompt or
+reference leaves the machine, and paid work already done is not thrown away.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import json
+import math
 import os
 import sqlite3
 import time
@@ -119,20 +129,30 @@ class Credential:
     token: str
 
 
-def jwt_expired(token: str, now_epoch: float | None = None) -> bool:
-    """Whether ``token``'s ``exp`` claim has passed. A token whose payload does
-    not decode, or that carries no ``exp``, is not known to be expired: coord
-    decides it."""
+def jwt_claims(token: str) -> dict[str, object] | None:
+    """The payload of a three-part JWT, or None when it does not decode. Not
+    verified: coord verifies; studio only reads ``exp`` and ``tenant_id``."""
     parts = token.split(".")
     if len(parts) != 3:
-        return False
+        return None
     try:
         payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
     except (ValueError, binascii.Error):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def jwt_expired(token: str, now_epoch: float | None = None) -> bool:
+    """Whether ``token``'s ``exp`` claim has passed. An ``exp`` that is present
+    but not a finite number (a string, a bool, NaN, infinity) counts as
+    expired. A token whose payload does not decode, or that carries no
+    ``exp``, is not known to be expired: coord decides it."""
+    claims = jwt_claims(token)
+    if claims is None or "exp" not in claims:
         return False
-    exp = payload.get("exp") if isinstance(payload, dict) else None
-    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
-        return False
+    exp = claims["exp"]
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+        return True
     return exp <= (time.time() if now_epoch is None else now_epoch)
 
 
@@ -141,8 +161,15 @@ def coord_base_url() -> str:
 
 
 def _is_loopback_url(url: str) -> bool:
+    """A LITERAL loopback address, or exactly ``localhost``. A name that merely
+    starts with ``127.`` (``127.evil.example``) resolves anywhere."""
     host = (urlparse(url).hostname or "").lower()
-    return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class CoordDialReader:
@@ -213,7 +240,18 @@ class CoordDialReader:
         data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, str) or not data.strip() or " " in data.strip():
             return "runner mint: the runner holds no device credential (no token in its answer)"
-        return Credential("runner mint", data.strip())
+        token = data.strip()
+        if jwt_expired(token):
+            return "runner mint: the minted token is expired"
+        if tenant:
+            claims = jwt_claims(token) or {}
+            claim = claims.get("tenant_id")
+            if not isinstance(claim, str) or claim.lower() != tenant.lower():
+                return (
+                    f"runner mint: the minted token's tenant_id claim {claim!r} is not "
+                    f"${TENANT_ENV} ({tenant}); discarded"
+                )
+        return Credential("runner mint", token)
 
     # ---- the read -------------------------------------------------------
 
@@ -428,28 +466,36 @@ def restrict(
     """The adapters ``decision`` lets this batch use.
 
     ``off`` raises its refusal. ``local_only`` moves every adapter that is not
-    the fleet's own into ``unavailable``, saying why, and raises the typed
+    the fleet's own out of ``adapters`` (no new submission) into ``poll_only``
+    (an in-flight job there is still polled and downloaded, so paid work is not
+    lost) and names why in ``unavailable``. It raises the typed
     ``image_generation_local_only`` refusal when that leaves none of
-    ``preference`` (the brief's providers) while some of them were built — so a
-    reversible switch never fails a job permanently. ``on`` changes nothing."""
+    ``preference`` (the brief's providers) while some of them were built, so the
+    switch alone does not fail a batch's jobs for want of a provider. ``on``
+    changes nothing."""
     refusal = decision.refusal()
     if refusal is not None:
         raise refusal
     if decision.level == "on":
         return adapters
     out = AdapterSet(
-        unavailable=dict(adapters.unavailable), refusal=adapters.refusal, route=adapters.route
+        unavailable=dict(adapters.unavailable),
+        refusal=adapters.refusal,
+        route=adapters.route,
+        poll_only=dict(adapters.poll_only),
     )
     for pid, adapter in adapters.adapters.items():
         if is_fleet_provider(inventory.get(pid), adapters.route):
             out.adapters[pid] = adapter
         else:
+            out.poll_only[pid] = adapter
             via = (
                 f"through the gateway route {adapters.route}" if adapters.route else "a cloud host"
             )
             out.unavailable[pid] = (
                 f"{pid}: image_generation is local_only ({decision.source}); this provider "
-                f"calls {via}, not the fleet's own image host"
+                f"calls {via}, not the fleet's own image host (in-flight jobs there are "
+                "still collected)"
             )
     wanted = list(preference)
     if (
