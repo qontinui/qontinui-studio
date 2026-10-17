@@ -234,7 +234,8 @@ const S6_CASES = illustrativeCases("s6-self-correction", { "16:9": [0, 170, 310,
 /**
  * S7 (507 frames: 36-frame intro, one beat every 27): 0 intro, 200 exploring
  * (states and actions being learned), 250 a state found, 440 the poster (the
- * traversal done, the path lit), 506 the end.
+ * traversal done, the path lit), 506 the end (the same picture as 440: it
+ * pins that the outro holds still).
  */
 const S7_CASES = illustrativeCases("s7-gui-automation", { "16:9": [0, 200, 440, 506], "9:16": [440], "1:1": [250, 440] });
 

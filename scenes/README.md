@@ -230,7 +230,8 @@ The validator also checks that:
   red run's diagnosis, once, while the PR is still red;
 - a GUI state or transition is found at most once; a transition is found
   only after both its states, taken only after it is found, and each step of
-  a traversal starts where the previous one ended;
+  a traversal starts where the previous one ended (re-taking an edge,
+  revisiting a state and exploring after a traversal starts are allowed);
 - a claim is acquired only when no session holds it (the holder may not
   re-acquire it), released only by its holder, and contended only against the
   session holding it at that point; a session's end releases its claims; and
@@ -252,8 +253,9 @@ may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
 sessions, S4 at most four PRs, S5 at most three machines with two sessions
 each, every session on a machine and started before it acts, S6 exactly
-one PR, a closed loop (red, a fix, then green) and no operator step, S7 at
-most six states).
+one PR, a closed loop (red, a fix, then green) and no operator step, S7 only graphs its layouts can
+draw honestly: at most six states found, no self-loop, one transition per pair
+of states, and no edge running through another state at any aspect).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

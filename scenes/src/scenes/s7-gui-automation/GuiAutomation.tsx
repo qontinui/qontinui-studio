@@ -1,6 +1,7 @@
 import type { Layout, SceneProps } from "../../api";
 import { Caption, Counter, Edge, Feed, Label, Node, SceneHeader, type Point } from "../../primitives";
-import { MAX_STATES, MODEL_ROWS, s7State } from "./model";
+import { graphSlots } from "./graph-layout";
+import { MODEL_ROWS, s7State } from "./model";
 
 interface Box {
   x: number;
@@ -10,25 +11,15 @@ interface Box {
 
 interface Placement {
   header: Box & { titleSize: number };
-  /** Centre of each state slot, in discovery order (a snake, so consecutive slots are neighbours). */
+  /** Centre of each state slot, in discovery order (see graph-layout.ts). */
   slots: Point[];
   node: { width: number; height: number };
+  /** Put an in-row edge's action on its line instead of above the row. */
+  inRowLabelsOnLine: boolean;
   /** The learned-model panel; null where there is no room (square). */
   model: Box | null;
   counters: Point[];
   caption: Box & { lines: number };
-}
-
-/** Slot centres for a cols x rows grid, filled as a snake. */
-function snake(cols: number, rows: number, x: (c: number) => number, y: (r: number) => number): Point[] {
-  const out: Point[] = [];
-  for (let r = 0; r < rows; r++) {
-    for (let k = 0; k < cols; k++) {
-      const c = r % 2 === 0 ? k : cols - 1 - k;
-      out.push({ x: x(c), y: y(r) });
-    }
-  }
-  return out.slice(0, MAX_STATES);
 }
 
 /** Where everything goes, per orientation. Pure function of the layout. */
@@ -40,8 +31,8 @@ function place(layout: Layout): Placement {
     const sideX = safe.x + 1290 * u;
     return {
       header: { x: safe.x, y: 140 * u, width: safe.width, titleSize: 48 },
-      slots: snake(3, 2, (c) => safe.x + 120 * u + c * 450 * u, (r) => 420 * u + r * 300 * u),
-      node: { width: 220 * u, height: 84 * u },
+      ...graphSlots(layout),
+      inRowLabelsOnLine: false,
       model: { x: sideX, y: 330 * u, width: right - sideX },
       counters: [
         { x: sideX, y: 650 * u },
@@ -52,21 +43,11 @@ function place(layout: Layout): Placement {
   }
 
   if (layout.orientation === "portrait") {
-    // Two columns, four rows: a path that turns at every row, so the
-    // illustrative graph's chord (Home → Cart) runs straight down.
-    const col = (c: number) => safe.x + 150 * u + c * 636 * u;
-    const row = (r: number) => 420 * u + r * 210 * u;
     return {
       header: { x: safe.x, y: 170 * u, width: safe.width, titleSize: 48 },
-      slots: [
-        { x: col(0), y: row(0) },
-        { x: col(0), y: row(1) },
-        { x: col(1), y: row(1) },
-        { x: col(1), y: row(2) },
-        { x: col(0), y: row(2) },
-        { x: col(0), y: row(3) },
-      ],
-      node: { width: 300 * u, height: 84 * u },
+      ...graphSlots(layout),
+      // Rows are far apart here, so an in-row action sits on its own line.
+      inRowLabelsOnLine: true,
       model: { x: safe.x, y: 1140 * u, width: safe.width },
       counters: [
         { x: safe.x, y: 1460 * u },
@@ -79,8 +60,8 @@ function place(layout: Layout): Placement {
   // square: the graph across the top, the caption and counters below.
   return {
     header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
-    slots: snake(3, 2, (c) => safe.x + 110 * u + c * 358 * u, (r) => 380 * u + r * 220 * u),
-    node: { width: 200 * u, height: 72 * u },
+    ...graphSlots(layout),
+    inRowLabelsOnLine: false,
     model: null,
     counters: [
       { x: safe.x, y: 850 * u },
@@ -147,8 +128,13 @@ export function GuiAutomation({ trace, frame, layout, timeline }: SceneProps) {
         // An edge within a row has its action above the line, clear of the
         // nodes; any other edge has it on the middle of its line.
         const x = (a.x + b.x) / 2;
-        const y = across ? Math.min(a.y, b.y) - p.node.height / 2 - 22 * u : (a.y + b.y) / 2;
-        const maxWidth = across ? Math.abs(b.x - a.x) - 20 * u : p.node.width + 40 * u;
+        const above = across && !p.inRowLabelsOnLine;
+        const y = above ? Math.min(a.y, b.y) - p.node.height / 2 - 22 * u : (a.y + b.y) / 2;
+        const maxWidth = above
+          ? Math.abs(b.x - a.x) - 20 * u
+          : across
+            ? Math.abs(b.x - a.x) - p.node.width - 20 * u
+            : p.node.width + 40 * u;
         return <Label key={`label-${edge.id}`} x={x} y={y} text={edge.action} maxWidth={maxWidth} appear={edge.appear} unit={u} />;
       })}
 
@@ -157,7 +143,7 @@ export function GuiAutomation({ trace, frame, layout, timeline }: SceneProps) {
           x={p.model.x}
           y={p.model.y}
           width={p.model.width}
-          title="THE LEARNED MODEL"
+          title={`THE LEARNED MODEL · LATEST ${MODEL_ROWS}`}
           rows={state.model}
           capacity={MODEL_ROWS}
           empty="Exploring the app"

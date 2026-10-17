@@ -18,14 +18,16 @@ export interface LabelProps {
  */
 export function Label({ x, y, text: content, maxWidth, appear = 1, unit }: LabelProps) {
   const height = Math.round(30 * unit);
+  // Never narrower than a short word, whatever room the caller computed.
+  const width = Math.max(Math.round(80 * unit), Math.round(maxWidth));
   return (
     <div
       data-studio-label={content}
       style={{
         position: "absolute",
-        left: Math.round(x - maxWidth / 2),
+        left: Math.round(x - width / 2),
         top: Math.round(y - height / 2),
-        width: Math.round(maxWidth),
+        width,
         height,
         display: "flex",
         justifyContent: "center",

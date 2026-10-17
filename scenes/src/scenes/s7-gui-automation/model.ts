@@ -29,8 +29,7 @@ export const S7_TIMING = {
   outroMs: 2200,
 } as const;
 
-/** States the layouts have slots for (the scene's check caps the trace at this). */
-export const MAX_STATES = 6;
+export { MAX_STATES } from "./graph-layout";
 /** Rows of room in the learned-model panel. */
 export const MODEL_ROWS = 4;
 
@@ -110,7 +109,8 @@ export function s7State(trace: SceneTrace, timeline: Timeline, frame: number): S
     if (b.event.kind !== "gui.state_found") continue;
     const id = b.event.state;
     const fresh = current === b;
-    let level: AttentionLevel = "landing";
+    // Known: inert; just found: testing; visited: done; where the traversal is: running.
+    let level: AttentionLevel = "inert";
     if (fresh) level = "testing";
     if (visited.has(id)) level = "done";
     if (id === at) level = "running";
@@ -130,14 +130,17 @@ export function s7State(trace: SceneTrace, timeline: Timeline, frame: number): S
     if (b.event.kind !== "gui.transition_found") continue;
     const t = transitionById.get(b.event.transition);
     if (!t) continue;
-    const takenBeat = taken.find((tb) => tb.event.kind === "gui.transition_taken" && tb.event.transition === t.id);
+    // The LATEST take of this transition (a path may take an edge twice).
+    const takes = taken.filter((tb) => tb.event.kind === "gui.transition_taken" && tb.event.transition === t.id);
+    const takenBeat = takes[takes.length - 1];
+    const fresh = current === b;
     edges.push({
       id: t.id,
       fromSlot: slotOf.get(t.from) ?? 0,
       toSlot: slotOf.get(t.to) ?? 0,
       action: t.action,
       progress: takenBeat ? progress(frame, takenBeat.startFrame, slow) : 0,
-      level: takenBeat ? (takenBeat === lastTaken ? "running" : "done") : "inert",
+      level: takenBeat ? (takenBeat === lastTaken ? "running" : "done") : fresh ? "testing" : "inert",
       appear: appearOf(b),
     });
   }
@@ -151,7 +154,7 @@ export function s7State(trace: SceneTrace, timeline: Timeline, frame: number): S
         id: b.event.id,
         text: t ? `${stateLabel(t.from)} → ${stateLabel(t.to)}` : b.event.id,
         detail: t ? `action: ${t.action}` : "",
-        level: (t && taken.some((tb) => tb.event.kind === "gui.transition_taken" && tb.event.transition === t.id) ? "done" : "landing") as AttentionLevel,
+        level: (t && taken.some((tb) => tb.event.kind === "gui.transition_taken" && tb.event.transition === t.id) ? "done" : "inert") as AttentionLevel,
         appear: appearOf(b),
       };
     });
@@ -167,12 +170,12 @@ export function s7State(trace: SceneTrace, timeline: Timeline, frame: number): S
     } else if (e.kind === "gui.transition_found") {
       const t = transitionById.get(e.transition);
       caption = t
-        ? text("A transition is learned", `${t.action} goes from "${stateLabel(t.from)}" to "${stateLabel(t.to)}".`)
+        ? text("A transition is learned", `"${stateLabel(t.from)}" → "${stateLabel(t.to)}", by: ${t.action}.`)
         : text("A transition is learned", "An action that moves the app between states.");
     } else if (e.kind === "gui.transition_taken") {
       const t = transitionById.get(e.transition);
       caption = t
-        ? text("Traversed by an action", `${t.action}: "${stateLabel(t.from)}" to "${stateLabel(t.to)}", on the learned graph.`)
+        ? text("Traversed by an action", `"${stateLabel(t.from)}" → "${stateLabel(t.to)}", by: ${t.action}, on the learned graph.`)
         : text("Traversed by an action", "The automation follows the learned graph.");
     }
   }

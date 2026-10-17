@@ -1,6 +1,7 @@
 import { defineScene } from "../../api";
 import { GuiAutomation } from "./GuiAutomation";
-import { MAX_STATES, s7Timeline } from "./model";
+import { graphProblems } from "./graph-layout";
+import { s7Timeline } from "./model";
 
 export const s7GuiAutomation = defineScene({
   id: "s7-gui-automation",
@@ -11,10 +12,8 @@ export const s7GuiAutomation = defineScene({
     kinds: ["gui.state_found", "gui.transition_found", "gui.transition_taken"],
     entities: ["states", "transitions"],
   },
-  check: (trace) => {
-    const n = trace.entities.states.length;
-    return n > MAX_STATES ? [`at most ${MAX_STATES} states (the trace has ${n})`] : [];
-  },
+  // Only graphs the layouts can draw honestly (graph-layout.ts).
+  check: graphProblems,
   timeline: s7Timeline,
   // The poster: the traversal complete, the path lit through the learned graph.
   poster: (timeline) => {

@@ -48,10 +48,25 @@ describe("S7 trace fields", () => {
     expect(errorsOf(jump)).toContain('events.13.transition: "t-add" starts at "st-results", but the traversal is at "st-home"');
   });
 
-  it("caps the scene at six states", () => {
+  it("caps the scene at six states found (declared but unfound states do not count)", () => {
     const json = traceJson();
     json.entities!.states!.push({ id: "st-7", label: "Extra" });
-    expect(missingRequirements(s7GuiAutomation, parseTrace(json))).toContain("at most 6 states (the trace has 7)");
+    expect(missingRequirements(s7GuiAutomation, parseTrace(json))).toEqual([]);
+    json.events.push({ id: "e90", at: "2026-09-19T10:02:40Z", kind: "gui.state_found", state: "st-7" } as never);
+    expect(missingRequirements(s7GuiAutomation, parseTrace(json))).toContain("at most 6 states found (the trace finds 7)");
+  });
+
+  it("refuses graphs the layout would draw wrongly", () => {
+    const withEdge = (id: string, from: string, to: string) => {
+      const json = traceJson();
+      json.entities!.transitions!.push({ id, from, to, action: "x" });
+      json.events.push({ id: "e90", at: "2026-09-19T10:02:40Z", kind: "gui.transition_found", transition: id } as never);
+      return missingRequirements(s7GuiAutomation, parseTrace(json));
+    };
+    expect(withEdge("t-self", "st-home", "st-home")).toContain("no self-loop (t-self)");
+    expect(withEdge("t-back", "st-home", "st-login")).toContain("one transition per pair of states (t-back repeats st-home/st-login)");
+    // Sign in (slot 0) → Search (slot 2) would run behind Home (slot 1).
+    expect(withEdge("t-skip", "st-login", "st-search").join("\n")).toMatch(/t-skip would run through "st-home" at 16:9/);
   });
 });
 
@@ -72,10 +87,12 @@ describe("S7 scene model", () => {
     expect(state.caption?.title).toBe("A state is found");
   });
 
-  it("learns transitions as edges, undrawn until taken", () => {
+  it("learns transitions as edges, unlit until taken, the newest one highlighted", () => {
     const state = at("e12");
     expect(state.actionsLearned).toBe(6);
-    expect(state.edges.every((e) => e.level === "inert" && e.progress === 0)).toBe(true);
+    expect(state.edges.every((e) => e.progress === 0)).toBe(true);
+    expect(state.edges.map((e) => e.level)).toEqual(["inert", "inert", "inert", "inert", "inert", "testing"]);
+    expect(state.states.every((st) => st.level === "inert")).toBe(true);
     expect(state.model.at(-1)).toMatchObject({ text: "Home → Cart", detail: "action: open Cart" });
   });
 
@@ -93,5 +110,42 @@ describe("S7 scene model", () => {
     expect(end.edges.find((e) => e.id === "t-checkout")?.level).toBe("running");
     expect(end.edges.find((e) => e.id === "t-search")?.level).toBe("inert");
     expect(end.caption?.title).toBe("Traversed by an action");
+  });
+
+  it("follows the latest take of an edge taken twice, and allows revisiting a state", () => {
+    const json = traceJson();
+    json.entities!.transitions!.push({ id: "t-home", from: "st-results", to: "st-home", action: "click Home" });
+    json.events = json.events.filter((e) => e.kind !== "gui.transition_taken");
+    json.events.push({ id: "e90", at: "2026-09-19T10:02:30Z", kind: "gui.transition_found", transition: "t-home" } as never);
+    ["t-signin", "t-search", "t-submit", "t-home", "t-search"].forEach((transition, n) =>
+      json.events.push({ id: `e9${n + 1}`, at: `2026-09-19T10:04:0${n}Z`, kind: "gui.transition_taken", transition } as never),
+    );
+    expect(missingRequirements(s7GuiAutomation, parseTrace(json))).toEqual([]);
+    const again = parseTrace(json);
+    const atl = s7Timeline(again, STUDIO_FPS);
+    const end = s7State(again, atl, atl.durationInFrames - 1);
+    expect(end.edges.find((e) => e.id === "t-search")?.level).toBe("running");
+    expect(end.edges.find((e) => e.id === "t-home")?.level).toBe("done");
+    expect(end.states.find((st) => st.label === "Search")?.level).toBe("running");
+    expect(end.states.find((st) => st.label === "Home")?.level).toBe("done");
+    expect(end.steps).toBe(5);
+  });
+
+  it("puts the poster on the last frame when nothing is taken", () => {
+    const json = traceJson();
+    json.events = json.events.filter((e) => e.kind !== "gui.transition_taken");
+    const t = parseTrace(json);
+    expect(posterFrame(s7GuiAutomation, t)).toBe(s7Timeline(t, STUDIO_FPS).durationInFrames - 1);
+  });
+
+  it("keeps exploring after a traversal starts", () => {
+    const json = traceJson();
+    json.events.push({ id: "e90", at: "2026-09-19T10:03:40Z", kind: "gui.transition_found", transition: "t-search" } as never);
+    json.events = json.events.filter((e) => e.id !== "e05");
+    const t = parseTrace(json);
+    const ttl = s7Timeline(t, STUDIO_FPS);
+    const end = s7State(t, ttl, ttl.durationInFrames - 1);
+    expect(end.phase).toBe("traversing");
+    expect(end.edges.find((e) => e.id === "t-search")?.level).toBe("testing");
   });
 });
