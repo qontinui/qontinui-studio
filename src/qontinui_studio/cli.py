@@ -874,6 +874,84 @@ def pulse_status(obj: Obj) -> None:
     click.echo(f"consecutive ready weeks: {ready_streak(rows)} (target 4)")
 
 
+def _primary_checkout() -> Path:
+    """The primary checkout of this repository (a linked worktree's main
+    one), so a task installed from an agent worktree survives its removal."""
+    import os
+    import subprocess
+
+    from qontinui_studio.pulse_schedule import default_working_directory
+
+    here = default_working_directory()
+    # An inherited GIT_DIR / GIT_WORK_TREE would override -C and answer for another repo.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
+    }
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return here
+    main = Path(common).parent if common else here
+    # A separate-git-dir layout has no checkout beside its git dir: fall back to this one.
+    return main if (main / "pyproject.toml").exists() else here
+
+
+@pulse.command("schedule")
+@click.option("--install", "verb", flag_value="install", help="Upsert the task by name.")
+@click.option("--check", "verb", flag_value="check", help="Report the task and any drift.")
+@click.option("--uninstall", "verb", flag_value="uninstall", help="Delete every task of the name.")
+@click.option(
+    "--dry-run", "verb", flag_value="dry-run", help="Print the request bodies; no network."
+)
+@click.option("--at", "at", default="06:30", show_default=True, help="Local time, HH:MM.")
+@click.option("--day", default="mon", show_default=True, help="Day of the week (mon..sun).")
+@click.option("--disabled", is_flag=True, help="Register the task disabled.")
+@click.option(
+    "--workdir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="The checkout the task runs in (default: this repository's primary checkout).",
+)
+@click.option("--runner", envvar="QONTINUI_RUNNER_URL", default=None, help="Runner base URL.")
+def pulse_schedule(
+    verb: str | None, at: str, day: str, disabled: bool, workdir: Path | None, runner: str | None
+) -> None:
+    """Register the weekly pulse in the Qontinui runner's own scheduler (never
+    an OS cron). Exit 0 done, 1 absent (--check), 2 UNKNOWN, 3 conflict, 4 usage."""
+    from qontinui_studio import pulse_schedule as ps
+
+    try:
+        if verb is None:
+            raise ps.ScheduleError(
+                ps.EXIT_USAGE, "pass --install, --check, --uninstall or --dry-run"
+            )
+        cwd = (workdir or _primary_checkout()).resolve()
+        intended = ps.Intended(str(cwd), ps.cron_for(at, day), enabled=not disabled)
+        if verb == "dry-run":
+            click.echo(ps.dry_run(intended))
+            return
+        scheduler = ps.RunnerScheduler(runner or ps.DEFAULT_RUNNER)
+        if verb == "install":
+            click.echo(f"factory-pulse: {ps.install(scheduler, intended)}")
+        elif verb == "check":
+            code, report = ps.check(scheduler, intended)
+            click.echo(f"factory-pulse: {report}")
+            sys.exit(code)
+        else:
+            click.echo(f"factory-pulse: {ps.uninstall(scheduler)}")
+    except ps.ScheduleError as e:
+        click.echo(f"factory-pulse: {e}", err=True)
+        sys.exit(e.code)
+
+
 def run() -> None:
     try:
         main(standalone_mode=True)

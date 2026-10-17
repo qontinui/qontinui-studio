@@ -859,6 +859,41 @@ outcomes, recorded in `pulse.json` and shown on `review.html`:
   overwritten). `pulse status` counts consecutive `ready` weeks — the
   Phase 5 acceptance is four in a row with no authoring work.
 
+### The schedule: a runner-scheduler task, never a cron
+
+The pulse runs weekly as ONE task, named `factory-pulse`, in the Qontinui
+runner's own scheduler (persisted by the runner, evaluated on its tick, one
+missed run caught up after a start). There is no OS cron, systemd timer or CI
+schedule for it.
+
+```sh
+scripts/schedule-factory-pulse.sh --dry-run     # print the request bodies; no network
+scripts/schedule-factory-pulse.sh --install     # upsert by name (twice -> UNCHANGED)
+scripts/schedule-factory-pulse.sh --check       # present/absent, enabled, cron, next run, drift
+scripts/schedule-factory-pulse.sh --uninstall   # delete every task named factory-pulse
+# options: --at HH:MM (default 06:30 local) --day mon..sun (default mon) --disabled
+#          --workdir DIR (default: this repo's primary checkout) --runner URL
+```
+
+(`studio pulse schedule` is the same command.) Exit codes: 0 done
+(`--check`: present), 1 `--check`: absent, 2 UNKNOWN (the runner did not
+answer, answered non-2xx or unreadable — never reported as absent), 3 two
+tasks of the name or a write that does not read back, 4 usage. It touches no
+task of any other name and never stops, restarts or rebuilds the runner.
+
+The task is a `RemoteAgent` task whose prompt starts one command,
+`scripts/run-factory-pulse.sh`, in the background (a render can outlast a
+single tool call), waits for it and reports its exit code and log tail
+(`.studio/pulse-run.log`). qontinui-schemas declares a `Script` task type, but
+no runner build dispatches it yet; once one does, the task becomes a Script
+task. That script brings the
+checkout's dependencies up to date (poetry, the scenes package, the pinned
+headless browser; it refuses to install through a linked `scenes/node_modules`) and runs
+`studio pulse run` against `$STUDIO_PULSE_ROOT` (default: the checkout,
+whose `pulse.yaml` names `products/qontinui-studio.yaml`). The task's
+working directory is the repo's primary checkout, so it runs whatever branch
+that checkout is on (normally `main`).
+
 ## Development
 
 ```bash

@@ -1,0 +1,5 @@
+# The weekly factory pulse's product (explainers plan Phase 5): whose build
+# record drives `studio pulse run`. Like providers.yaml and products/, this is
+# the example project config kept in the tool repo for now.
+product: products/qontinui-studio.yaml
+aspect: "16:9"
