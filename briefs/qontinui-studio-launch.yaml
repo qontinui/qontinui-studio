@@ -14,5 +14,7 @@ prompt: >-
 negative_prompt: text, logos, people, watermarks, product screenshots
 style_guide: ../style/warm-minimal.md
 reference_images: []
-provider_preference: [local-gpu, gemini, openai]
+# Free routes only (no paid image API): the fleet GPU, then the operator's own
+# web accounts through the private wrappers.
+provider_preference: [local-gpu, gemini-web, chatgpt-web]
 variants: 1

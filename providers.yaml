@@ -15,12 +15,16 @@
 #   this provider nothing; setting it on a billed API is a spending decision for the
 #   operator.
 note: >-
-  Terms reviewed 2026-10-09 by agent web research. OPERATOR INPUT STILL OWED: the
-  operator's actual account list (which of these providers they hold an account on,
-  and on which plan). Rows describe each provider's free tier, not the operator's
-  accounts. One account per provider (D4) — multiple free accounts are never used to
-  get around a provider's limits, and the loader rejects a duplicate provider row.
-operator_accounts_owed: true
+  Terms reviewed 2026-10-09 by agent web research; web-account rows added
+  2026-10-17. Operator accounts (2026-10-17): no paid image API (the gemini and
+  openai API rows stay without a daily_quota); the operator's own free Gemini and
+  ChatGPT web accounts, driven by private UI Bridge wrappers under an
+  operator_override (plan
+  2026-10-17-free-image-generation-local-gpu-and-private-ui-bridge-wrappers); and
+  the fleet's own GPU (local-gpu). One account per provider (D4): the web rows are
+  the same operator account as the matching API row reached by a different route,
+  never a second account, and the loader rejects a duplicate provider row.
+operator_accounts_owed: false
 
 providers:
   # The fleet's own GPU (plan 2026-10-13-image-generation-and-visual-judgment,
@@ -155,6 +159,95 @@ providers:
       first-party terms are read. The ChatGPT web UI is not treated as automatable:
       the (third-party-mirrored) Terms of Use forbid "Automatically or
       programmatically extract data or Output", and no GUI adapter is built.
+
+  # The operator's own free web accounts, driven at manual volume by private UI
+  # Bridge wrappers on the operator's machine. The terms say no to automation
+  # and the rows keep saying so; the operator_override records the operator's
+  # decision (2026-10-17) and the bounds that hold it to manual use. A login
+  # wall, CAPTCHA or bot challenge stops the run and hands it to the operator.
+  - id: gemini-web
+    provider: Google Gemini web app (operator's own account)
+    plan: >-
+      The operator's free Gemini account at gemini.google.com, driven by the
+      private wrapper `gemini-web` instead of typing the prompts by hand.
+    api_available:
+      value: "no"
+      source: https://gemini.google.com/robots.txt
+      note: 'the web app is a UI, not an API; the API route is the gemini row'
+    automation_allowed:
+      value: "no"
+      source: https://gemini.google.com/robots.txt
+      quote: 'Disallow: /app/'
+      note: >-
+        Read first-hand 2026-10-17: Google's Terms bar "using automated means to
+        access content from any of our services in violation of the machine-readable
+        instructions on our web pages" (policies.google.com/terms), and robots.txt
+        disallows /app/. Overridden by the operator, below.
+    commercial_use:
+      value: "yes"
+      source: https://policies.google.com/terms
+      quote: "Google won’t claim ownership over that content."
+      note: 'read first-hand at policies.google.com/terms on 2026-10-17'
+    watermark: SynthID (invisible); whether the free web app adds a visible mark is not verified
+    media: [image]
+    adapter: ui_bridge_wrapper
+    wrapper_id: gemini-web
+    model: gemini-web-default
+    daily_quota: 10
+    operator_override:
+      decided: 2026-10-17
+      record: qontinui-dev-notes plans/2026-10-09-factory-built-product-portfolio-and-launch-kit.md
+      max_per_day: 10
+      min_interval_s: 90
+      on_challenge: stop_and_hand_off
+    tos_reviewed: 2026-10-17
+    domains: [gemini.google.com, policies.google.com]
+    sources:
+      - https://gemini.google.com/robots.txt
+      - https://policies.google.com/terms
+
+  - id: chatgpt-web
+    provider: OpenAI ChatGPT web app (operator's own account)
+    plan: >-
+      The operator's free ChatGPT account at chatgpt.com, driven by the private
+      wrapper `chatgpt-web` instead of typing the prompts by hand.
+    api_available:
+      value: "no"
+      source: https://chatgpt.com/robots.txt
+      note: 'the web app is a UI, not an API; the API route is the openai row'
+    automation_allowed:
+      value: "no"
+      source: https://chatgpt.com/robots.txt
+      note: >-
+        UNVERIFIED first-hand: openai.com/policies/terms-of-use answered HTTP 403 to
+        curl and to WebFetch on 2026-10-17. A third-party mirror of the Terms of Use
+        forbids "Automatically or programmatically extract data or Output"; the
+        verdict is held at "no" on that unconfirmed reading. Overridden by the
+        operator, below.
+    commercial_use:
+      value: unknown
+      source: https://chatgpt.com/robots.txt
+      note: >-
+        the first-party Terms of Use page answered HTTP 403, so ownership of Output is
+        unread first-hand; the D5 gate refuses ChatGPT assets for publication until it
+        is read. The override covers automation, not ownership.
+    watermark: C2PA metadata (no visible mark)
+    watermark_visible: false
+    media: [image]
+    adapter: ui_bridge_wrapper
+    wrapper_id: chatgpt-web
+    model: chatgpt-web-default
+    daily_quota: 10
+    operator_override:
+      decided: 2026-10-17
+      record: qontinui-dev-notes plans/2026-10-09-factory-built-product-portfolio-and-launch-kit.md
+      max_per_day: 10
+      min_interval_s: 90
+      on_challenge: stop_and_hand_off
+    tos_reviewed: 2026-10-17
+    domains: [chatgpt.com]
+    sources:
+      - https://chatgpt.com/robots.txt
 
   - id: bing
     provider: Microsoft Bing Image Creator / Designer

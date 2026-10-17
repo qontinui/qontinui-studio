@@ -3,7 +3,18 @@ caller (or the CLI) can branch on it rather than on message text."""
 
 from __future__ import annotations
 
+import hashlib
 import math
+
+
+def omitted(text: object) -> str:
+    """Free text from outside the studio (a runner, a wrapper, a gateway
+    reading), never echoed into a message, a file or a log: its length and a
+    sha256 prefix only, so two reports of the same text can be correlated."""
+    if text is None or text == "":
+        return "no detail"
+    raw = str(text).encode("utf-8", "replace")
+    return f"detail omitted ({len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:12]})"
 
 
 class StudioError(Exception):
@@ -31,6 +42,29 @@ class QuotaExhaustedError(ProviderError):
     RESOURCE_EXHAUSTED / insufficient_quota). Not a retryable glitch and not a
     failure of the job: the provider is marked spent until its quota resets and
     the job is deferred."""
+
+
+class OperatorHandoff(QuotaExhaustedError):
+    """A wrapper driving the operator's own web account stopped at a login
+    wall, CAPTCHA, bot challenge, usage limit or an unrecognised page, and
+    handed the run to the operator. Typed as a spent quota so the scheduler
+    takes the provider out of this run and an interactive job falls through to
+    the next provider; the hand-off LATCH (adapters/ui_bridge_wrapper.py) keeps
+    it out of every later run until the operator runs
+    ``studio providers clear-handoff`` — not merely until the quota reset."""
+
+    REASONS = (
+        "login_wall",
+        "captcha",
+        "bot_challenge",
+        "rate_limited",
+        "ui_changed",
+        "state_unreadable",
+    )
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class PermanentProviderError(ProviderError):

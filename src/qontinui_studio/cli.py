@@ -23,6 +23,7 @@ import click
 
 from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
+from qontinui_studio.adapters.ui_bridge_wrapper import HandoffLatch
 from qontinui_studio.briefs import load_brief, validate_brief
 from qontinui_studio.errors import GatewayRefusal, ImportRefused, PublicationRefused, StudioError
 from qontinui_studio.gateway import read_gateway_state
@@ -65,13 +66,19 @@ def _context(root: Path, generate: bool = False) -> Context:
     ws = Workspace(root)
     inventory = load_providers(ws.providers_path)
     file_notifier = FileNotifier(ws.notices_dir)
+    notifier = CoordFindingNotifier(file_notifier)
     return Context(
         workspace=ws,
         conn=connect(ws.db_path, inventory.adapter_kinds()),
         inventory=inventory,
         sites=load_sites(ws.sites_dir, root),
-        adapters=build_adapters(inventory, gateway=read_gateway_state() if generate else None),
-        notifier=CoordFindingNotifier(file_notifier),
+        adapters=build_adapters(
+            inventory,
+            gateway=read_gateway_state() if generate else None,
+            state_dir=ws.state_dir,
+            notifier=notifier,
+        ),
+        notifier=notifier,
         on_wait=_print_wait,
     )
 
@@ -542,13 +549,35 @@ def providers() -> None:
 @providers.command("list")
 @click.pass_obj
 def providers_list(obj: Obj) -> None:
-    inventory = load_providers(Workspace(obj.root).providers_path)
+    ws = Workspace(obj.root)
+    inventory = load_providers(ws.providers_path)
+    latch = HandoffLatch(ws.handoffs_dir)
     for p in inventory.providers:
-        why = p.schedulable_reason()
+        why = latch.describe(p.id) or p.schedulable_reason()
         click.echo(
             f"{p.id:12} automation={p.automation_allowed.value:7} commercial={p.commercial_use.value:7} "
             f"{'SCHEDULABLE' if why is None else 'off: ' + why}"
         )
+
+
+@providers.command("clear-handoff")
+@click.argument("provider_id")
+@click.pass_obj
+def providers_clear_handoff(obj: Obj, provider_id: str) -> None:
+    """Clear an operator hand-off latch after resolving what it named (a login,
+    a CAPTCHA, a usage limit) in the browser. The wrapper keeps its own latch:
+    clear that one too on the wrapper's machine."""
+    ws = Workspace(obj.root)
+    load_providers(ws.providers_path).get(provider_id)  # unknown id -> ConfigError
+    latch = HandoffLatch(ws.handoffs_dir)
+    if latch.clear(provider_id):
+        click.echo(f"cleared the hand-off latch for {provider_id}")
+    else:
+        click.echo(f"{provider_id} had no hand-off latch")
+    click.echo(
+        f"on the wrapper's machine also run: node <wrappers root>/{provider_id}/dist/cli.js "
+        "clear-handoff"
+    )
 
 
 # ---- launch kit (plan Phase 3) ------------------------------------------------------

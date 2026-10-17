@@ -50,6 +50,12 @@ class Workspace:
         return self.state_dir / "notices"
 
     @property
+    def handoffs_dir(self) -> Path:
+        """Operator hand-off latches, one file per provider (ui_bridge_wrapper);
+        the adapter derives the same path from ``state_dir``."""
+        return self.state_dir / "handoffs"
+
+    @property
     def review_dir(self) -> Path:
         return self.state_dir / "review"
 
