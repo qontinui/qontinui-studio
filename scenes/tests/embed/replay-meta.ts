@@ -5,7 +5,8 @@
  */
 import { SOURCE_REF_MAX } from "../../src/api/trace/schema";
 
-export const EMBED_REPLAY_SOURCE = "build-record export of qontinui/qontinui-design-tokens, last 30 days";
+/** Plainly a fixture: the label it produces must never pass for a real replay. */
+export const EMBED_REPLAY_SOURCE = "TEST FIXTURE: not a real build-record export";
 
 /** Replay meta whose date range covers every event (whole UTC days). */
 export function embedReplayMeta(title: string, events: readonly { at: string }[]) {

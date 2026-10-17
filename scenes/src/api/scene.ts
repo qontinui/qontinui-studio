@@ -40,7 +40,8 @@ export interface SceneDefinition {
    * The poster frame: what an embed shows before it plays, and all it shows
    * under `prefers-reduced-motion: reduce` until the viewer presses play.
    * Choose a frame that tells the scene's story on its own. Default: the
-   * last frame. Clamped to the scene's duration.
+   * last frame. Must be a whole frame inside the scene's duration
+   * (`posterFrame` throws otherwise).
    */
   poster?: (timeline: Timeline) => number;
   Component: ComponentType<SceneProps>;

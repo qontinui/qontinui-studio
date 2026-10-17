@@ -40,6 +40,11 @@ const REDUCED_MOTION = "(prefers-reduced-motion: reduce)";
 function subscribeReducedMotion(onChange: () => void): () => void {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => undefined;
   const query = window.matchMedia(REDUCED_MOTION);
+  // Safari before 14 has only the deprecated addListener/removeListener.
+  if (typeof query.addEventListener !== "function") {
+    query.addListener(onChange);
+    return () => query.removeListener(onChange);
+  }
   query.addEventListener("change", onChange);
   return () => query.removeEventListener("change", onChange);
 }

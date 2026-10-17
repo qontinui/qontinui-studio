@@ -32,7 +32,11 @@ const HTML = `<!doctype html>
 </html>
 `;
 
-/** The page bundle. `process.env.VITEST` is defined for the test-only replay hook. */
+/**
+ * The page bundle. `process.env.VITEST` is passed through from the process
+ * that builds it, so the test-only replay hook works under vitest (the scene
+ * matrix) and refuses everywhere else (`pnpm embed:serve`).
+ */
 export async function bundleEmbedPage(): Promise<string> {
   const result = await build({
     absWorkingDir: ROOT,
@@ -45,7 +49,7 @@ export async function bundleEmbedPage(): Promise<string> {
     logLevel: "silent",
     define: {
       "process.env.NODE_ENV": '"production"',
-      "process.env.VITEST": '"true"',
+      "process.env.VITEST": JSON.stringify(process.env.VITEST ?? ""),
     },
   });
   const [output] = result.outputFiles;
@@ -77,7 +81,7 @@ export async function serveEmbedPage(port = 0): Promise<EmbedServer> {
     const respond = async () => {
       if (pathname === "/") return { type: "text/html; charset=utf-8", body: HTML };
       if (pathname === "/page.js") return { type: "text/javascript; charset=utf-8", body: script };
-      const font = /^\/assets\/fonts\/([^/]+)$/.exec(pathname);
+      const font = /^\/assets\/fonts\/([^/]+\.woff2)$/.exec(pathname);
       if (font) return serveFile(FONTS_DIR, font[1] as string, "font/woff2");
       const trace = /^\/traces\/([^/]+\.json)$/.exec(pathname);
       if (trace) return serveFile(TRACES_DIR, decodeURIComponent(trace[1] as string), "application/json");

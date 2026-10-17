@@ -154,8 +154,10 @@ replay (see "Traces"). Each scene declares a **poster frame**
 
 `pnpm embed:serve` serves the embed test page (`tests/embed/page.tsx`) for a
 human: `http://127.0.0.1:4173/?scene=<id>&aspect=16:9&autoplay=1`, with
-`mode=replay` (the same events as an attested replay, to see the replay
-label) and `controls=0`.
+`controls=0` and `ssr=1` (server-render, then hydrate). `mode=replay` (the
+same events as an attested replay whose source reads "TEST FIXTURE") works
+only when vitest builds the page, as the scene matrix does; under
+`embed:serve` the test-only hook refuses it.
 
 ## Traces
 
@@ -403,18 +405,23 @@ longest realistic source, and at 9:16 and 1:1 a replay whose source is 120
 gate; CI runs one `scene-matrix` job per aspect). For every registered scene
 at each aspect it:
 
-- renders the whole scene to mp4 through the adapter (native size, the
-  timeline's duration) and its poster frame as a still;
+- renders the whole scene to mp4 through the adapter and reads the file back
+  (native size, 30 fps, H.264, the timeline's length), and renders its poster
+  frame as a still;
 - mounts the scene in the embed test page with its illustrative trace, in the
   pinned Chrome Headless Shell, and checks that it plays;
 - asserts the D2 mode label **on screen**: the text is the trace's own mode
   line (ILLUSTRATIVE; and, for the same events as an attested replay, REPLAY
-  with date range and source), and the label lies inside the scene's frame,
-  is visible and opaque, and is the topmost scene element at its centre;
-- checks that an embed not asked to autoplay stays on the poster frame, and
-  that under `prefers-reduced-motion: reduce` an embed asked to autoplay with
-  no controls stays on the poster frame, shows a play control, and plays only
-  once it is pressed.
+  with date range and source); the badge and the detail line each lie inside
+  the scene's frame, are visible and opaque, with opaque text that contrasts
+  with its background; the label is the topmost scene element at its centre;
+  and a screenshot of it shows drawn text;
+- checks that an embed not asked to autoplay stays on the poster frame; that
+  under `prefers-reduced-motion: reduce` an embed asked to autoplay with no
+  controls stays on the poster frame, shows a visible play control, and plays
+  only once it is pressed; that turning the preference on mid-play returns to
+  the poster and turning it off plays again; and that a server-rendered,
+  hydrated embed autoplays only once the client reports no preference.
 
 - **Golden gate (exact):** each full-size frame's SHA-256 must equal the
   committed `__goldens__/<name>.png.sha256`. Beside it is a 2x2-reduced PNG

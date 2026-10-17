@@ -80,8 +80,7 @@ export interface GoldenCase {
 
 /**
  * The cases every new scene starts with: its illustrative trace at each
- * aspect, the 16:9 frames rendered alone too, plus one 9:16 and one 1:1
- * frame alone.
+ * aspect, every one of their frames also rendered alone in a fresh browser.
  */
 export function illustrativeCases(
   scene: string,

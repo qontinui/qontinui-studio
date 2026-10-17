@@ -7,14 +7,20 @@
  * It mounts the adapter's web player exactly as a consumer would, with a
  * scene's committed illustrative trace fetched as untrusted JSON:
  *
- *   /?scene=<id>&aspect=16:9|9:16|1:1&mode=illustrative|replay&autoplay=0|1&controls=0|1
+ *   /?scene=<id>&aspect=16:9|9:16|1:1&mode=illustrative|replay&autoplay=0|1&controls=0|1&ssr=0|1
+ *
+ * `ssr=1` renders the player to HTML first and then hydrates it, as a
+ * server-rendered consumer page would.
  *
  * `mode=replay` turns the same events into a REPLAY trace attested through
  * the test-only hook, so the matrix can check the replay label (date range
- * and source) on screen. The bundle defines `process.env.VITEST` for that
- * hook; nothing outside tests/ builds or serves this page.
+ * and source) on screen; its source says it is a test fixture. The bundle
+ * carries the building process's `process.env.VITEST`, so replay mode works
+ * only when vitest built the page (the matrix) and is refused when
+ * `pnpm embed:serve` did.
  */
-import { createRoot } from "react-dom/client";
+import { createRoot, hydrateRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 
 import { StudioPlayer } from "../../src/adapters/remotion/Player";
 import { ASPECT_SIZES, isAspect } from "../../src/api/layout";
@@ -33,6 +39,7 @@ async function main() {
   const mode = params.get("mode") ?? "illustrative";
   const autoPlay = params.get("autoplay") === "1";
   const controls = params.get("controls") !== "0";
+  const ssr = params.get("ssr") === "1";
 
   const response = await fetch(`/traces/${encodeURIComponent(scene)}.json`);
   if (!response.ok) throw new Error(`no illustrative trace for ${scene} (${response.status})`);
@@ -46,9 +53,15 @@ async function main() {
 
   const container = document.getElementById("root") as HTMLElement;
   container.style.width = `${PLAYER_WIDTH[aspect]}px`;
-  createRoot(container).render(
-    <StudioPlayer scene={scene} trace={trace} aspect={aspect} assetBaseUrl="/assets" autoPlay={autoPlay} controls={controls} />,
+  const player = (
+    <StudioPlayer scene={scene} trace={trace} aspect={aspect} assetBaseUrl="/assets" autoPlay={autoPlay} controls={controls} />
   );
+  if (ssr) {
+    container.innerHTML = renderToString(player);
+    hydrateRoot(container, player);
+  } else {
+    createRoot(container).render(player);
+  }
   document.body.dataset.embedReady = "1";
 }
 

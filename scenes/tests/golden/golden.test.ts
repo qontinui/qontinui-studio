@@ -110,7 +110,6 @@ let first: Map<string, string>;
 let second: Map<string, string>;
 let reversed: Map<string, string>;
 const alone = new Map<string, string>();
-// Frame numbers repeat across scenes, so each alone render gets its own dir.
 const reducedFiles = new Map<string, string>();
 
 beforeAll(async () => {
@@ -120,6 +119,7 @@ beforeAll(async () => {
   first = await renderCases(serveUrl, path.join(OUT_DIR, "full"), suiteOrder);
   second = await renderCases(serveUrl, path.join(OUT_DIR, "full-repeat"), suiteOrder);
   reversed = await renderCases(serveUrl, path.join(OUT_DIR, "full-reversed"), reversedOrder);
+  // Frame numbers repeat across scenes, so each alone render gets its own dir.
   for (const { caseIndex, frame } of ALONE) {
     const c = GOLDEN_CASES[caseIndex] as GoldenCase;
     const files = await renderCases(serveUrl, path.join(OUT_DIR, `full-alone-${c.id}-${frame}`), [{ c, frames: [frame] }]);

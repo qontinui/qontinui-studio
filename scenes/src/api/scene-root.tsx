@@ -58,12 +58,15 @@ export function sceneDuration(scene: SceneDefinition, trace: SceneTrace): number
 
 /**
  * The poster frame of `scene` for `trace` (see `SceneDefinition.poster`):
- * the scene's own choice, or its last frame, always within its duration.
+ * the scene's own choice, or its last frame. A choice that is not a whole
+ * frame inside the scene's duration is a scene bug, and throws.
  */
 export function posterFrame(scene: SceneDefinition, trace: SceneTrace): number {
   const timeline = scene.timeline(trace, STUDIO_FPS);
   const last = timeline.durationInFrames - 1;
   const chosen = scene.poster ? scene.poster(timeline) : last;
-  if (!Number.isInteger(chosen)) throw new Error(`scene "${scene.id}": poster frame ${chosen} is not an integer`);
-  return Math.min(last, Math.max(0, chosen));
+  if (!Number.isInteger(chosen) || chosen < 0 || chosen > last) {
+    throw new Error(`scene "${scene.id}": poster frame ${chosen} is not a whole frame in 0..${last}`);
+  }
+  return chosen;
 }

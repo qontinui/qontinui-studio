@@ -55,3 +55,17 @@ describe("the registry", () => {
     expect(Object.keys(defaultTraces).sort()).toEqual(SCENE_IDS);
   });
 });
+
+describe("posterFrame", () => {
+  const s1 = scenes["s1-plan-lifecycle"]!;
+  const trace = parseTrace(JSON.parse(readFileSync(illustrativeTraceFile(s1.id), "utf8")));
+  const last = sceneDuration(s1, trace) - 1;
+
+  it("defaults to the last frame", () => {
+    expect(posterFrame({ ...s1, poster: undefined }, trace)).toBe(last);
+  });
+
+  it.each([-1, last + 1, 2.5])("refuses a scene's poster choice of %s", (frame) => {
+    expect(() => posterFrame({ ...s1, poster: () => frame }, trace)).toThrow(/is not a whole frame/);
+  });
+});
