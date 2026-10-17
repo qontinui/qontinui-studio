@@ -890,7 +890,12 @@ task. That script brings the
 checkout's dependencies up to date (poetry, the scenes package, the pinned
 headless browser; it refuses to install through a linked `scenes/node_modules`) and runs
 `studio pulse run` against `$STUDIO_PULSE_ROOT` (default: the checkout,
-whose `pulse.yaml` names `products/qontinui-studio.yaml`). The task's
+whose `pulse.yaml` names `products/qontinui-studio.yaml`). Before that, it keeps
+the shared checkout current by itself: on `main` with a clean tree it fetches
+`origin/main`, fast-forwards (`git merge --ff-only`) and re-runs the updated
+script once; on another branch, with uncommitted changes, or when the fetch or
+fast-forward fails, it says why and runs the current tree. It never stashes,
+resets or rebases. The task's
 working directory is the repo's primary checkout, so it runs whatever branch
 that checkout is on (normally `main`).
 
