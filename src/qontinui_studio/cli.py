@@ -75,7 +75,7 @@ def _context(root: Path, generate: bool = False) -> Context:
         adapters=build_adapters(
             inventory,
             gateway=read_gateway_state() if generate else None,
-            handoff_dir=ws.handoffs_dir,
+            state_dir=ws.state_dir,
             notifier=notifier,
         ),
         notifier=notifier,

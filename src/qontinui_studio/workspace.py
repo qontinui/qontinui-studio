@@ -51,7 +51,8 @@ class Workspace:
 
     @property
     def handoffs_dir(self) -> Path:
-        """Operator hand-off latches, one file per provider (ui_bridge_wrapper)."""
+        """Operator hand-off latches, one file per provider (ui_bridge_wrapper);
+        the adapter derives the same path from ``state_dir``."""
         return self.state_dir / "handoffs"
 
     @property

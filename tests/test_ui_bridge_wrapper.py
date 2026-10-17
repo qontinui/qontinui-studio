@@ -84,7 +84,25 @@ def _request() -> GenerationRequest:
 
 
 def _answer(result: dict[str, Any]) -> httpx.Response:
-    return httpx.Response(200, json={"success": True, "data": {"result": result}, "error": None})
+    """The REAL two-layer envelope. The @qontinui/ui-bridge-wrapper@0.8.0
+    dispatch server answers ``{"success": true, "data": <handler result>}``
+    (captured from the running server 2026-10-17); the runner's dispatch.rs
+    forwards that body as ``result`` because it has no ``result`` key."""
+    wrapper_body = {"success": True, "data": result}
+    return httpx.Response(
+        200, json={"success": True, "data": {"result": wrapper_body}, "error": None}
+    )
+
+
+def _adapter(state: Path, **kw: Any) -> UIBridgeWrapperAdapter:
+    """An adapter whose clock moves 1000 s per read, so consecutive submits in
+    one test are never refused by studio's own pace interval."""
+    from qontinui_studio.providers import OperatorOverride
+
+    ticks = iter(range(10**6))
+    kw.setdefault("override", OperatorOverride.model_validate(OVERRIDE))
+    kw.setdefault("clock", lambda: 1_000_000.0 + 1000.0 * next(ticks))
+    return UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER, state_dir=state, **kw)
 
 
 # --- the override in the inventory ---------------------------------------------
@@ -96,8 +114,8 @@ def test_a_wrapper_row_runs_only_under_its_override() -> None:
     assert with_override.adapter_gate() is None
     assert with_override.schedulable_reason() is None
 
-    bare = _inventory(_row(operator_override=None, daily_quota=10)).providers[0]
-    assert bare.adapter_gate() == "automation_allowed is 'no'"
+    with pytest.raises(ValueError, match="needs an operator_override"):
+        _inventory(_row(operator_override=None, daily_quota=10))
 
 
 @pytest.mark.parametrize(
@@ -156,14 +174,14 @@ def test_the_shipped_inventory_spends_nothing() -> None:
 
 
 def test_build_adapter_refuses_a_runner_off_the_local_network(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     provider = _inventory(_row()).providers[0]
     monkeypatch.setenv("STUDIO_RUNNER_URL", "https://runner.example.com")
     with pytest.raises(AdapterDisabledError, match="not on this machine or the local network"):
-        build_adapter(provider)
+        build_adapter(provider, state_dir=tmp_path)
     monkeypatch.setenv("STUDIO_RUNNER_URL", RUNNER)
-    adapter = build_adapter(provider)
+    adapter = build_adapter(provider, state_dir=tmp_path)
     assert isinstance(adapter, UIBridgeWrapperAdapter)
     assert adapter.runner_url == RUNNER
 
@@ -173,13 +191,18 @@ def test_done_stages_marked_images(tmp_path: Path) -> None:
     route = respx.post(DISPATCH).mock(
         return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
     )
-    adapter = UIBridgeWrapperAdapter("gemini-web", "gemini-web-default", "gemini-web", RUNNER)
+    adapter = _adapter(tmp_path / "state")
     job = adapter.submit(_request(), tmp_path / "stage")
     sent = route.calls.last.request
     assert sent.headers["X-Wrapper-Dispatch-Timeout"] == "300"
     assert json.loads(sent.content) == {
         "action": "generate-image",
-        "params": {"prompt": "a red square", "aspectRatio": "1:1"},
+        "params": {
+            "prompt": "a red square",
+            "aspectRatio": "1:1",
+            "maxPerDay": 10,
+            "minIntervalS": 90,
+        },
     }
     assert adapter.poll(job).status == "done"
     files = adapter.download(job, tmp_path / "out")
@@ -219,7 +242,7 @@ def test_wrapper_outcomes_are_typed(
     tmp_path: Path, result: dict[str, Any], error: type[Exception], check: Callable[[Any], bool]
 ) -> None:
     respx.post(DISPATCH).mock(return_value=_answer(result))
-    adapter = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER)
+    adapter = _adapter(tmp_path / "state")
     with pytest.raises(error) as info:
         adapter.submit(_request(), tmp_path)
     assert check(info.value)
@@ -251,14 +274,14 @@ def test_runner_outcomes_are_typed(
     tmp_path: Path, response: httpx.Response, error: type[Exception]
 ) -> None:
     respx.post(DISPATCH).mock(return_value=response)
-    adapter = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER)
+    adapter = _adapter(tmp_path / "state")
     with pytest.raises(error):
         adapter.submit(_request(), tmp_path)
 
 
 @respx.mock
 def test_transport_failures_split_on_whether_the_prompt_left(tmp_path: Path) -> None:
-    adapter = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER)
+    adapter = _adapter(tmp_path / "state")
     respx.post(DISPATCH).mock(side_effect=httpx.ConnectError("refused"))
     with pytest.raises(ProviderBusy) as busy:
         adapter.submit(_request(), tmp_path)
@@ -313,18 +336,10 @@ def test_the_inventory_loader_reports_a_bad_override_as_config(tmp_path: Path) -
 
 @respx.mock
 def test_the_override_bounds_ride_every_dispatch(tmp_path: Path) -> None:
-    from qontinui_studio.providers import OperatorOverride
-
     route = respx.post(DISPATCH).mock(
         return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
     )
-    adapter = UIBridgeWrapperAdapter(
-        "gemini-web",
-        "m",
-        "gemini-web",
-        RUNNER,
-        override=OperatorOverride.model_validate(OVERRIDE),
-    )
+    adapter = _adapter(tmp_path / "state")
     adapter.submit(_request(), tmp_path)
     params = json.loads(route.calls.last.request.content)["params"]
     assert params["maxPerDay"] == 10 and params["minIntervalS"] == 90
@@ -336,10 +351,16 @@ def test_the_override_cap_has_a_manual_equivalent_ceiling() -> None:
     assert _inventory(_row(operator_override={**OVERRIDE, "max_per_day": 25}, daily_quota=25))
 
 
-def test_a_wrapper_row_without_an_override_is_refused_at_build() -> None:
-    bare = _inventory(_row(operator_override=None)).providers[0]
-    with pytest.raises(AdapterDisabledError, match="automation_allowed is 'no'"):
-        build_adapter(bare)
+def test_every_wrapper_row_needs_an_override_even_when_automation_is_allowed() -> None:
+    row = _row(operator_override=None)
+    row["automation_allowed"] = {"value": "yes", "source": "https://gemini.example/tos"}
+    with pytest.raises(ValueError, match="needs an operator_override"):
+        _inventory(row)
+
+
+def test_a_wrapper_adapter_needs_the_state_dir() -> None:
+    with pytest.raises(AdapterDisabledError, match="needs the workspace state dir"):
+        build_adapter(_inventory(_row()).providers[0])
 
 
 class _Notices:
@@ -367,9 +388,7 @@ def test_a_handoff_latches_until_the_operator_clears_it(tmp_path: Path) -> None:
     )
     latch = HandoffLatch(tmp_path / "handoffs")
     notices = _Notices()
-    adapter = UIBridgeWrapperAdapter(
-        "gemini-web", "m", "gemini-web", RUNNER, latch=latch, notifier=notices
-    )
+    adapter = _adapter(tmp_path, notifier=notices)
     with pytest.raises(OperatorHandoff) as first:
         adapter.submit(_request(), tmp_path / "s")
     assert "SECRET" not in str(first.value) and "a@b.example" not in str(first.value)
@@ -382,15 +401,12 @@ def test_a_handoff_latches_until_the_operator_clears_it(tmp_path: Path) -> None:
     assert route.call_count == 1 and len(notices.sent) == 1
 
     # Every later run builds the provider as unavailable — not only until reset.
-    built = build_adapters(_inventory(_row()), handoff_dir=tmp_path / "handoffs")
+    built = build_adapters(_inventory(_row()), state_dir=tmp_path)
     assert "gemini-web" not in built.adapters
     assert "operator hand-off latched (captcha)" in built.unavailable["gemini-web"]
 
     assert latch.clear("gemini-web")
-    assert (
-        "gemini-web"
-        in build_adapters(_inventory(_row()), handoff_dir=tmp_path / "handoffs").adapters
-    )
+    assert "gemini-web" in build_adapters(_inventory(_row()), state_dir=tmp_path).adapters
 
 
 def test_an_unreadable_latch_fails_closed(tmp_path: Path) -> None:
@@ -424,18 +440,18 @@ def test_clear_handoff_command(tmp_path: Path) -> None:
     assert HandoffLatch(ws.handoffs_dir).get("gemini-web") is None
 
 
-def test_redact_strips_queries_and_emails_and_bounds_length() -> None:
+def test_redact_strips_paths_queries_and_emails_and_bounds_length() -> None:
     from qontinui_studio.adapters.ui_bridge_wrapper import MAX_DETAIL_CHARS, redact
 
     out = redact("see https://accounts.google.com/signin?continue=x#f for me@mail.example")
-    assert out == "see https://accounts.google.com/signin for <email>"
+    assert out == "see https://accounts.google.com for <email>"
     assert len(redact("x" * 5000)) == MAX_DETAIL_CHARS
 
 
 @respx.mock
 def test_a_runner_503_parks_past_the_run_horizon(tmp_path: Path) -> None:
     respx.post(DISPATCH).mock(return_value=httpx.Response(503, json={"error": "spawn failed"}))
-    adapter = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER)
+    adapter = _adapter(tmp_path / "state")
     with pytest.raises(ProviderBusy) as busy:
         adapter.submit(_request(), tmp_path)
     assert busy.value.retry_after_s == 3600
@@ -452,9 +468,7 @@ def test_no_conversation_url_reaches_the_handle(tmp_path: Path) -> None:
             }
         )
     )
-    job = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER).submit(
-        _request(), tmp_path
-    )
+    job = _adapter(tmp_path / "state").submit(_request(), tmp_path)
     assert set(job.data) == {"staged"}
 
 
@@ -485,3 +499,82 @@ def test_a_paced_answer_refunds_the_unit_and_falls_back(
         "SELECT COALESCE(SUM(used), 0) AS u FROM quota_usage WHERE provider='fake'"
     ).fetchone()
     assert used["u"] == 0  # the refused submission's unit was refunded
+
+
+# --- review round 2: the real envelope, host-only URLs, studio-side spacing ----
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # the real two-layer shape (runner around the wrapper dispatch server)
+        {"success": True, "data": {"result": {"success": True, "data": {"status": "cap_reached"}}}},
+        # a wrapper that answers {"result": ...} itself: the runner unwraps it
+        {"success": True, "data": {"result": {"status": "cap_reached"}}},
+    ],
+)
+@respx.mock
+def test_both_runner_envelopes_reach_the_handler_result(
+    tmp_path: Path, body: dict[str, Any]
+) -> None:
+    respx.post(DISPATCH).mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(QuotaExhaustedError):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@respx.mock
+def test_a_wrapper_failure_inside_a_2xx_is_unknown(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={"success": True, "data": {"result": {"success": False, "error": "boom"}}},
+        )
+    )
+    with pytest.raises(ProviderOutcomeUnknown, match="wrapper reported failure"):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@respx.mock
+def test_a_real_envelope_handoff_latches(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=_answer(
+            {
+                "status": "handoff",
+                "reason": "login_wall",
+                "detail": "went to https://gemini.google.com/app/8f3a2c1d9e?hl=en",
+                "latched": True,
+            }
+        )
+    )
+    adapter = _adapter(tmp_path)
+    with pytest.raises(OperatorHandoff) as e:
+        adapter.submit(_request(), tmp_path / "s")
+    assert e.value.reason == "login_wall"
+    latch_text = (tmp_path / "handoffs" / "gemini-web.json").read_text()
+    for text in (str(e.value), latch_text):
+        assert "8f3a2c1d9e" not in text and "/app/" not in text
+        assert "https://gemini.google.com" in text
+
+
+def test_redact_keeps_only_scheme_and_host() -> None:
+    from qontinui_studio.adapters.ui_bridge_wrapper import redact
+
+    assert redact("at https://chatgpt.com/c/abc-123?x=1 now") == "at https://chatgpt.com now"
+
+
+@respx.mock
+def test_studio_alone_holds_the_pace_interval(tmp_path: Path) -> None:
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
+    )
+    now = [1_000_000.0]
+    adapter = _adapter(tmp_path / "state", clock=lambda: now[0])
+    adapter.submit(_request(), tmp_path / "a")
+    now[0] += 30  # inside the row's 90 s interval
+    with pytest.raises(ProviderBusy) as busy:
+        adapter.submit(_request(), tmp_path / "b")
+    assert busy.value.code == "paced" and busy.value.retry_after_s == 60
+    assert route.call_count == 1  # refused without dialling
+    now[0] += 61
+    adapter.submit(_request(), tmp_path / "c")
+    assert route.call_count == 2
