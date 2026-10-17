@@ -99,7 +99,16 @@ def _e(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
-def _page(title: str, body: str, record_url: str | None, head_extra: str = "") -> str:
+def _page(
+    title: str,
+    body: str,
+    record_url: str | None,
+    head_extra: str = "",
+    scripts: tuple[str, ...] = (),
+) -> str:
+    # `publish.page_scripts`, validated as site-root-relative .js paths
+    # (product.PAGE_SCRIPT_RE); escaped anyway, as every attribute here is.
+    head_extra += "".join(f"<script type='module' src='{_e(src)}'></script>" for src in scripts)
     if record_url:
         footer = f'<a class="factory" href="{_e(record_url)}">{FOOTER_TEXT}</a> — the public build record'
     else:
@@ -142,7 +151,9 @@ def how_it_was_built(product: LaunchProduct, outcome: FetchOutcome, record_url: 
             f"<code>{_e(product.slug)}</code> yet ({_e(outcome.kind)}): {_e(outcome.detail)}. "
             "This page shows numbers only from the factory's published build record, so it shows none.</p>"
         )
-        return _page(f"How {product.title} was built", body, record_url)
+        return _page(
+            f"How {product.title} was built", body, record_url, scripts=product.publish.page_scripts
+        )
     rec = outcome.record
     parts = [
         f"<h1>How {_e(rec.product.title)} was built</h1>",
@@ -248,7 +259,12 @@ def how_it_was_built(product: LaunchProduct, outcome: FetchOutcome, record_url: 
         )
     else:
         parts.append("<p data-source='unknowns'>The record lists no unknowns.</p>")
-    return _page(f"How {rec.product.title} was built", "".join(parts), record_url)
+    return _page(
+        f"How {rec.product.title} was built",
+        "".join(parts),
+        record_url,
+        scripts=product.publish.page_scripts,
+    )
 
 
 def landing_page(
@@ -310,7 +326,7 @@ def landing_page(
             "<p class='notice' data-record='absent'>No build record has been published yet.</p>"
         )
     parts.append("<p><a href='how-it-was-built.html'>The full build record, rendered</a></p>")
-    return _page(product.title, "".join(parts), record_url, head)
+    return _page(product.title, "".join(parts), record_url, head, product.publish.page_scripts)
 
 
 class BundleRefused(StudioError):

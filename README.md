@@ -794,6 +794,16 @@ film. Two steps remain before the **live** self-launch:
   waived. For the same reason, `sites/qontinui-studio-launch.yaml` refuses
   decoration until it has a preview.
 
+Bundle pages are static HTML, so they carry no UI Bridge of their own, and D7's
+image check needs the React auto-registration provider with media discovery on
+the page. A host site provides it through `publish.page_scripts`, a list of
+site-root-relative `.js`/`.mjs` paths (for example `["/_hub/ui-bridge.js"]`).
+Every bundle page loads each one as a module script, in order. Each entry must
+be a path on the page's own host: a scheme, a host, a query, a fragment or a dot
+segment is refused when the product file loads. The domain is decided
+(`build.qontinui.io`); the hub that serves these scripts is plan
+`2026-10-17-build-qontinui-io-factory-hub`.
+
 ## Development
 
 ```bash

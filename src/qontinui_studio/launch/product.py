@@ -8,17 +8,22 @@ bundle publishes.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from qontinui_studio.errors import ConfigError
 from qontinui_studio.gates import origin
 from qontinui_studio.launch.record import SLUG_PATTERN, WEB_BASE, public_record_url
 from qontinui_studio.sites import Site, forbidden_bridge_reason
+
+#: A page script: one leading slash, then path segments of URL-safe characters,
+#: ending in .js or .mjs. Excludes `//host`, schemes, queries and fragments.
+PAGE_SCRIPT_RE = re.compile(r"/[A-Za-z0-9_~-][A-Za-z0-9._~/-]*\.m?js")
 
 
 class RecordSource(BaseModel):
@@ -75,6 +80,12 @@ class PublishTarget(BaseModel):
     preview_dir: Path | None = None
     preview_manifest_url: str | None = None
     commercial: bool = False
+    # Site-root-relative scripts every bundle page loads, in order — e.g. the
+    # host site's UI Bridge boot (`/_hub/ui-bridge.js`), which mounts the React
+    # auto-registration provider with media discovery so D7 can see the page's
+    # images. Same-origin by construction: a path, never a URL, so a published
+    # page can only run code its own host serves.
+    page_scripts: tuple[str, ...] = ()
 
     @property
     def has_preview(self) -> bool:
@@ -84,6 +95,20 @@ class PublishTarget(BaseModel):
             and self.preview_dir
             and self.preview_manifest_url
         )
+
+    @field_validator("page_scripts")
+    @classmethod
+    def _page_scripts(cls, scripts: tuple[str, ...]) -> tuple[str, ...]:
+        for path in scripts:
+            if not PAGE_SCRIPT_RE.fullmatch(path) or "/../" in f"{path}/" or "/./" in f"{path}/":
+                raise ValueError(
+                    f"page_scripts entry {path!r} must be a site-root-relative path to a .js "
+                    "or .mjs file (e.g. /_hub/ui-bridge.js): no scheme, host, query, "
+                    "fragment or dot segment"
+                )
+        if len(set(scripts)) != len(scripts):
+            raise ValueError("page_scripts lists a path twice")
+        return scripts
 
     @model_validator(mode="after")
     def _preview(self) -> PublishTarget:
