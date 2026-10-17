@@ -156,7 +156,13 @@ const S1_CASES: readonly GoldenCase[] = [
   ).map(([suffix, aspect, trace]) => ({ id: `${SCENE_ID}-${suffix}`, scene: SCENE_ID, aspect, frames: [250], trace })),
 ];
 
-export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES];
+/**
+ * S2 (609 frames: 36-frame intro, one beat every 39): 0 intro, 200 the first
+ * decision, 503 the poster (the last answer, every panel full), 608 the end.
+ */
+const S2_CASES = illustrativeCases("s2-digital-twin", { "16:9": [0, 200, 503, 608], "9:16": [503], "1:1": [230] });
+
+export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES];
 
 export function goldenName(c: GoldenCase, frame: number): string {
   return `${c.id}-f${String(frame).padStart(4, "0")}.png`;

@@ -5,6 +5,7 @@ import { sceneDuration } from "../../api/scene-root";
 import { parseTrace } from "../../api/trace/schema";
 import { getScene, scenes } from "../../scenes";
 import s1Illustrative from "../../../traces/illustrative/s1-plan-lifecycle.json";
+import s2Illustrative from "../../../traces/illustrative/s2-digital-twin.json";
 import { StudioComposition, type StudioCompositionProps } from "./StudioComposition";
 
 /**
@@ -13,6 +14,7 @@ import { StudioComposition, type StudioCompositionProps } from "./StudioComposit
  */
 export const defaultTraces: Record<string, unknown> = {
   "s1-plan-lifecycle": s1Illustrative,
+  "s2-digital-twin": s2Illustrative,
 };
 
 /** Size and length come from the props, so one composition serves every aspect and trace. */

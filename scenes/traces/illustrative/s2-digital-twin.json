@@ -1,0 +1,37 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "Decisions come from the twin, not from guesses",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s2-digital-twin.json"
+    }
+  },
+  "entities": {
+    "sources": [
+      { "id": "src-github", "kind": "repo-host", "label": "GitHub" },
+      { "id": "src-ci", "kind": "ci", "label": "CI" },
+      { "id": "src-machines", "kind": "machine", "label": "Machines" },
+      { "id": "src-sessions", "kind": "session", "label": "Agent sessions" }
+    ],
+    "sessions": [
+      { "id": "session-impl", "label": "Implementing session" }
+    ]
+  },
+  "events": [
+    { "id": "e01", "at": "2026-09-14T17:40:00Z", "kind": "twin.mirrored", "source": "src-github", "fact": "PR #412 opened on example/sync-service" },
+    { "id": "e02", "at": "2026-09-14T17:41:00Z", "kind": "twin.mirrored", "source": "src-sessions", "fact": "Implementing session: working on PR #412" },
+    { "id": "e03", "at": "2026-09-14T17:43:00Z", "kind": "twin.mirrored", "source": "src-machines", "fact": "Build box: 2 of 6 build slots free" },
+    { "id": "e04", "at": "2026-09-14T18:52:00Z", "kind": "twin.mirrored", "source": "src-ci", "fact": "PR #412: 14 of 14 checks green" },
+    { "id": "e05", "at": "2026-09-14T18:53:00Z", "kind": "twin.decided", "decision": "Queue PR #412 in the merge train", "basis": "every required check is green" },
+    { "id": "e06", "at": "2026-09-14T19:02:00Z", "kind": "twin.mirrored", "source": "src-github", "fact": "main moved: 3 commits landed" },
+    { "id": "e07", "at": "2026-09-14T19:03:00Z", "kind": "twin.decided", "decision": "Rebase PR #412 and test it again", "basis": "main moved since its checks ran" },
+    { "id": "e08", "at": "2026-09-14T19:04:00Z", "kind": "twin.decided", "decision": "Run the rebase build on the build box", "basis": "it has free build slots" },
+    { "id": "e09", "at": "2026-09-14T19:20:00Z", "kind": "question.asked", "session": "session-impl", "question": "May I rebase a peer's branch to unblock mine?" },
+    { "id": "e10", "at": "2026-09-14T19:20:30Z", "kind": "question.answered", "question": "e09", "answer": "No: route around it on a fresh branch", "from": "policy", "document": "policy git-operations" },
+    { "id": "e11", "at": "2026-09-14T19:31:00Z", "kind": "question.asked", "session": "session-impl", "question": "Who is the changelog entry written for?" },
+    { "id": "e12", "at": "2026-09-14T19:31:20Z", "kind": "question.answered", "question": "e11", "answer": "Experienced programmers who run the factory", "from": "intent", "document": "audience profile external-operator" },
+    { "id": "e13", "at": "2026-09-14T20:05:00Z", "kind": "twin.mirrored", "source": "src-github", "fact": "PR #412 landed on main" }
+  ]
+}

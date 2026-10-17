@@ -22,7 +22,7 @@ src/api/          the studio scene API — the only thing scenes import (besides
   engine.ts       EngineAdapter / PlayerEmbedProps — the engine seam (D7)
   scene-root.tsx  what every adapter renders: canvas + scene + mode label
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label
-src/scenes/       scenes; S1 "Plan lifecycle" is the first
+src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin", ...)
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
@@ -37,6 +37,13 @@ lint-fixtures/    files that MUST fail lint (the lint self-test); never part of 
 fontconfig/       the fontconfig the headless browser runs under
 assets/fonts/     bundled Inter 4.1, full character set (OFL)
 ```
+
+## Scenes
+
+| Scene | Shows | Trace |
+| --- | --- | --- |
+| `s1-plan-lifecycle` | one plan, draft to shipped | illustrative; replay once the build-record export lands in coord |
+| `s2-digital-twin` | GitHub, CI, machines and sessions mirrored into coord; decisions from the twin; the developer twin answering from served documents | illustrative only: the export carries no twin, webhook or question events |
 
 ## The engine seam (plan D7)
 
@@ -169,7 +176,8 @@ carries `trace_version: 1`. A trace contains:
   - `source`: `hand-authored` for illustrative traces; `build-record` with an
     `export_version` for replays;
   - `date_range`: required for a replay.
-- `entities`: `plans`, `prs` and `sessions`.
+- `entities`: `plans`, `prs`, `sessions` and `sources` (systems the twin
+  mirrors: `repo-host`, `ci`, `machine`, `session`; display labels only).
 - `events`: each event has an `id` and an `at` (ISO-8601 with an offset), and is
   one of:
   - `plan.drafted|vetted|implementing|shipped`
@@ -178,6 +186,11 @@ carries `trace_version: 1`. A trace contains:
   - `ci.started|passed|failed`
   - `merge_train.queued`
   - `pr.landed`
+  - `twin.mirrored` (a fact from a source) and `twin.decided` (a decision and
+    the twin state it was made from)
+  - `question.asked` and `question.answered` (the answer, and whether it came
+    from a served `policy` or `intent` document or from the `operator`; the
+    answer must reference an earlier `question.asked` event)
 
 The validator also checks that:
 

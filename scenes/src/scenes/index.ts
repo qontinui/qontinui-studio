@@ -1,8 +1,9 @@
 /** Scene registry: every scene the CLI and adapters can render, by id. */
 import type { SceneDefinition } from "../api";
 import { s1PlanLifecycle } from "./s1-plan-lifecycle";
+import { s2DigitalTwin } from "./s2-digital-twin";
 
-const ALL: readonly SceneDefinition[] = [s1PlanLifecycle];
+const ALL: readonly SceneDefinition[] = [s1PlanLifecycle, s2DigitalTwin];
 
 export const scenes: Readonly<Record<string, SceneDefinition>> = Object.fromEntries(
   ALL.map((scene) => [scene.id, scene]),

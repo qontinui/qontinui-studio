@@ -8,9 +8,9 @@ import type { ComponentType } from "react";
 
 import type { Layout } from "./layout";
 import type { Timeline } from "./timeline";
-import type { EventKind, SceneTrace } from "./trace/schema";
+import type { EntityKind, EventKind, SceneTrace } from "./trace/schema";
 
-export type EntityKind = "plans" | "prs" | "sessions";
+export type { EntityKind };
 
 export interface SceneRequirements {
   /** Each kind must occur at least once in the trace. */
