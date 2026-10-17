@@ -24,7 +24,8 @@ src/api/          the studio scene API — the only thing scenes import (besides
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
-                  S3 "Gates and continuations", S4 "The merge train", S5 "The fleet", ...)
+                  S3 "Gates and continuations", S4 "The merge train", S5 "The fleet",
+                  S6 "Self-correction", ...)
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
@@ -49,6 +50,7 @@ assets/fonts/     bundled Inter 4.1, full character set (OFL)
 | `s3-gates-continuations` | a session registers a gate on a condition and ends; coord observes the condition and clears the gate; a new session continues | illustrative only: the export carries gate counts, not gate events |
 | `s4-merge-train` | PRs queued, rebased onto main, tested and landed in order; a conflicted PR steps out and rejoins at the back | illustrative only: the export carries land times but no queue order, rebase or conflict events |
 | `s5-fleet` | sessions on several machines, each in its own worktree, coordinating through declared intent and claims; a held claim is a collision avoided | illustrative only: the export carries a session count, excludes machine names, and has no worktree, intent or claim events |
+| `s6-self-correction` | CI goes red; the session diagnoses it from the CI log and pushes a fix; CI runs again, round the loop to green, with no human step | illustrative only: the export carries attempts, CI duration and a red-CI-fixed count, but no CI run, diagnosis or fix events |
 
 ## The engine seam (plan D7)
 
@@ -194,7 +196,8 @@ as an unknown event. A trace contains:
   - `session.started|ended` (`session.started` may name the gate it
     `continues`)
   - `pr.opened`
-  - `ci.started|passed|failed`
+  - `ci.started|passed|failed`, and `ci.diagnosed` / `fix.pushed` (a
+    diagnosis follows a red run of the same PR; a fix follows a diagnosis)
   - `merge_train.queued|rebased|conflicted|resolved`
   - `pr.landed`
   - `twin.mirrored` (a fact from a source) and `twin.decided` (a decision and
@@ -240,7 +243,8 @@ Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
 may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
 sessions, S4 at most four PRs, S5 at most three machines with two sessions
-each, every session on a machine and started before it acts).
+each, every session on a machine and started before it acts, S6 exactly
+one PR).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

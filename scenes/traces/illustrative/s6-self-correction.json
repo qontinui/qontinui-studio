@@ -1,0 +1,109 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "Red to green with no human step",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s6-self-correction.json"
+    }
+  },
+  "entities": {
+    "plans": [
+      {
+        "id": "plan-retry",
+        "title": "Add a retry budget to the sync worker"
+      }
+    ],
+    "prs": [
+      {
+        "id": "pr-430",
+        "plan": "plan-retry",
+        "repo": "example/sync-service",
+        "number": 430,
+        "title": "feat: bounded retry budget for sync jobs"
+      }
+    ]
+  },
+  "events": [
+    {
+      "id": "e01",
+      "at": "2026-09-18T14:00:00Z",
+      "kind": "pr.opened",
+      "pr": "pr-430"
+    },
+    {
+      "id": "e02",
+      "at": "2026-09-18T14:01:00Z",
+      "kind": "ci.started",
+      "pr": "pr-430"
+    },
+    {
+      "id": "e03",
+      "at": "2026-09-18T14:19:00Z",
+      "kind": "ci.failed",
+      "pr": "pr-430",
+      "checks": 14
+    },
+    {
+      "id": "e04",
+      "at": "2026-09-18T14:21:00Z",
+      "kind": "ci.diagnosed",
+      "pr": "pr-430",
+      "cause": "test_retry_budget expects 3 retries and sees 4"
+    },
+    {
+      "id": "e05",
+      "at": "2026-09-18T14:27:00Z",
+      "kind": "fix.pushed",
+      "pr": "pr-430",
+      "summary": "stop counting the first attempt as a retry"
+    },
+    {
+      "id": "e06",
+      "at": "2026-09-18T14:28:00Z",
+      "kind": "ci.started",
+      "pr": "pr-430"
+    },
+    {
+      "id": "e07",
+      "at": "2026-09-18T14:44:00Z",
+      "kind": "ci.failed",
+      "pr": "pr-430",
+      "checks": 14
+    },
+    {
+      "id": "e08",
+      "at": "2026-09-18T14:45:00Z",
+      "kind": "ci.diagnosed",
+      "pr": "pr-430",
+      "cause": "lint: the fix left an unused import"
+    },
+    {
+      "id": "e09",
+      "at": "2026-09-18T14:46:00Z",
+      "kind": "fix.pushed",
+      "pr": "pr-430",
+      "summary": "remove the unused import"
+    },
+    {
+      "id": "e10",
+      "at": "2026-09-18T14:47:00Z",
+      "kind": "ci.started",
+      "pr": "pr-430"
+    },
+    {
+      "id": "e11",
+      "at": "2026-09-18T15:05:00Z",
+      "kind": "ci.passed",
+      "pr": "pr-430",
+      "checks": 14
+    },
+    {
+      "id": "e12",
+      "at": "2026-09-18T15:30:00Z",
+      "kind": "pr.landed",
+      "pr": "pr-430"
+    }
+  ]
+}

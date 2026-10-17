@@ -5,8 +5,9 @@ import { s2DigitalTwin } from "./s2-digital-twin";
 import { s3GatesContinuations } from "./s3-gates-continuations";
 import { s4MergeTrain } from "./s4-merge-train";
 import { s5Fleet } from "./s5-fleet";
+import { s6SelfCorrection } from "./s6-self-correction";
 
-const ALL: readonly SceneDefinition[] = [s1PlanLifecycle, s2DigitalTwin, s3GatesContinuations, s4MergeTrain, s5Fleet];
+const ALL: readonly SceneDefinition[] = [s1PlanLifecycle, s2DigitalTwin, s3GatesContinuations, s4MergeTrain, s5Fleet, s6SelfCorrection];
 
 export const scenes: Readonly<Record<string, SceneDefinition>> = Object.fromEntries(
   ALL.map((scene) => [scene.id, scene]),

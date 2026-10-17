@@ -150,6 +150,10 @@ export const traceEvent = z.discriminatedUnion("kind", [
       checks: z.number().int().nonnegative().optional(),
     })
     .strict(),
+  // Self-correction (S6): a red run is diagnosed and a fix pushed, with no
+  // human step; the next ci.started/ci.passed closes the loop.
+  z.object({ ...eventBase, kind: z.literal("ci.diagnosed"), ...prRef, cause: z.string().min(1).max(80) }).strict(),
+  z.object({ ...eventBase, kind: z.literal("fix.pushed"), ...prRef, summary: z.string().min(1).max(80) }).strict(),
   z.object({ ...eventBase, kind: z.literal("merge_train.queued"), ...prRef }).strict(),
   // The merge train (S4): the head of the train is rebased onto main; a
   // rebase that conflicts takes the PR out of the train until it is resolved.
@@ -249,6 +253,8 @@ export const EVENT_KINDS = [
   "ci.started",
   "ci.passed",
   "ci.failed",
+  "ci.diagnosed",
+  "fix.pushed",
   "merge_train.queued",
   "merge_train.rebased",
   "merge_train.conflicted",
@@ -559,6 +565,12 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       const held = holderBefore.get(i);
       if (held === event.session) issue("resource", `"${event.session}" already holds "${event.resource}"`);
       else if (held !== undefined) issue("resource", `"${event.resource}" is already held by "${held}"`);
+    }
+    if ((event.kind === "ci.diagnosed" || event.kind === "fix.pushed") && prs.has(event.pr)) {
+      // A diagnosis follows a red run; a fix follows a diagnosis (of the same PR).
+      const needs = event.kind === "ci.diagnosed" ? "ci.failed" : "ci.diagnosed";
+      const prior = trace.events.findIndex((e, j) => e.kind === needs && "pr" in e && e.pr === event.pr && precedes(j, i));
+      if (prior < 0) issue("pr", `${event.kind} before any ${needs} for "${event.pr}"`);
     }
     if (prs.has("pr" in event ? event.pr : "") && "pr" in event) {
       const pr = event.pr;

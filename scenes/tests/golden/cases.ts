@@ -224,7 +224,21 @@ const S4_CASES: readonly GoldenCase[] = [
  */
 const S5_CASES = illustrativeCases("s5-fleet", { "16:9": [0, 240, 467, 587], "9:16": [467], "1:1": [240, 467] });
 
-export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES, ...S4_CASES, ...S5_CASES];
+/**
+ * S6 (498 frames: 36-frame intro, one beat every 33): 0 intro, 170 the first
+ * fix pushed, 310 the second fix pushed, 398 the poster (green after the loop),
+ * 497 the end (landed).
+ */
+const S6_CASES = illustrativeCases("s6-self-correction", { "16:9": [0, 170, 310, 398, 497], "9:16": [398], "1:1": [170, 398] });
+
+export const GOLDEN_CASES: readonly GoldenCase[] = [
+  ...S1_CASES,
+  ...S2_CASES,
+  ...S3_CASES,
+  ...S4_CASES,
+  ...S5_CASES,
+  ...S6_CASES,
+];
 
 export function goldenName(c: GoldenCase, frame: number): string {
   return `${c.id}-f${String(frame).padStart(4, "0")}.png`;
