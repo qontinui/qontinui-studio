@@ -115,15 +115,23 @@ export function s3State(trace: SceneTrace, timeline: Timeline, frame: number): S
   const cleared = of(passed, "gate.cleared");
   const hasEnded = (session: string) => ended.some((b) => b.event.session === session);
 
-  // --- the gate in focus -------------------------------------------------------
-  const focus = registered[registered.length - 1];
+  // --- the gate in focus: the one the latest gate-related beat names ----------------
+  // (with several gates open at once, the centre follows what the caption says).
+  let focusGate: string | undefined;
+  for (const b of passed) {
+    const e = b.event;
+    if (e.kind === "gate.registered" || e.kind === "gate.observed" || e.kind === "gate.cleared") focusGate = e.gate;
+    else if (e.kind === "session.started" && e.continues !== undefined) focusGate = e.continues;
+  }
+  const focus = registered.find((b) => b.event.gate === focusGate);
   let gate: S3State["gate"] = null;
   let registrant: SessionCard | null = null;
+  const firstBeat = beats[0];
   let continuation: SessionCard = {
     label: "Next session",
     sublabel: "starts when the gate clears",
     level: "inert",
-    appear: 1,
+    appear: firstBeat ? appearOf(firstBeat) : 1,
   };
   let edgeIn = 0;
   let edgeOut = 0;
@@ -145,7 +153,8 @@ export function s3State(trace: SceneTrace, timeline: Timeline, frame: number): S
       label: sessionLabel(owner),
       sublabel: gone ? "ended · nothing polls" : "registered a gate",
       level: gone ? "done" : "running",
-      appear: 1,
+      // Re-enters when the focus moves to this gate's registration.
+      appear: appearOf(focus),
     };
     edgeIn = progress(frame, focus.startFrame, slow);
     const next = started.find((b) => b.event.continues === id);
@@ -189,14 +198,18 @@ export function s3State(trace: SceneTrace, timeline: Timeline, frame: number): S
   // --- sessions on the real-time axis ---------------------------------------------------
   const startOf = (session: string) => trace.events.find((e) => e.kind === "session.started" && e.session === session);
   const endOf = (session: string) => trace.events.find((e) => e.kind === "session.ended" && e.session === session);
+  // Started / ended follow the beats (what the nodes show); a session with no
+  // start event counts as started from the beginning of the axis.
   let running = 0;
   const lanes = trace.entities.sessions.map((session) => {
     const s = startOf(session.id);
     const e = endOf(session.id);
-    const startMs = s ? eventTimeMs(s) : Number.POSITIVE_INFINITY;
+    const isStarted = !s || started.some((b) => b.event.id === s.id);
+    const isOver = e !== undefined && ended.some((b) => b.event.id === e.id);
+    const startMs = s ? eventTimeMs(s) : firstMs;
     const endMs = e ? eventTimeMs(e) : Number.POSITIVE_INFINITY;
-    if (nowMs < startMs) return { id: session.id, label: session.label, start: 0, end: 0, level: "inert" as AttentionLevel };
-    const over = nowMs >= endMs;
+    if (!isStarted) return { id: session.id, label: session.label, start: 0, end: 0, level: "inert" as AttentionLevel };
+    const over = isOver;
     if (!over) running++;
     return {
       id: session.id,
@@ -208,7 +221,13 @@ export function s3State(trace: SceneTrace, timeline: Timeline, frame: number): S
   });
 
   const tickLevel = (kind: S3Kind): AttentionLevel =>
-    kind === "gate.registered" ? "waiting" : kind === "gate.observed" ? "testing" : kind === "gate.cleared" ? "done" : "running";
+    kind === "gate.registered"
+      ? "waiting"
+      : kind === "gate.observed"
+        ? "testing"
+        : kind === "gate.cleared" || kind === "session.ended"
+          ? "done"
+          : "running";
   const ticks = beats.map((b) => ({
     at: axis(b.atMs),
     level: tickLevel(b.event.kind as S3Kind),

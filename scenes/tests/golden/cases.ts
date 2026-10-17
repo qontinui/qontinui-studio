@@ -179,7 +179,21 @@ const S2_CASES: readonly GoldenCase[] = [
  * condition observed after the wait (no session running), 251 the poster
  * (the first continuation running), 527 the end.
  */
-const S3_CASES = illustrativeCases("s3-gates-continuations", { "16:9": [0, 150, 251, 527], "9:16": [251], "1:1": [251] });
+/** S3 with 80-character session labels and a 60-character condition (the schema maximums). */
+export function s3LongLabelsTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(illustrativeTraceFile("s3-gates-continuations"), "utf8"));
+  json.entities.sessions.forEach((s: { label: string }, i: number) => {
+    s.label = `Session ${i + 1} working on the per-tenant retry budget for the sync worker job queue`.slice(0, 80);
+  });
+  json.entities.gates[0].condition = "the upstream PR example/api#88 has landed on main, all green";
+  return parseTrace(json);
+}
+
+const S3_CASES: readonly GoldenCase[] = [
+  ...illustrativeCases("s3-gates-continuations", { "16:9": [0, 150, 251, 527], "9:16": [251], "1:1": [251] }),
+  { id: "s3-gates-continuations-9x16-long-labels", scene: "s3-gates-continuations", aspect: "9:16", frames: [251], trace: s3LongLabelsTrace },
+  { id: "s3-gates-continuations-1x1-long-labels", scene: "s3-gates-continuations", aspect: "1:1", frames: [251], trace: s3LongLabelsTrace },
+];
 
 export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES];
 

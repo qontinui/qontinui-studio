@@ -361,8 +361,14 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     return ta < tb || (ta === tb && a < b);
   };
   /** Index of the first event of `kind` for gate `gate`, or -1. */
-  const gateEvent = (kind: EventKind, gate: string) =>
-    trace.events.findIndex((e) => e.kind === kind && "gate" in e && e.gate === gate);
+  /** Index of the first event of `kind` for gate `gate` in timeline order, or -1. */
+  const gateEvent = (kind: EventKind, gate: string) => {
+    let first = -1;
+    trace.events.forEach((e, j) => {
+      if (e.kind === kind && "gate" in e && e.gate === gate && (first < 0 || precedes(j, first))) first = j;
+    });
+    return first;
+  };
 
   trace.entities.prs.forEach((pr, i) => {
     if (!plans.has(pr.plan)) {
@@ -375,12 +381,13 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   });
 
   trace.events.forEach((event, i) => {
-    const ref = (field: string, set: Set<string>, value: string | undefined) => {
+    /** `noun` names what the field refers to when it differs from the field (e.g. continues → gate). */
+    const ref = (field: string, set: Set<string>, value: string | undefined, noun = field) => {
       if (value !== undefined && !set.has(value)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["events", i, field],
-          message: `unknown ${field} "${value}"`,
+          message: `unknown ${noun} "${value}"`,
         });
       }
     };
@@ -389,32 +396,45 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
     if ("session" in event) ref("session", sessions, event.session);
     if ("source" in event) ref("source", sources, event.source);
     if ("gate" in event) ref("gate", gates, event.gate);
-    if (event.kind === "session.started") ref("continues", gates, event.continues);
-    const mustFollow = (kind: EventKind, gate: string, field: string, what: string) => {
+    if (event.kind === "session.started") ref("continues", gates, event.continues, "gate");
+    const issue = (field: string, message: string) =>
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["events", i, field], message });
+    /** `kind` for `gate` must exist and come strictly before event i. */
+    const mustFollow = (kind: EventKind, gate: string, field: string, before: string, never: string) => {
+      if (!gates.has(gate)) return;
       const at = gateEvent(kind, gate);
-      if (gates.has(gate) && (at < 0 || !precedes(at, i))) {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["events", i, field], message: `${what} "${gate}"` });
-      }
+      if (at < 0) issue(field, `${never} "${gate}"`);
+      else if (!precedes(at, i)) issue(field, `${before} "${gate}"`);
     };
     if (event.kind === "gate.observed" || event.kind === "gate.cleared") {
-      mustFollow("gate.registered", event.gate, "gate", `${event.kind} before gate.registered for`);
-      if (gateEvent(event.kind, event.gate) !== i) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["events", i, "gate"],
-          message: `${event.kind} occurs more than once for "${event.gate}"`,
-        });
-      }
+      mustFollow(
+        "gate.registered",
+        event.gate,
+        "gate",
+        `${event.kind} before gate.registered for`,
+        `${event.kind} for a gate that is never registered:`,
+      );
+      if (gateEvent(event.kind, event.gate) !== i) issue("gate", `${event.kind} occurs more than once for "${event.gate}"`);
     }
-    if (event.kind === "gate.registered" && gateEvent("gate.registered", event.gate) !== i) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["events", i, "gate"],
-        message: `gate "${event.gate}" is registered more than once`,
-      });
+    if (event.kind === "gate.cleared") {
+      // Observed (when it is) before it clears: the condition is seen, then the gate opens.
+      const seen = gateEvent("gate.observed", event.gate);
+      if (seen >= 0 && !precedes(seen, i)) issue("gate", `gate.cleared before gate.observed for "${event.gate}"`);
+    }
+    if (event.kind === "gate.registered") {
+      if (gateEvent("gate.registered", event.gate) !== i) issue("gate", `gate "${event.gate}" is registered more than once`);
+      // A session registers a gate while it is running, not after it ended.
+      const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
+      if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
     }
     if (event.kind === "session.started" && event.continues !== undefined) {
-      mustFollow("gate.cleared", event.continues, "continues", "a continuation starts before gate.cleared for");
+      mustFollow(
+        "gate.cleared",
+        event.continues,
+        "continues",
+        "a continuation starts before gate.cleared for",
+        "a continuation of a gate that is never cleared:",
+      );
     }
     if (event.kind === "question.answered") {
       const asked = eventsById.get(event.question);
