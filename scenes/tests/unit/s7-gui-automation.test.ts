@@ -69,6 +69,16 @@ describe("S7 trace fields", () => {
     expect(withEdge("t-skip", "st-login", "st-search").join("\n")).toMatch(/t-skip would run through "st-home" at 16:9/);
   });
 
+  it("judges labels at the widest they can render, so the text never changes the verdict", () => {
+    const verdict = (action: string) => {
+      const json = traceJson();
+      json.entities!.transitions!.push({ id: "t-diag", from: "st-search", to: "st-cart", action });
+      json.events.push({ id: "e90", at: "2026-09-19T10:02:40Z", kind: "gui.transition_found", transition: "t-diag" } as never);
+      return missingRequirements(s7GuiAutomation, parseTrace(json));
+    };
+    expect(verdict("W")).toEqual(verdict("W".repeat(32)));
+  });
+
   it("refuses two edges that cross as an X (their labels would land on each other)", () => {
     const json = traceJson();
     // Home (slot 1) → Results (slot 3) crosses Search (slot 2) → Cart (slot 4).

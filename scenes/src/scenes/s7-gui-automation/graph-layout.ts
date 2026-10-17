@@ -113,27 +113,29 @@ export function labelPlacement(layout: Layout, g: GraphSlots, a: P, b: P): Label
   const x = (a.x + b.x) / 2;
   const y = above ? Math.min(a.y, b.y) - g.node.height / 2 - 22 * u : (a.y + b.y) / 2;
   // Room: an in-row label above spans the gap between centres; on the line it
-  // must stay between the two nodes; an up-and-down one may be a little wider
-  // than a node; a diagonal one stays within the gap between columns.
+  // stays between the two nodes with room at each end; an up-and-down one is
+  // no wider than a node (so it stays in the safe area); a diagonal one stays
+  // within the gap between columns.
   const columnGap = Math.min(
     ...g.slots.flatMap((p, i) => g.slots.slice(i + 1).map((q) => Math.abs(q.x - p.x)).filter((d) => d > 1)),
   );
   const maxWidth = above
     ? Math.abs(b.x - a.x) - 20 * u
     : across
-      ? Math.abs(b.x - a.x) - g.node.width - 20 * u
+      ? Math.abs(b.x - a.x) - g.node.width - 40 * u
       : Math.abs(b.x - a.x) < 1
-        ? g.node.width + 40 * u
+        ? g.node.width
         : Math.max(80 * u, columnGap - g.node.width - 20 * u);
   return { x, y, maxWidth };
 }
 
-/** The box a label will occupy (its text estimated, capped at its room), for overlap checks. */
-function labelBox(layout: Layout, place: LabelPlacement, text: string) {
+/**
+ * The box a label may occupy: the widest it can ever render (its room, at
+ * least the 80u minimum), so the check does not depend on font metrics.
+ */
+function labelBox(layout: Layout, place: LabelPlacement) {
   const u = layout.unit;
-  const estimated = text.length * 0.56 * 22 * 0.85 * u + 22 * u;
-  const width = Math.min(Math.max(80 * u, place.maxWidth), Math.max(80 * u, estimated));
-  return { x: place.x, y: place.y, w: width, h: 30 * u };
+  return { x: place.x, y: place.y, w: Math.max(80 * u, place.maxWidth), h: 30 * u };
 }
 
 function overlap(p: { x: number; y: number; w: number; h: number }, q: { x: number; y: number; w: number; h: number }) {
@@ -183,7 +185,7 @@ export function graphProblems(trace: SceneTrace): string[] {
     const boxes = edges.flatMap((t) => {
       const a = g.slots[slotOf.get(t.from) ?? -1];
       const b = g.slots[slotOf.get(t.to) ?? -1];
-      return a && b && t.from !== t.to ? [{ id: t.id, box: labelBox(layout, labelPlacement(layout, g, a, b), t.action) }] : [];
+      return a && b && t.from !== t.to ? [{ id: t.id, box: labelBox(layout, labelPlacement(layout, g, a, b)) }] : [];
     });
     const nodes = [...slotOf.entries()].flatMap(([id, slot]) => {
       const c = g.slots[slot];
