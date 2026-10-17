@@ -331,7 +331,7 @@ def test_the_inventory_loader_reports_a_bad_override_as_config(tmp_path: Path) -
         load_providers(path)
 
 
-# --- review round 1: bounds on the wire, the latch, the notice, redaction ------
+# --- review round 1: bounds on the wire, the latch, the notice -------------------
 
 
 @respx.mock
@@ -440,14 +440,6 @@ def test_clear_handoff_command(tmp_path: Path) -> None:
     assert HandoffLatch(ws.handoffs_dir).get("gemini-web") is None
 
 
-def test_redact_strips_paths_queries_and_emails_and_bounds_length() -> None:
-    from qontinui_studio.adapters.ui_bridge_wrapper import MAX_DETAIL_CHARS, redact
-
-    out = redact("see https://accounts.google.com/signin?continue=x#f for me@mail.example")
-    assert out == "see https://accounts.google.com for <email>"
-    assert len(redact("x" * 5000)) == MAX_DETAIL_CHARS
-
-
 @respx.mock
 def test_a_runner_503_parks_past_the_run_horizon(tmp_path: Path) -> None:
     respx.post(DISPATCH).mock(return_value=httpx.Response(503, json={"error": "spawn failed"}))
@@ -553,13 +545,7 @@ def test_a_real_envelope_handoff_latches(tmp_path: Path) -> None:
     latch_text = (tmp_path / "handoffs" / "gemini-web.json").read_text()
     for text in (str(e.value), latch_text):
         assert "8f3a2c1d9e" not in text and "/app/" not in text
-        assert "https://gemini.google.com" in text
-
-
-def test_redact_keeps_only_scheme_and_host() -> None:
-    from qontinui_studio.adapters.ui_bridge_wrapper import redact
-
-    assert redact("at https://chatgpt.com/c/abc-123?x=1 now") == "at https://chatgpt.com now"
+        assert "login_wall" in text
 
 
 @respx.mock
@@ -580,28 +566,7 @@ def test_studio_alone_holds_the_pace_interval(tmp_path: Path) -> None:
     assert route.call_count == 2
 
 
-# --- review round 3: redaction edge cases, the real gate, the real paced path --
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("see gemini.google.com/app/8f3a2c1d9e now", "see gemini.google.com now"),
-        ("HTTPS://chatgpt.com/c/abc?x=1", "HTTPS://chatgpt.com"),
-        ("https://user:pw@chatgpt.com/c/x", "https://chatgpt.com"),
-        ("at Https://Gemini.Google.com/app/z#f", "at Https://Gemini.Google.com"),
-        # file paths are not hosts and stay readable
-        (
-            "file ~/.qontinui/wrappers/gemini-web/state.json",
-            "file ~/.qontinui/wrappers/gemini-web/state.json",
-        ),
-        ("node dist/cli.js clear-handoff", "node dist/cli.js clear-handoff"),
-    ],
-)
-def test_redact_reduces_every_url_shape_to_its_host(text: str, expected: str) -> None:
-    from qontinui_studio.adapters.ui_bridge_wrapper import redact
-
-    assert redact(text) == expected
+# --- review round 3: the real gate, the real paced path ------------------------
 
 
 def _chatgpt_row() -> dict[str, Any]:
@@ -705,3 +670,143 @@ def test_the_real_adapter_paced_refusal_falls_back_through_the_scheduler(
         "SELECT COALESCE(SUM(used), 0) AS u FROM quota_usage WHERE provider='gemini-web'"
     ).fetchone()
     assert used["u"] == 1  # the paced refusal's unit was refunded
+
+
+# --- review round 4: nothing the wrapper or runner says is persisted ------------
+
+LEAKS = [
+    "https://gemini.google.com/app/8f3a2c1d9e?hl=en",
+    "gemini.google.com/app/8f3a2c1d9e",
+    "gemini.google.com:443/app/xyzconv",
+    "HTTPS://chatgpt.com/c/abcconv?x=1",
+    "chatgpt.com?next=/c/nextconv&acct=bobacct",
+    "chatgpt.com#/c/fragconv",
+    "//chatgpt.com/c/slashconv",
+    "bücher.de/pfad/umlautsecret",
+    "user:pwsecret@chatgpt.com/c/userinfoconv",
+    "https://user@evil@chatgpt.com/c/doubleat",
+    "[link](https://chatgpt.com/c/mdconv) trailing",
+    "https://www.google.com/recaptcha/api2?k=SECRETKEY",
+    "signed in as someone@mail.example",
+]
+# Every substring that must never reach a message, latch file or notice.
+FORBIDDEN = [
+    "8f3a2c1d9e",
+    "xyzconv",
+    "abcconv",
+    "nextconv",
+    "bobacct",
+    "fragconv",
+    "slashconv",
+    "umlautsecret",
+    "pwsecret",
+    "userinfoconv",
+    "doubleat",
+    "mdconv",
+    "SECRETKEY",
+    "someone@mail.example",
+    "/app/",
+    "/c/",
+    "evil",
+    "bücher",
+]
+
+
+def _persisted(tmp_path: Path, *extra: str) -> str:
+    texts = [p.read_text() for p in tmp_path.rglob("*.json")]
+    return "\n".join([*texts, *extra])
+
+
+@pytest.mark.parametrize("leak", LEAKS)
+@respx.mock
+def test_no_wrapper_handoff_detail_is_persisted(tmp_path: Path, leak: str) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "handoff", "reason": "captcha", "detail": leak})
+    )
+    notices = _Notices()
+    adapter = _adapter(tmp_path / "state", notifier=notices, known_host="gemini.google.com")
+    with pytest.raises(OperatorHandoff) as e:
+        adapter.submit(_request(), tmp_path / "s")
+    notice = notices.sent[0]
+    out = _persisted(tmp_path, str(e.value), notice.title, notice.body)
+    for bad in FORBIDDEN:
+        assert bad not in out, (leak, bad)
+    assert "captcha" in out and "gemini.google.com" in str(e.value)  # the KNOWN host only
+    latch = json.loads((tmp_path / "state" / "handoffs" / "gemini-web.json").read_text())
+    assert set(latch) == {"reason", "at", "detail_omitted"}
+
+
+@pytest.mark.parametrize("leak", LEAKS)
+@pytest.mark.parametrize("status", [404, 500, 502, 503])
+@respx.mock
+def test_no_runner_error_text_is_persisted(tmp_path: Path, leak: str, status: int) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(status, json={"success": False, "error": leak})
+    )
+    with pytest.raises(Exception) as e:
+        _adapter(tmp_path / "state").submit(_request(), tmp_path / "s")
+    for bad in FORBIDDEN:
+        assert bad not in str(e.value), (leak, bad)
+    assert f"HTTP {status}" in str(e.value) or status == 503
+
+
+@pytest.mark.parametrize("leak", LEAKS)
+@respx.mock
+def test_no_wrapper_failure_or_status_text_is_persisted(tmp_path: Path, leak: str) -> None:
+    for i, body in enumerate(
+        (
+            {"success": True, "data": {"result": {"success": False, "error": leak}}},
+            {"success": True, "data": {"result": {"success": True, "data": {"status": leak}}}},
+        )
+    ):
+        respx.post(DISPATCH).mock(return_value=httpx.Response(200, json=body))
+        with pytest.raises(ProviderOutcomeUnknown) as e:
+            _adapter(tmp_path / f"state{i}").submit(_request(), tmp_path / "s")
+        for bad in FORBIDDEN:
+            assert bad not in str(e.value), (leak, bad)
+        assert "detail omitted" in str(e.value)
+
+
+@respx.mock
+def test_job_rows_carry_no_wrapper_text(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    tmp_path: Path,
+) -> None:
+    from qontinui_studio.providers import OperatorOverride
+
+    _studio_with(studio_root, _row())
+    respx.post(DISPATCH).mock(
+        return_value=_answer(
+            {"status": "handoff", "reason": "login_wall", "detail": " ".join(LEAKS)}
+        )
+    )
+    real = UIBridgeWrapperAdapter(
+        "gemini-web",
+        "m",
+        "gemini-web",
+        RUNNER,
+        override=OperatorOverride.model_validate(OVERRIDE),
+        state_dir=tmp_path / "state",
+    )
+    ctx = make_context(
+        adapters=AdapterSet(
+            adapters={"gemini-web": real, "fake": FakeImageAdapter("fake", "fake-v1")}
+        )
+    )
+    drive_batch(
+        ctx, new_batch(ctx, load_brief(write_brief(providers="gemini-web, fake"))), publish=False
+    )
+    rows = [
+        " ".join(str(v) for v in r)
+        for table in ("jobs", "job_attempts")
+        for r in ctx.conn.execute(f"SELECT * FROM {table}")
+    ]
+    joined = "\n".join(rows)
+    assert (
+        json.loads((tmp_path / "state" / "handoffs" / "gemini-web.json").read_text())["reason"]
+        == "login_wall"
+    )  # the hand-off happened
+    for bad in FORBIDDEN:
+        assert bad not in joined, bad

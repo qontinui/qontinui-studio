@@ -100,6 +100,7 @@ def build_adapter(
                 override=provider.operator_override,
                 state_dir=state_dir,
                 notifier=notifier,
+                known_host=provider.domains[0].partition("/")[0],
             )
         except PermanentProviderError as e:  # a non-local runner URL
             raise AdapterDisabledError(str(e)) from e
