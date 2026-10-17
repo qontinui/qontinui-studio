@@ -1115,3 +1115,61 @@ def test_decor_rejected_after_assembly_is_refused_at_publish(
     assert not result.published
     refused = [g for g in result.failures if g.gate == "library_approval"]
     assert refused and uid in refused[0].subject and "rejected" in refused[0].detail
+
+
+def test_page_scripts_load_on_every_page_and_publication_still_passes(
+    make_context: Callable[..., Context], studio_root: Path, record_file: Path
+) -> None:
+    """`publish.page_scripts` is how a host site gets its UI Bridge boot onto
+    studio-rendered bundle pages (plan 2026-10-17-build-qontinui-io-factory-hub,
+    D3): every page loads each script, in order, and every gate still passes."""
+    ctx = make_context(**preview_ctx(studio_root))
+    scripts = ("/_hub/ui-bridge.js", "/_hub/extra.mjs")
+    product_path = write_product(studio_root, capture=False, page_scripts=scripts)
+    run = run_kit(ctx, product_path, KitOptions(video=False), public_client(), publish=True)
+    assert run.publish is not None and run.publish.published, run.publish.failures
+    tags = "".join(f"<script type='module' src='{s}'></script>" for s in scripts)
+    for page in ("index.html", "how-it-was-built.html"):
+        text = (run.bundle.out_dir / page).read_text()
+        head = text.split("</head>", 1)[0]
+        assert tags in head, page
+
+
+def test_page_scripts_without_any_render_no_script_tag(
+    make_context: Callable[..., Context], studio_root: Path, record_file: Path
+) -> None:
+    ctx = make_context(**preview_ctx(studio_root))
+    product_path = write_product(studio_root, capture=False)
+    run = run_kit(ctx, product_path, KitOptions(video=False), public_client())
+    for page in ("index.html", "how-it-was-built.html"):
+        assert "<script" not in (run.bundle.out_dir / page).read_text()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://cdn.example/x.js",
+        "//cdn.example/x.js",
+        "_hub/ui-bridge.js",
+        "/_hub/ui-bridge.js?v=1",
+        "/_hub/ui-bridge.js#x",
+        "/_hub/../secret.js",
+        "/_hub/./ui-bridge.js",
+        "/.hidden/x.js",
+        "/_hub/ui-bridge.css",
+        "/_hub/ui bridge.js",
+        "/_hub/x.js'><script>",
+    ],
+)
+def test_page_scripts_refuse_anything_but_a_root_relative_js_path(
+    studio_root: Path, bad: str
+) -> None:
+    path = write_product(studio_root, capture=False, page_scripts=(bad,))
+    with pytest.raises(ConfigError, match="page_scripts"):
+        load_product(path)
+
+
+def test_page_scripts_refuse_a_duplicate(studio_root: Path) -> None:
+    path = write_product(studio_root, capture=False, page_scripts=("/_hub/a.js", "/_hub/a.js"))
+    with pytest.raises(ConfigError, match="twice"):
+        load_product(path)

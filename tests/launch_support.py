@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import html
+import json
 import re
 import shutil
 from pathlib import Path
@@ -281,6 +282,7 @@ def write_product(
     preview: bool = True,
     video_seconds: float = 6,
     commercial: bool = False,
+    page_scripts: tuple[str, ...] = (),
 ) -> Path:
     """products/<slug>.yaml plus its capture script and served static site."""
     products = root / "products"
@@ -301,6 +303,8 @@ def write_product(
         "  publish_dir: ../published-launch",
         f"  commercial: {'true' if commercial else 'false'}",
     ]
+    if page_scripts:
+        lines.append("  page_scripts: " + json.dumps(list(page_scripts)))
     if preview:
         lines += preview_lines("launch", "  ")
     if capture:
