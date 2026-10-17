@@ -28,6 +28,7 @@ src/api/          the studio scene API — the only thing scenes import (besides
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header, label (a small pill on a point)
 src/compositions/ the teaser, the explainer and the factory pulse (plan Phase 5)
+src/gate/         the unattended publish gate (manifest, speech, layout, ffprobe, frames, audio, captions)
 src/narration/    speak -> re-transcribe -> align (Kokoro-FastAPI, Whisper); vendor/explainroo (MIT)
 narration/examples/  an example narration script (a production's own scripts live in its repo)
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
@@ -592,6 +593,50 @@ speech match is floored, never rounded up past the gate.
 `--force`) one holding only its own files. The tests run the loop against
 shape fixtures (`tests/fixtures/narration/`) through a fake `fetch` and a
 loopback server; no live service is needed.
+
+## The publish gate (plan Phase 5)
+
+```sh
+pnpm studio-scenes gate out/teaser.mp4 [--min-speech 0.9] [--max-silence 10]
+```
+
+Reads `<video>.composition.json`, runs every check, writes
+`<video>.gate.json` (each check, pass or fail, and why) and exits **0** when
+the video may be published unattended, **3** when it may not. Every check
+runs even after one fails, and a check that cannot be measured fails
+(UNKNOWN never passes).
+
+| Check | Passes when |
+| --- | --- |
+| `manifest` | the video hashes to the manifest; every input (traces, b-roll, timing table, clips) still hashes to it; the program rebuilt from them places every segment where the manifest says |
+| `speech` | every narration clip the REBUILT program plays (the manifest's own list must agree) has an independent speech check (Whisper vs script, from the timing table) of **≥ 0.9**; `unavailable` or never checked fails |
+| `layout` | at three points in every segment: no visible text runs off the frame, is cut off by a clipping box with no ellipsis (horizontally past it, or more than a fifth of a line's height outside it), is partly covered by an opaque box, or overlaps other text; and every sampled frame has visible text (at least its mode label). Text shortened with an ellipsis by the box that cuts it (`text-overflow: ellipsis` horizontally, a line clamp vertically) is a **warning** on the report, not a failure: it is how the scenes fit long names at narrow aspects. Every clipping box is checked, so an ellipsized label that also runs off the frame fails |
+| `ffprobe` | one video stream of the manifest's codec, size and frame rate, 8-bit 4:2:0; the container AND the video stream itself as long as the manifest says (within two frames; one frame for the stream's frame count); with narration, one audio stream |
+| `frames` | four frames, at the middles of the four quarters, none black (nothing lit: 99.9th-percentile luma ≤ 40) or flat (luma s.d. < 1) |
+| `audio` | there is an audio stream, it is not silent (mean ≥ −60 dB), no silence of 10 s or more (−50 dB), no clipping (peak < −0.1 dBFS) |
+| `captions` | the captions file is byte for byte the one the rebuilt program and timing table produce (a stale or edited file fails), is valid WebVTT, its cue count matches the manifest, cues are ordered and end inside the video, and every narrated segment has a caption |
+
+The layout check lays each sampled frame out, as static markup from the
+same `ProgramRoot` every render draws, in the pinned Chrome Headless Shell
+under the studio fontconfig, with the bundled fonts registered from their
+bytes (a frame measured without its font would mean nothing, so a font that
+fails to load fails the check). Its controls are in
+`tests/golden/gate.test.ts`.
+
+**What the gate does not see** (stated, so nobody relies on it): occlusion
+is judged from background colours and images, so text under an opaque SVG
+shape is not flagged; `clip-path` and `contain: paint` are not treated as
+clips; a line-clamped box shorter than its clamp is reported as a
+truncation warning, not a cut; and a frame showing only its mode label on
+the dark canvas passes both `frames` and `layout` (missing scene content
+with the label present is not detected). None of these patterns occurs in
+the current scenes; the layout calibration over every composition, aspect
+and 15th frame finds only designed truncations.
+
+The last four checks are named after checks in calesthio/OpenMontage, which
+is AGPL: they are this package's own implementation, and no code was taken
+from it. ffprobe and ffmpeg come from `STUDIO_FFPROBE` / `STUDIO_FFMPEG`, else
+`PATH`.
 
 ## Tests
 

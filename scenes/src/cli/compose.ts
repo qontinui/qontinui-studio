@@ -8,7 +8,6 @@
  * omitted and why, the SHA-256 of every input), and — when the narration
  * carries aligned words — `<out>.vtt`, the captions.
  */
-import { createHash } from "node:crypto";
 import { access, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +28,7 @@ import { fromBuildRecord, type BuildRecordExport } from "../api/trace/from-build
 import { renderRefusal } from "../api/trace/provenance";
 import { validateTrace, type SceneTrace } from "../api/trace/schema";
 import { compositions, getComposition } from "../compositions";
+import { mediaName, sha256 } from "../gate/hash";
 import { scenes } from "../scenes";
 import { loadAdapter, parse, readJson } from "./common";
 import { UsageError, runInterruptible } from "./interruptible";
@@ -52,9 +52,6 @@ export class ReplayUnavailable extends Error {}
 
 export const MANIFEST_VERSION = 1;
 
-function sha256(bytes: Buffer | string): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
 
 /** `name=value` pairs, each name at most once. */
 function pairs(flag: string, values: readonly string[] | undefined): Map<string, string> {
@@ -69,11 +66,6 @@ function pairs(flag: string, values: readonly string[] | undefined): Map<string,
   return out;
 }
 
-/** A media name: content-addressed, so equal files share one name and nothing collides. */
-function mediaName(bytes: Buffer, file: string): string {
-  const ext = path.extname(file).toLowerCase().replace(/[^.a-z0-9]/g, "");
-  return `media/${sha256(bytes).slice(0, 24)}${ext}`;
-}
 
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const AUDIO_EXT = new Set([".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"]);
