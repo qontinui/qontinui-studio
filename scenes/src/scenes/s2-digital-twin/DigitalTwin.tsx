@@ -114,8 +114,8 @@ function place(layout: Layout, sourceCount: number): Placement {
   // the developer twin side by side below; the caption across the bottom.
   const top = 290 * u;
   const colWidth = 210 * u;
-  const nodeHeight = 52 * u;
-  const nodeStep = 60 * u;
+  const nodeHeight = 50 * u;
+  const nodeStep = 58 * u;
   const sources = Array.from({ length: n }, (_, i) => ({ x: safe.x + colWidth / 2, y: top + nodeHeight / 2 + nodeStep * i }));
   const twinRows = 4;
   const twin = { x: safe.x + colWidth + 30 * u, y: top, width: right - (safe.x + colWidth + 30 * u) };
@@ -147,9 +147,9 @@ function place(layout: Layout, sourceCount: number): Placement {
     },
     operator: {
       x: safe.x + colWidth / 2,
-      y: twinBottom - nodeHeight / 2,
+      y: twinBottom - 32 * u,
       width: colWidth,
-      height: nodeHeight,
+      height: 64 * u,
       short: true,
     },
     caption: { x: safe.x, y: rowBottom + 26 * u, width: safe.width, lines: 2 },
