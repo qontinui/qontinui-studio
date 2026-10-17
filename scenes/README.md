@@ -193,8 +193,7 @@ as an unknown event. A trace contains:
     `continues`)
   - `pr.opened`
   - `ci.started|passed|failed`
-  - `merge_train.queued|rebased|conflicted|resolved` (a resolution must
-    follow a conflict of the same PR)
+  - `merge_train.queued|rebased|conflicted|resolved`
   - `pr.landed`
   - `twin.mirrored` (a fact from a source) and `twin.decided` (a decision and
     the twin state it was made from)
@@ -214,6 +213,9 @@ The validator also checks that:
   it is registered, observed (when it is) before it clears, and a
   continuation starts only after its gate cleared (all by time, then by
   position);
+- in the merge train, a resolution answers an unresolved conflict of the same
+  PR, a conflicted PR is neither rebased nor landed until it is resolved, and
+  a PR lands at most once;
 - replay events fall inside `date_range`;
 - an illustrative trace never claims a build-record source, and a replay never
   claims a hand-authored one;

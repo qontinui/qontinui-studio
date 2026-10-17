@@ -434,16 +434,30 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
     }
-    if (event.kind === "merge_train.resolved" && prs.has(event.pr)) {
-      const conflicted = trace.events.findIndex(
-        (e, j) => e.kind === "merge_train.conflicted" && e.pr === event.pr && precedes(j, i),
-      );
-      if (conflicted < 0) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["events", i, "pr"],
-          message: `merge_train.resolved before any merge_train.conflicted for "${event.pr}"`,
-        });
+    if (prs.has("pr" in event ? event.pr : "") && "pr" in event) {
+      const pr = event.pr;
+      // The PR's standing in the train just before this event: the latest
+      // queued / conflicted / resolved event for it.
+      let standing: EventKind | null = null;
+      let standingAt = -1;
+      trace.events.forEach((e, j) => {
+        if ("pr" in e && e.pr === pr && precedes(j, i) && (standingAt < 0 || precedes(standingAt, j))) {
+          if (e.kind === "merge_train.queued" || e.kind === "merge_train.conflicted" || e.kind === "merge_train.resolved") {
+            standing = e.kind;
+            standingAt = j;
+          }
+        }
+      });
+      if (event.kind === "merge_train.resolved" && standing !== "merge_train.conflicted") {
+        issue("pr", `merge_train.resolved without an unresolved merge_train.conflicted for "${pr}"`);
+      }
+      // A conflicted PR is out of the train until it is resolved.
+      if ((event.kind === "merge_train.rebased" || event.kind === "pr.landed") && standing === "merge_train.conflicted") {
+        issue("pr", `${event.kind} while "${pr}" has an unresolved conflict`);
+      }
+      if (event.kind === "pr.landed") {
+        const first = trace.events.findIndex((e, j) => e.kind === "pr.landed" && e.pr === pr && j !== i && precedes(j, i));
+        if (first >= 0) issue("pr", `"${pr}" lands more than once`);
       }
     }
     if (event.kind === "session.started" && event.continues !== undefined) {

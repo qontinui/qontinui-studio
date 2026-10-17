@@ -26,7 +26,19 @@ describe("S4 trace fields", () => {
     const json = traceJson();
     const resolved = json.events.find((e) => e.kind === "merge_train.resolved")!;
     resolved.at = "2026-09-16T09:00:30Z";
-    expect(errorsOf(json).join("\n")).toMatch(/merge_train.resolved before any merge_train.conflicted for "pr-418"/);
+    expect(errorsOf(json).join("\n")).toMatch(/merge_train.resolved without an unresolved merge_train.conflicted for "pr-418"/);
+  });
+
+  it("refuses a second resolution, a rebase or landing while conflicted, and landing twice", () => {
+    const twice = traceJson();
+    twice.events.push({ id: "e90", at: "2026-09-16T10:21:00Z", kind: "merge_train.resolved", pr: "pr-418" } as never);
+    expect(errorsOf(twice).join("\n")).toMatch(/events.18.pr: merge_train.resolved without an unresolved/);
+    const early = traceJson();
+    early.events.push({ id: "e91", at: "2026-09-16T10:04:00Z", kind: "merge_train.rebased", pr: "pr-418" } as never);
+    expect(errorsOf(early)).toContain('events.18.pr: merge_train.rebased while "pr-418" has an unresolved conflict');
+    const again = traceJson();
+    again.events.push({ id: "e92", at: "2026-09-16T11:30:00Z", kind: "pr.landed", pr: "pr-412" } as never);
+    expect(errorsOf(again)).toContain('events.18.pr: "pr-412" lands more than once');
   });
 
   it("caps the scene at four PRs", () => {
@@ -56,7 +68,12 @@ describe("S4 scene model", () => {
   it("rebases and tests the head, then lands it and the rest move up", () => {
     expect(settled(beat("merge_train.rebased", "pr-412")).cars[0]).toMatchObject({ number: 412, status: "Rebased · testing", level: "testing" });
     const landing = beat("pr.landed", "pr-412");
-    expect(s4State(trace, tl, landing.startFrame).cars[0]?.number).toBe(412);
+    // The landed car leaves first, drawn last so nothing slides over it.
+    const leaving = s4State(trace, tl, landing.startFrame + 4);
+    expect(leaving.cars.at(-1)).toMatchObject({ number: 412, status: "Landed" });
+    expect(leaving.cars.at(-1)!.exit).toBeGreaterThan(0);
+    expect(leaving.cars.find((c) => c.number === 415)?.slot).toBe(1);
+    expect(leaving.main.at(-1)?.text).toBe("#412 feat: retry budget for sync jobs");
     const after = settled(landing);
     expect(after.cars.map((c) => c.number)).toEqual([415, 418, 421]);
     expect(after.cars.map((c) => c.slot)).toEqual([0, 1, 2]);
@@ -86,7 +103,11 @@ describe("S4 scene model", () => {
     expect(end.main.map((r) => r.text.split(" ")[0])).toEqual(["#412", "#415", "#421", "#418"]);
     expect(end.landed).toBe(4);
     const resolved = settled(beat("merge_train.resolved", "pr-418"));
-    expect(resolved.cars).toMatchObject([{ number: 418, aside: 0, status: "Resolved · queued" }]);
+    expect(resolved.cars.map((c) => [c.number, c.slot, c.aside])).toEqual([
+      [421, 0, 0],
+      [418, 1, 0],
+    ]);
+    expect(resolved.cars[1]?.status).toBe("Resolved · queued");
   });
 
   it("puts the poster on the conflict with the next PR at the head", () => {

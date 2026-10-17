@@ -39,7 +39,7 @@ function place(layout: Layout): Placement {
     return {
       header: { x: safe.x, y: 140 * u, width: safe.width, titleSize: 48 },
       train: { ...train, capacity },
-      car: { x: i.x, y: i.y, width: i.width - 48 * u, step, asideDx: 48 * u, exitDx: 160 * u },
+      car: { x: i.x, y: i.y, width: i.width - 48 * u, step, asideDx: 48 * u, exitDx: 48 * u },
       main,
       counter: { x: sideX, y: main.y + feedHeight(TRAIN_SLOTS, u) + 40 * u },
       caption: { x: sideX, y: main.y + feedHeight(TRAIN_SLOTS, u) + 170 * u, width: main.width, lines: 2 },
@@ -55,7 +55,7 @@ function place(layout: Layout): Placement {
     return {
       header: { x: safe.x, y: 170 * u, width: safe.width, titleSize: 48 },
       train: { ...train, capacity },
-      car: { x: i.x, y: i.y, width: i.width - 48 * u, step, asideDx: 48 * u, exitDx: 160 * u },
+      car: { x: i.x, y: i.y, width: i.width - 48 * u, step, asideDx: 48 * u, exitDx: 48 * u },
       main,
       counter: { x: safe.x, y: below },
       caption: { x: safe.x, y: below + 130 * u, width: safe.width, lines: 3 },
@@ -63,14 +63,14 @@ function place(layout: Layout): Placement {
   }
 
   // square: the train on the left, main and the caption on the right.
-  const train = { x: safe.x, y: 290 * u, width: 560 * u };
+  const train = { x: safe.x, y: 290 * u, width: 480 * u };
   const i = inner(train);
   const sideX = train.x + train.width + 24 * u;
   const main = { x: sideX, y: 290 * u, width: right - sideX };
   return {
     header: { x: safe.x, y: 150 * u, width: safe.width, titleSize: 36 },
     train: { ...train, capacity },
-    car: { x: i.x, y: i.y, width: i.width - 40 * u, step, asideDx: 40 * u, exitDx: 120 * u },
+    car: { x: i.x, y: i.y, width: i.width - 40 * u, step, asideDx: 40 * u, exitDx: 40 * u },
     main,
     counter: { x: sideX, y: main.y + feedHeight(TRAIN_SLOTS, u) + 24 * u },
     caption: { x: sideX, y: main.y + feedHeight(TRAIN_SLOTS, u) + 140 * u, width: main.width, lines: 3 },

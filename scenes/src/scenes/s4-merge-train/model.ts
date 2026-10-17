@@ -136,7 +136,13 @@ export function s4State(trace: SceneTrace, timeline: Timeline, frame: number): S
   const before = standings(beats, Math.max(0, active));
   const slotNow = slots(now);
   const slotBefore = slots(before);
-  const t = current ? progress(frame, current.startFrame, slow, easings.standard) : 1;
+  // On a landing beat the landed car leaves first (over `fast`) and the rest
+  // move up after it (over `slow`); fast + slow fits inside one beat.
+  const landingBeat = current?.event.kind === "pr.landed";
+  const moveStart = current ? current.startFrame + (landingBeat ? fast : 0) : 0;
+  // ...and settles before the next beat starts.
+  const moveFrames = landingBeat ? Math.max(1, Math.min(slow, timeline.beatFrames - fast - 1)) : slow;
+  const t = current ? progress(frame, moveStart, moveFrames, easings.standard) : 1;
   const prById = new Map(trace.entities.prs.map((p) => [p.id, p]));
 
   const cars: CarState[] = [];
@@ -145,11 +151,11 @@ export function s4State(trace: SceneTrace, timeline: Timeline, frame: number): S
     if (!pr) continue;
     const landingNow = s.landed && current !== undefined && "pr" in current.event && current.event.pr === id && current.event.kind === "pr.landed";
     if (s.landed && !landingNow) continue;
-    const queuedBeat = beats.find((b) => b.event.kind === "merge_train.queued" && "pr" in b.event && b.event.pr === id);
+    const firstBeat = beats.find((b) => "pr" in b.event && b.event.pr === id);
     const target = landingNow ? (slotBefore.get(id) ?? 0) : (slotNow.get(id) ?? 0);
     const from = slotBefore.get(id) ?? target;
     const wasAside = before.get(id)?.aside ?? false;
-    const exit = landingNow && current ? progress(frame, current.startFrame, slow, easings.exit) : 0;
+    const exit = landingNow && current ? progress(frame, current.startFrame, fast, easings.exit) : 0;
     // A landed PR leaves the train; once it is gone it is drawn in main only.
     if (exit >= 1) continue;
     cars.push({
@@ -161,11 +167,12 @@ export function s4State(trace: SceneTrace, timeline: Timeline, frame: number): S
       level: STATUS[s.last].level,
       slot: mix(from, target, t),
       aside: mix(wasAside ? 1 : 0, s.aside ? 1 : 0, t),
-      appear: queuedBeat ? progress(frame, queuedBeat.startFrame, fast, easings.enter) : 1,
+      appear: firstBeat ? progress(frame, firstBeat.startFrame, fast, easings.enter) : 1,
       exit,
     });
   }
-  cars.sort((a, b) => a.slot - b.slot);
+  // By slot, with a leaving car drawn last so nothing slides over it.
+  cars.sort((a, b) => (a.exit > 0 ? 1 : 0) - (b.exit > 0 ? 1 : 0) || a.slot - b.slot);
 
   const landedBeats = beats.slice(0, active + 1).filter((b) => b.event.kind === "pr.landed");
   const main = landedBeats.map((b) => {
@@ -173,9 +180,9 @@ export function s4State(trace: SceneTrace, timeline: Timeline, frame: number): S
     return {
       id: b.event.id,
       text: pr ? `#${pr.number} ${pr.title}` : b.event.id,
-      detail: `landed ${formatDateTime(b.atMs)} · tested on this main`,
+      detail: `landed ${formatDateTime(b.atMs).slice(11)} · tested on this main`,
       level: "done" as AttentionLevel,
-      appear: progress(frame, b.startFrame + Math.round(slow / 2), fast, easings.enter),
+      appear: progress(frame, b.startFrame, fast, easings.enter),
     };
   });
 

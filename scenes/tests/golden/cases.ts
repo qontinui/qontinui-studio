@@ -195,12 +195,27 @@ const S3_CASES: readonly GoldenCase[] = [
   { id: "s3-gates-continuations-1x1-long-labels", scene: "s3-gates-continuations", aspect: "1:1", frames: [251], trace: s3LongLabelsTrace },
 ];
 
+/** S4 with 100-character repos and 160-character titles (the schema maximums). */
+export function s4LongLabelsTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(illustrativeTraceFile("s4-merge-train"), "utf8"));
+  for (const pr of json.entities.prs) {
+    pr.repo = `example-org/${"a-very-long-repository-name-".repeat(4)}`.slice(0, 100);
+    pr.title = LONG_TITLE;
+  }
+  return parseTrace(json);
+}
+
 /**
  * S4 (588 frames: 36-frame intro, one beat every 27): 0 intro, 100 the train
- * filling, 359 the poster (the conflicted PR out of line while the next one
- * is tested at the head), 587 the end (all four landed).
+ * filling, 202 a landing (the landed car leaving, drawn on top), 359 the
+ * poster (the conflicted PR out of line while the next one is tested at the
+ * head), 587 the end (all four landed).
  */
-const S4_CASES = illustrativeCases("s4-merge-train", { "16:9": [0, 100, 359, 587], "9:16": [359], "1:1": [359] });
+const S4_CASES: readonly GoldenCase[] = [
+  ...illustrativeCases("s4-merge-train", { "16:9": [0, 100, 202, 359, 587], "9:16": [359], "1:1": [359] }),
+  { id: "s4-merge-train-9x16-long-labels", scene: "s4-merge-train", aspect: "9:16", frames: [359], trace: s4LongLabelsTrace },
+  { id: "s4-merge-train-1x1-long-labels", scene: "s4-merge-train", aspect: "1:1", frames: [359], trace: s4LongLabelsTrace },
+];
 
 export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES, ...S4_CASES];
 

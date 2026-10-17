@@ -121,21 +121,21 @@
     },
     {
       "id": "e13",
+      "at": "2026-09-16T10:20:00Z",
+      "kind": "merge_train.resolved",
+      "pr": "pr-418"
+    },
+    {
+      "id": "e14",
       "at": "2026-09-16T10:23:00Z",
       "kind": "ci.passed",
       "pr": "pr-421"
     },
     {
-      "id": "e14",
+      "id": "e15",
       "at": "2026-09-16T10:25:00Z",
       "kind": "pr.landed",
       "pr": "pr-421"
-    },
-    {
-      "id": "e15",
-      "at": "2026-09-16T10:35:00Z",
-      "kind": "merge_train.resolved",
-      "pr": "pr-418"
     },
     {
       "id": "e16",

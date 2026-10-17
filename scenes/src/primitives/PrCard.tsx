@@ -59,18 +59,19 @@ export function PrCard({ x, y, width, repo, number, title, status, level, appear
           gap: Math.round(12 * unit),
         }}
       >
+        {/* The repo ellipsises; the PR number is never cut. */}
         <span
           style={{
+            display: "flex",
+            minWidth: 0,
             color: text.muted,
             fontSize: Math.round(typeScale.caption * unit),
             fontVariantNumeric: "tabular-nums",
             whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            minWidth: 0,
           }}
         >
-          {repo}#{number}
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>{repo}</span>
+          <span style={{ flex: "none" }}>#{number}</span>
         </span>
         <span
           data-studio-pr-status={status}
