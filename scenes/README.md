@@ -223,8 +223,9 @@ The validator also checks that:
 - a claim is acquired only when no session holds it (the holder may not
   re-acquire it), released only by its holder, and contended only against the
   session holding it at that point; a session's end releases its claims; and
-  a session allocates worktrees, declares intent and handles claims only
-  between its start and its end;
+  a session starts and ends at most once, and allocates worktrees, declares
+  intent and handles claims only between its start and its end (a session
+  that never starts is left to the scene's check);
 - replay events fall inside `date_range`;
 - an illustrative trace never claims a build-record source, and a replay never
   claims a hand-authored one;

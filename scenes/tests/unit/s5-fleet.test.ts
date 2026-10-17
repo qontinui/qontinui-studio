@@ -75,6 +75,21 @@ describe("S5 trace fields", () => {
     expect(errorsOf(early)).toContain('events.11.session: "s3" acts before it started (worktree.allocated)');
   });
 
+  it("refuses a second start or end, and an ended session's acquire takes nothing", () => {
+    const json = traceJson();
+    json.events.push({ id: "e97", at: "2026-09-17T09:58:00Z", kind: "session.started", session: "s1" } as never);
+    json.events.push({ id: "e98", at: "2026-09-17T09:59:00Z", kind: "session.ended", session: "s1" } as never);
+    const errors = errorsOf(json);
+    expect(errors).toContain('events.18.session: "s1" starts more than once');
+    expect(errors).toContain('events.19.session: "s1" ends more than once');
+    const ghost = traceJson();
+    ghost.events.push({ id: "e97", at: "2026-09-17T09:57:00Z", kind: "claim.acquired", session: "s1", resource: "x.ts" } as never);
+    ghost.events.push({ id: "e98", at: "2026-09-17T09:58:00Z", kind: "claim.acquired", session: "s2", resource: "x.ts" } as never);
+    const ghostErrors = errorsOf(ghost);
+    expect(ghostErrors).toContain('events.18.session: "s1" acts after it ended (claim.acquired)');
+    expect(ghostErrors.join("\n")).not.toMatch(/already held by "s1"/);
+  });
+
   it("refuses a holder re-acquiring its own claim", () => {
     const json = traceJson();
     json.events.push({ id: "e99", at: "2026-09-17T09:04:00Z", kind: "claim.acquired", session: "s1", resource: "sync/worker.ts" } as never);
@@ -111,13 +126,13 @@ describe("S5 scene model", () => {
   it("puts sessions on their machines as they start, each with its worktree", () => {
     expect(s5State(trace, tl, 0).machines.every((m) => m.sessions.length === 0)).toBe(true);
     const state = at("e02");
-    expect(state.machines[0]?.sessions).toMatchObject([{ text: "Session 1 · example/sync-service", detail: "in its own worktree" }]);
+    expect(state.machines[0]?.sessions).toMatchObject([{ text: "Session 1 · sync-service", detail: "in its own worktree" }]);
     expect(state.caption?.title).toBe("Its own worktree");
   });
 
   it("logs intent and claims, and counts an avoided collision", () => {
     const state = at("e08");
-    expect(state.machines[1]?.sessions[0]).toMatchObject({ level: "waiting", detail: "sync/worker.ts is taken · picks other work" });
+    expect(state.machines[1]?.sessions[0]).toMatchObject({ level: "waiting", detail: "sync/worker.ts taken · other work" });
     expect(state.log.at(-1)).toMatchObject({ text: "sync/worker.ts", detail: "Session 2 sees it held by Session 1 · no collision" });
     expect(state.avoided).toBe(1);
     expect(state.caption?.title).toBe("Already claimed");
@@ -134,7 +149,7 @@ describe("S5 scene model", () => {
     expect(end.machines[0]?.sessions[0]).toMatchObject({
       text: "Session 1",
       level: "done",
-      detail: "done · claims released, worktree reclaimed",
+      detail: "done · claims released",
     });
   });
 

@@ -452,6 +452,7 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   ];
   const holderBefore = new Map<number, string | undefined>();
   const lifeBefore = new Map<number, "unstarted" | "running" | "ended">();
+  const lifeRepeats = new Map<number, string>();
   {
     const order = trace.events.map((_, j) => j).sort((a, b) => (precedes(a, b) ? -1 : precedes(b, a) ? 1 : 0));
     const holder = new Map<string, string>();
@@ -462,12 +463,18 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       if (FLEET_KINDS.includes(e.kind) && "session" in e && e.session !== undefined) {
         lifeBefore.set(j, life.get(e.session) ?? "unstarted");
       }
-      if (e.kind === "session.started") life.set(e.session, "running");
-      else if (e.kind === "session.ended") {
+      if (e.kind === "session.started") {
+        // A session lives once: a second start (or a start after its end) is refused below.
+        if (life.has(e.session)) lifeRepeats.set(j, `"${e.session}" starts more than once`);
+        else life.set(e.session, "running");
+      } else if (e.kind === "session.ended") {
+        if (life.get(e.session) === "ended") lifeRepeats.set(j, `"${e.session}" ends more than once`);
         life.set(e.session, "ended");
         for (const [resource, who] of [...holder]) if (who === e.session) holder.delete(resource);
-      } else if (e.kind === "claim.acquired" && !holder.has(e.resource)) holder.set(e.resource, e.session);
-      else if (e.kind === "claim.released" && holder.get(e.resource) === e.session) holder.delete(e.resource);
+      } else if (e.kind === "claim.acquired" && !holder.has(e.resource) && life.get(e.session) !== "ended") {
+        // An acquire refused for acting after the end must not take the claim either.
+        holder.set(e.resource, e.session);
+      } else if (e.kind === "claim.released" && holder.get(e.resource) === e.session) holder.delete(e.resource);
     }
   }
   const startedSessions = new Set(trace.events.flatMap((e) => (e.kind === "session.started" ? [e.session] : [])));
@@ -529,6 +536,8 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
     }
+    const repeat = lifeRepeats.get(i);
+    if (repeat) issue("session", repeat);
     if (FLEET_KINDS.includes(event.kind) && "session" in event && event.session !== undefined) {
       const life = lifeBefore.get(i);
       if (life === "ended") issue("session", `"${event.session}" acts after it ended (${event.kind})`);

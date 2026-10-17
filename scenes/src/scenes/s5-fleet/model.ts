@@ -100,10 +100,10 @@ export function s5State(trace: SceneTrace, timeline: Timeline, frame: number): S
     let detail = "starting";
     let level: AttentionLevel = "running";
     if (e.kind === "session.ended") {
-      detail = "done · claims released, worktree reclaimed";
+      detail = "done · claims released";
       level = "done";
     } else if (e.kind === "claim.contended") {
-      detail = `${e.resource} is taken · picks other work`;
+      detail = `${e.resource} taken · other work`;
       level = "waiting";
     } else if (held.length) detail = `holds ${held.join(", ")}`;
     else if (e.kind === "intent.declared") detail = `intent: ${e.intent}`;
@@ -112,7 +112,7 @@ export function s5State(trace: SceneTrace, timeline: Timeline, frame: number): S
     return {
       id: sessionId,
       // The worktree goes with the session: shown while it runs, gone once it ends.
-      text: repo && level !== "done" ? `${label} · ${repo}` : label,
+      text: repo && level !== "done" ? `${label} · ${repo.split("/").pop() ?? repo}` : label,
       detail,
       level,
       appear: appearOf(start),
