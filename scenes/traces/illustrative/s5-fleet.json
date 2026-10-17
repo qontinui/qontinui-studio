@@ -1,0 +1,173 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "Many sessions, one codebase, no collisions",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s5-fleet.json"
+    }
+  },
+  "entities": {
+    "machines": [
+      {
+        "id": "m-a",
+        "label": "Build box A"
+      },
+      {
+        "id": "m-b",
+        "label": "Build box B"
+      },
+      {
+        "id": "m-c",
+        "label": "Laptop"
+      }
+    ],
+    "sessions": [
+      {
+        "id": "s1",
+        "label": "Session 1",
+        "machine": "m-a"
+      },
+      {
+        "id": "s2",
+        "label": "Session 2",
+        "machine": "m-b"
+      },
+      {
+        "id": "s3",
+        "label": "Session 3",
+        "machine": "m-c"
+      },
+      {
+        "id": "s4",
+        "label": "Session 4",
+        "machine": "m-a"
+      }
+    ]
+  },
+  "events": [
+    {
+      "id": "e01",
+      "at": "2026-09-17T09:00:00Z",
+      "kind": "session.started",
+      "session": "s1"
+    },
+    {
+      "id": "e02",
+      "at": "2026-09-17T09:01:00Z",
+      "kind": "worktree.allocated",
+      "session": "s1",
+      "repo": "example/sync-service"
+    },
+    {
+      "id": "e03",
+      "at": "2026-09-17T09:02:00Z",
+      "kind": "intent.declared",
+      "session": "s1",
+      "intent": "plan retry-budget, phase 2"
+    },
+    {
+      "id": "e04",
+      "at": "2026-09-17T09:03:00Z",
+      "kind": "claim.acquired",
+      "session": "s1",
+      "resource": "sync/worker.ts"
+    },
+    {
+      "id": "e05",
+      "at": "2026-09-17T09:05:00Z",
+      "kind": "session.started",
+      "session": "s2"
+    },
+    {
+      "id": "e06",
+      "at": "2026-09-17T09:06:00Z",
+      "kind": "worktree.allocated",
+      "session": "s2",
+      "repo": "example/sync-service"
+    },
+    {
+      "id": "e07",
+      "at": "2026-09-17T09:07:00Z",
+      "kind": "intent.declared",
+      "session": "s2",
+      "intent": "fix the flaky retry test"
+    },
+    {
+      "id": "e08",
+      "at": "2026-09-17T09:08:00Z",
+      "kind": "claim.contended",
+      "session": "s2",
+      "resource": "sync/worker.ts",
+      "holder": "s1"
+    },
+    {
+      "id": "e09",
+      "at": "2026-09-17T09:09:00Z",
+      "kind": "intent.declared",
+      "session": "s2",
+      "intent": "plan metrics export, phase 1"
+    },
+    {
+      "id": "e10",
+      "at": "2026-09-17T09:10:00Z",
+      "kind": "claim.acquired",
+      "session": "s2",
+      "resource": "sync/metrics.ts"
+    },
+    {
+      "id": "e11",
+      "at": "2026-09-17T09:12:00Z",
+      "kind": "session.started",
+      "session": "s3"
+    },
+    {
+      "id": "e12",
+      "at": "2026-09-17T09:13:00Z",
+      "kind": "worktree.allocated",
+      "session": "s3",
+      "repo": "example/web-app"
+    },
+    {
+      "id": "e13",
+      "at": "2026-09-17T09:14:00Z",
+      "kind": "claim.acquired",
+      "session": "s3",
+      "resource": "docs/retries.md"
+    },
+    {
+      "id": "e14",
+      "at": "2026-09-17T09:16:00Z",
+      "kind": "session.started",
+      "session": "s4"
+    },
+    {
+      "id": "e15",
+      "at": "2026-09-17T09:17:00Z",
+      "kind": "worktree.allocated",
+      "session": "s4",
+      "repo": "example/sync-service"
+    },
+    {
+      "id": "e16",
+      "at": "2026-09-17T09:18:00Z",
+      "kind": "claim.acquired",
+      "session": "s4",
+      "resource": "sync/config.ts"
+    },
+    {
+      "id": "e17",
+      "at": "2026-09-17T09:55:00Z",
+      "kind": "claim.released",
+      "session": "s1",
+      "resource": "sync/worker.ts"
+    },
+    {
+      "id": "e18",
+      "at": "2026-09-17T09:56:00Z",
+      "kind": "session.ended",
+      "session": "s1"
+    }
+  ]
+}

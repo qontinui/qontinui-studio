@@ -24,7 +24,7 @@ src/api/          the studio scene API — the only thing scenes import (besides
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
-                  S3 "Gates and continuations", S4 "The merge train", ...)
+                  S3 "Gates and continuations", S4 "The merge train", S5 "The fleet", ...)
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
@@ -48,6 +48,7 @@ assets/fonts/     bundled Inter 4.1, full character set (OFL)
 | `s2-digital-twin` | GitHub, CI, machines and sessions mirrored into coord; decisions from the twin; the developer twin answering from served documents | illustrative only: the export carries no twin, webhook or question events |
 | `s3-gates-continuations` | a session registers a gate on a condition and ends; coord observes the condition and clears the gate; a new session continues | illustrative only: the export carries gate counts, not gate events |
 | `s4-merge-train` | PRs queued, rebased onto main, tested and landed in order; a conflicted PR steps out and rejoins at the back | illustrative only: the export carries land times but no queue order, rebase or conflict events |
+| `s5-fleet` | sessions on several machines, each in its own worktree, coordinating through declared intent and claims; a held claim is a collision avoided | illustrative only: the export carries a session count, excludes machine names, and has no worktree, intent or claim events |
 
 ## The engine seam (plan D7)
 
@@ -184,8 +185,9 @@ as an unknown event. A trace contains:
     `export_version` for replays;
   - `date_range`: required for a replay.
 - `entities`: `plans`, `prs`, `sessions`, `sources` (systems the twin
-  mirrors: `repo-host`, `ci`, `machine`, `session`; display labels only) and
-  `gates` (a condition a session waits on).
+  mirrors: `repo-host`, `ci`, `machine`, `session`; display labels only),
+  `gates` (a condition a session waits on) and `machines` (display labels
+  only; a session may name its `machine`).
 - `events`: each event has an `id` and an `at` (ISO-8601 with an offset), and is
   one of:
   - `plan.drafted|vetted|implementing|shipped`
@@ -201,6 +203,8 @@ as an unknown event. A trace contains:
     from a served `policy` or `intent` document or from the `operator`; the
     answer cites the document unless the operator gave it)
   - `gate.registered` (by a session), `gate.observed` and `gate.cleared`
+  - `worktree.allocated`, `intent.declared`, `claim.acquired|released` and
+    `claim.contended` (naming the session that holds the claim)
 
 The validator also checks that:
 
@@ -216,6 +220,9 @@ The validator also checks that:
 - in the merge train, a resolution answers an unresolved conflict of the same
   PR, a conflicted PR is neither rebased nor landed until it is resolved, and
   a PR lands at most once;
+- a claim is acquired only when no other session holds it, released only by
+  a session that holds it, and contended only against a session that holds
+  it at that point;
 - replay events fall inside `date_range`;
 - an illustrative trace never claims a build-record source, and a replay never
   claims a hand-authored one;
@@ -229,7 +236,8 @@ The validator also checks that:
 Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
 may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
-sessions, S4 at most four PRs).
+sessions, S4 at most four PRs, S5 at most three machines with two sessions
+each, every session on a machine).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

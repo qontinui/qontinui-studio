@@ -47,6 +47,19 @@ export const sessionEntity = z
     id,
     /** Display name only — never a machine name or an account (sibling D3). */
     label: z.string().min(1).max(80),
+    /** The machine it runs on (S5), from `entities.machines`. */
+    machine: id.optional(),
+  })
+  .strict();
+
+/**
+ * A machine in the fleet (S5). Display label only, e.g. "Build box A":
+ * never a real host name (sibling D3).
+ */
+export const machineEntity = z
+  .object({
+    id,
+    label: z.string().min(1).max(24),
   })
   .strict();
 
@@ -81,6 +94,7 @@ export const traceEntities = z
     sessions: z.array(sessionEntity).default([]),
     sources: z.array(sourceEntity).default([]),
     gates: z.array(gateEntity).default([]),
+    machines: z.array(machineEntity).default([]),
   })
   .strict();
 
@@ -184,6 +198,30 @@ export const traceEvent = z.discriminatedUnion("kind", [
   z.object({ ...eventBase, kind: z.literal("gate.registered"), gate: id, session: id }).strict(),
   z.object({ ...eventBase, kind: z.literal("gate.observed"), gate: id }).strict(),
   z.object({ ...eventBase, kind: z.literal("gate.cleared"), gate: id }).strict(),
+  // The fleet (S5): sessions in isolated worktrees coordinate through declared
+  // intent and claims. A contended claim names the session holding it.
+  z
+    .object({ ...eventBase, kind: z.literal("worktree.allocated"), session: id, repo: z.string().min(1).max(60) })
+    .strict(),
+  z
+    .object({ ...eventBase, kind: z.literal("intent.declared"), session: id, intent: z.string().min(1).max(80) })
+    .strict(),
+  z
+    .object({ ...eventBase, kind: z.literal("claim.acquired"), session: id, resource: z.string().min(1).max(60) })
+    .strict(),
+  z
+    .object({
+      ...eventBase,
+      kind: z.literal("claim.contended"),
+      session: id,
+      resource: z.string().min(1).max(60),
+      /** The session that holds the claim. */
+      holder: id,
+    })
+    .strict(),
+  z
+    .object({ ...eventBase, kind: z.literal("claim.released"), session: id, resource: z.string().min(1).max(60) })
+    .strict(),
 ]);
 
 export type TraceEvent = z.infer<typeof traceEvent>;
@@ -213,6 +251,11 @@ export const EVENT_KINDS = [
   "gate.registered",
   "gate.observed",
   "gate.cleared",
+  "worktree.allocated",
+  "intent.declared",
+  "claim.acquired",
+  "claim.contended",
+  "claim.released",
 ] as const satisfies readonly EventKind[];
 
 // ---------------------------------------------------------------------------
@@ -359,6 +402,30 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
   const sessions = unique("sessions", trace.entities.sessions.map((s) => s.id));
   const sources = unique("sources", trace.entities.sources.map((s) => s.id));
   const gates = unique("gates", trace.entities.gates.map((g) => g.id));
+  const machines = unique("machines", trace.entities.machines.map((m) => m.id));
+  trace.entities.sessions.forEach((session, i) => {
+    if (session.machine !== undefined && !machines.has(session.machine)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["entities", "sessions", i, "machine"],
+        message: `unknown machine "${session.machine}"`,
+      });
+    }
+  });
+  /** Is `resource` held by `session` just before event `i` (timeline order)? */
+  const holds = (session: string, resource: string, i: number) => {
+    let held = false;
+    trace.events
+      .map((e, j) => ({ e, j }))
+      .filter(({ j }) => precedes(j, i))
+      .sort((a, b) => (precedes(a.j, b.j) ? -1 : 1))
+      .forEach(({ e }) => {
+        if ((e.kind === "claim.acquired" || e.kind === "claim.released") && e.session === session && e.resource === resource) {
+          held = e.kind === "claim.acquired";
+        }
+      });
+    return held;
+  };
   unique("events", trace.events.map((e) => e.id));
   const eventsById = new Map(trace.events.map((e) => [e.id, e]));
   const answeredQuestions = new Set<string>();
@@ -433,6 +500,35 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       // A session registers a gate while it is running, not after it ended.
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
+    }
+    if (event.kind === "claim.contended") {
+      ref("holder", sessions, event.holder);
+      if (event.holder === event.session) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["events", i, "holder"], message: "a session cannot contend with itself" });
+      } else if (sessions.has(event.holder) && !holds(event.holder, event.resource, i)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["events", i, "holder"],
+          message: `"${event.holder}" does not hold "${event.resource}" at that point`,
+        });
+      }
+    }
+    if (event.kind === "claim.released" && !holds(event.session, event.resource, i)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["events", i, "resource"],
+        message: `"${event.session}" releases "${event.resource}" without holding it`,
+      });
+    }
+    if (event.kind === "claim.acquired") {
+      const other = trace.entities.sessions.find((s) => s.id !== event.session && holds(s.id, event.resource, i));
+      if (other) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["events", i, "resource"],
+          message: `"${event.resource}" is already held by "${other.id}"`,
+        });
+      }
     }
     if (prs.has("pr" in event ? event.pr : "") && "pr" in event) {
       const pr = event.pr;

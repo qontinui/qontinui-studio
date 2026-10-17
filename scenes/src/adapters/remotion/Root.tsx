@@ -8,6 +8,7 @@ import s1Illustrative from "../../../traces/illustrative/s1-plan-lifecycle.json"
 import s2Illustrative from "../../../traces/illustrative/s2-digital-twin.json";
 import s3Illustrative from "../../../traces/illustrative/s3-gates-continuations.json";
 import s4Illustrative from "../../../traces/illustrative/s4-merge-train.json";
+import s5Illustrative from "../../../traces/illustrative/s5-fleet.json";
 import { StudioComposition, type StudioCompositionProps } from "./StudioComposition";
 
 /**
@@ -19,6 +20,7 @@ export const defaultTraces: Record<string, unknown> = {
   "s2-digital-twin": s2Illustrative,
   "s3-gates-continuations": s3Illustrative,
   "s4-merge-train": s4Illustrative,
+  "s5-fleet": s5Illustrative,
 };
 
 /** Size and length come from the props, so one composition serves every aspect and trace. */

@@ -1,0 +1,99 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+import { STUDIO_FPS, findBeat, missingRequirements, parseTrace, validateTrace, type SceneTraceInput } from "../../src/api";
+import { posterFrame } from "../../src/api/scene-root";
+import { s5Fleet } from "../../src/scenes/s5-fleet";
+import { s5State, s5Timeline } from "../../src/scenes/s5-fleet/model";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const traceJson = (): SceneTraceInput =>
+  JSON.parse(readFileSync(path.join(here, "../../traces/illustrative/s5-fleet.json"), "utf8")) as SceneTraceInput;
+const errorsOf = (input: unknown) => {
+  const result = validateTrace(input);
+  return result.ok ? [] : result.errors;
+};
+type Mutable = Record<string, unknown>;
+
+describe("S5 trace fields", () => {
+  it("accepts the committed illustrative trace and it drives the scene", () => {
+    expect(missingRequirements(s5Fleet, parseTrace(traceJson()))).toEqual([]);
+  });
+
+  it("refuses an unknown machine", () => {
+    const json = traceJson();
+    json.entities!.sessions![0]!.machine = "m-nowhere";
+    expect(errorsOf(json)).toContain('entities.sessions.0.machine: unknown machine "m-nowhere"');
+  });
+
+  it("refuses a contention against a session that does not hold the claim", () => {
+    const json = traceJson();
+    (json.events[7] as Mutable).holder = "s3";
+    expect(errorsOf(json)).toContain('events.7.holder: "s3" does not hold "sync/worker.ts" at that point');
+    (json.events[7] as Mutable).holder = "s2";
+    expect(errorsOf(json)).toContain("events.7.holder: a session cannot contend with itself");
+  });
+
+  it("refuses a claim already held by another session, and a release without holding", () => {
+    const taken = traceJson();
+    (taken.events[9] as Mutable).resource = "sync/worker.ts";
+    expect(errorsOf(taken)).toContain('events.9.resource: "sync/worker.ts" is already held by "s1"');
+    const stray = traceJson();
+    (stray.events[16] as Mutable).session = "s3";
+    expect(errorsOf(stray)).toContain('events.16.resource: "s3" releases "sync/worker.ts" without holding it');
+  });
+
+  it("lets a released claim be taken again", () => {
+    const json = traceJson();
+    json.events.push({ id: "e99", at: "2026-09-17T10:00:00Z", kind: "claim.acquired", session: "s2", resource: "sync/worker.ts" } as never);
+    expect(errorsOf(json)).toEqual([]);
+  });
+
+  it("checks machines and sessions per machine", () => {
+    const json = traceJson();
+    json.entities!.sessions!.push({ id: "s5", label: "Session 5", machine: "m-a" }, { id: "s6", label: "Session 6" });
+    const problems = missingRequirements(s5Fleet, parseTrace(json));
+    expect(problems).toContain("every session on a machine (not: s6)");
+    expect(problems).toContain("at most 2 sessions per machine (m-a has 3)");
+  });
+});
+
+describe("S5 scene model", () => {
+  const trace = parseTrace(traceJson());
+  const tl = s5Timeline(trace, STUDIO_FPS);
+  const beat = (id: string) => findBeat(tl, (e) => e.id === id)!;
+  const at = (id: string) => s5State(trace, tl, beat(id).startFrame + 5);
+
+  it("puts sessions on their machines as they start, each with its worktree", () => {
+    expect(s5State(trace, tl, 0).machines.every((m) => m.sessions.length === 0)).toBe(true);
+    const state = at("e02");
+    expect(state.machines[0]?.sessions).toMatchObject([{ text: "Session 1 · worktree of example/sync-service", detail: "in its own worktree" }]);
+    expect(state.caption?.title).toBe("Its own worktree");
+  });
+
+  it("logs intent and claims, and counts an avoided collision", () => {
+    const state = at("e08");
+    expect(state.machines[1]?.sessions[0]).toMatchObject({ level: "waiting", detail: "sync/worker.ts is taken · picks other work" });
+    expect(state.log.at(-1)).toMatchObject({ text: "sync/worker.ts", detail: "Session 2 sees it held by Session 1 · no collision" });
+    expect(state.avoided).toBe(1);
+    expect(state.caption?.title).toBe("Already claimed");
+  });
+
+  it("runs four sessions at the poster and one fewer once Session 1 ends", () => {
+    const poster = posterFrame(s5Fleet, trace);
+    expect(poster).toBe(467);
+    const state = s5State(trace, tl, poster);
+    expect(state.running).toBe(4);
+    expect(state.machines.map((m) => m.sessions.length)).toEqual([2, 1, 1]);
+    const end = s5State(trace, tl, tl.durationInFrames - 1);
+    expect(end.running).toBe(3);
+    expect(end.machines[0]?.sessions[0]).toMatchObject({ level: "done", detail: "done" });
+  });
+
+  it("keeps the log to its capacity", () => {
+    expect(s5State(trace, tl, tl.durationInFrames - 1).log.length).toBeLessThanOrEqual(5);
+  });
+});
