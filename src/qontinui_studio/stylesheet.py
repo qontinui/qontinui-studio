@@ -32,7 +32,7 @@ from qontinui_studio.library import TAG_PATTERN, AssetRecord, Library, is_tag
 GUIDE_FORMAT = "qontinui-studio/style-guide"
 TOKEN_PATTERN = r"^--qontinui-[a-z0-9-]+$"
 ICON_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
-HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}\b")
+HEX_RE = re.compile(r"#(?:[0-9A-Fa-f]{8}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})\b")
 
 # The icon contract: plain line drawings on a 24x24 grid, coloured by the page
 # or scene that draws them (``currentColor``). Anything outside these elements
@@ -178,6 +178,10 @@ def load_guide(style_dir: Path) -> Guide:
     for look in guide.looks:
         if not _inside(style_dir, look.prompt_fragment).is_file():
             raise ConfigError(f"{path}: look '{look.id}' prompt_fragment does not exist")
+    # Reference briefs are named relative to the studio root, style/'s parent.
+    for brief in guide.references.briefs:
+        if not _inside(style_dir.parent, brief).is_file():
+            raise ConfigError(f"{path}: reference brief '{brief}' does not exist")
     return guide
 
 
@@ -266,6 +270,9 @@ def _e(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
+# Page chrome only. The var() fallbacks style the page itself when no
+# tokens.css was given; they are never shown as a token's value (that renders
+# "unresolved"), so they are not guessed defaults for the guide.
 CSS = """
 body { margin:0; padding:16px; background:var(--qontinui-surface-canvas, #111115);
   color:var(--qontinui-text-primary, #fff); font-family:var(--qontinui-font-sans, system-ui, sans-serif);
@@ -416,7 +423,9 @@ def build_style_sheet(
 
     drift: list[str] = []
     palette_values = (
-        {v.upper() for v in tokens.values() if HEX_RE.fullmatch(v)} if tokens is not None else None
+        {tokens[t.token].upper() for t in guide.tokens.palette if HEX_RE.fullmatch(tokens[t.token])}
+        if tokens is not None
+        else None
     )
     parts.append("<h2>Looks (prompt fragments)</h2><div class='grid'>")
     for look in guide.looks:
@@ -467,7 +476,14 @@ def build_style_sheet(
             )
             shown = refs_dir / f"{a.uid}{Path(preview).suffix}"
             shown.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(preview, shown)
+            try:
+                shutil.copyfile(preview, shown)
+            except OSError as e:
+                parts.append(
+                    f"<div class='card'><p class='fail'>{_e(a.uid)}: preview file missing "
+                    f"({_e(type(e).__name__)})</p></div>"
+                )
+                continue
             parts.append(
                 f"<figure class='card' style='margin:0'><img src='refs/{_e(shown.name)}' "
                 f"alt='{_e(a.asset_id)} reference' loading='lazy'><figcaption class='muted'>"

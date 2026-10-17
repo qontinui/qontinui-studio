@@ -348,7 +348,7 @@ def ingest(ctx: Context, loaded: LoadedBrief, job: sqlite3.Row) -> bool:
                 commit=False,
             )
             for tag in brief.tags:
-                library.tag(asset.uid, tag, f"brief:{brief.id}", ctx.clock().date(), commit=False)
+                library.tag_from_brief(asset.uid, tag, brief.id, ctx.clock().date(), commit=False)
             for variant_id, site_id, slot_name, campaign, vfmt, vpath in variants:
                 library.add_variant(
                     variant_id=variant_id,
