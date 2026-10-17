@@ -168,3 +168,48 @@ jobs:
         run: pnpm test:matrix
         env:
           SCENE_MATRIX_ASPECTS: ${{ matrix.aspect }}
+
+  # The embeddable package (plan Phase 4): build the tarball qontinui-web
+  # vendors, and publish its SHA-256 so a vendored copy can be checked
+  # against the commit it claims to come from. The pack itself refuses a
+  # poster that differs from its golden frame.
+  embed-package:
+    name: embed-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          package_json_file: scenes/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Exact, not the floating major: npm's tar and Node's zlib write
+          # the tarball bytes, so the SHA-256 is a property of the toolchain.
+          node-version: "24.19.0"
+          cache: pnpm
+          cache-dependency-path: scenes/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Shared libraries for Chrome Headless Shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 libgbm1 \
+            libasound2t64 libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 \
+            libxdamage1 libpango-1.0-0 libcairo2 libcups2t64
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: scenes/node_modules/.remotion
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('scenes/pnpm-lock.yaml') }}
+      - run: pnpm browser:ensure
+      - name: Pack twice; the two tarballs must be identical
+        run: |
+          pnpm -s embed:pack --out out/embed-a | tee pack-a.txt
+          pnpm -s embed:pack --out out/embed-b | tee pack-b.txt
+          a=$(sed -n 's/^sha256 //p' pack-a.txt); b=$(sed -n 's/^sha256 //p' pack-b.txt)
+          test -n "$a" && test "$a" = "$b"
+          echo "embed package sha256: \`$a\` (commit ${GITHUB_SHA})" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: embed-package
+          path: scenes/out/embed-a/*.tgz

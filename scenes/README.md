@@ -30,6 +30,7 @@ src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the test
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
 docs/             hyperframes-spike.md: the HyperFrames adapter spike result
+embed/            the embeddable package's public types (player-api.ts) and README (`pnpm embed:pack`, see below)
 src/cli/          the studio-scenes CLI
 traces/           illustrative traces (fixtures)
 tests/unit/       schema, motion, timeline, per-scene model, safety, catalogue and CLI-refusal tests (vitest)
@@ -575,3 +576,27 @@ imports, or a vendored copy if the licences still differ.
   arrows and symbols; no CJK), from `inter-ui@4.1.1` (`web/Inter-*.woff2`,
   "Version 4.001;git-9221beed3"). The copyright line in `OFL.txt` is the one in
   the fonts' own name table ("Copyright 2016 The Inter Project Authors").
+
+## The embeddable package (plan Phase 4)
+
+`pnpm embed:pack [--out <dir>]` builds `out/embed/qontinui-studio-scenes-<version>.tgz`.
+That is the npm tarball a website vendors and installs as a file dependency,
+because the package is not published to npm. It contains:
+
+- `dist/player.js`: `src/adapters/remotion/embed.ts` bundled into one ESM
+  module, with React and Remotion left external (peer dependencies);
+- `dist/player.d.ts`: a copy of `embed/player-api.ts`, which
+  `tests/unit/embed-types.test.ts` holds to the source;
+- the fonts;
+- each scene's 16:9 poster frame, rendered at scale 1;
+- `manifest.json`, `LICENSE`, `THIRD_PARTY_LICENSES` (bundled zod) and
+  `README.md` (from `embed/README.md`).
+
+The tarball is reproducible for a given toolchain: one commit, packed with the
+same Node version and its bundled npm, gives one SHA-256. The CI job pins the
+exact Node version. Every poster must be a golden frame with a matching hash,
+or the pack fails. The CI `embed-package` job packs twice, requires identical
+hashes, writes the hash to the job summary and uploads the tarball. A consumer records the studio commit
+and the SHA-256 next to its vendored copy (qontinui-web:
+`frontend/vendor/studio-scenes.pin.json`).
+

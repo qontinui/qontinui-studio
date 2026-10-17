@@ -26,7 +26,8 @@
     "embed:serve": "tsx scripts/serve-embed.ts",
     "test:graph": "vitest run --config vitest.config.ts tests/unit/engine-graph.test.ts",
     "hyperframes:image": "tsx scripts/hyperframes-image.ts",
-    "test:hyperframes": "HYPERFRAMES=1 vitest run --config vitest.golden.config.ts tests/golden/hyperframes.test.ts"
+    "test:hyperframes": "HYPERFRAMES=1 vitest run --config vitest.golden.config.ts tests/golden/hyperframes.test.ts",
+    "embed:pack": "tsx scripts/pack-embed.ts"
   },
   "dependencies": {
     "react": "19.2.8",

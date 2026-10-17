@@ -4,28 +4,14 @@ import { ASPECT_SIZES, STUDIO_FPS } from "../../api/layout";
 import { sceneDuration } from "../../api/scene-root";
 import { parseTrace } from "../../api/trace/schema";
 import { getScene, scenes } from "../../scenes";
-import s1Illustrative from "../../../traces/illustrative/s1-plan-lifecycle.json";
-import s2Illustrative from "../../../traces/illustrative/s2-digital-twin.json";
-import s3Illustrative from "../../../traces/illustrative/s3-gates-continuations.json";
-import s4Illustrative from "../../../traces/illustrative/s4-merge-train.json";
-import s5Illustrative from "../../../traces/illustrative/s5-fleet.json";
-import s6Illustrative from "../../../traces/illustrative/s6-self-correction.json";
-import s7Illustrative from "../../../traces/illustrative/s7-gui-automation.json";
+import { illustrativeTraces } from "../../scenes/illustrative-traces";
 import { StudioComposition, type StudioCompositionProps } from "./StudioComposition";
 
 /**
  * Default (preview) trace per scene: its committed illustrative trace. A CLI
  * render always passes its own. A unit test checks every scene has one.
  */
-export const defaultTraces: Record<string, unknown> = {
-  "s1-plan-lifecycle": s1Illustrative,
-  "s2-digital-twin": s2Illustrative,
-  "s3-gates-continuations": s3Illustrative,
-  "s4-merge-train": s4Illustrative,
-  "s5-fleet": s5Illustrative,
-  "s6-self-correction": s6Illustrative,
-  "s7-gui-automation": s7Illustrative,
-};
+export const defaultTraces: Readonly<Record<string, unknown>> = illustrativeTraces;
 
 /** Size and length come from the props, so one composition serves every aspect and trace. */
 const calculateMetadata: CalculateMetadataFunction<StudioCompositionProps> = ({ props }) => {
