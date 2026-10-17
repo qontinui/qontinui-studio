@@ -399,7 +399,7 @@ export default tseslint.config(
   },
   {
     // Scene purity: a scene is a pure function of (trace, frame).
-    files: ["src/scenes/**/*.{ts,tsx}", "src/primitives/**/*.{ts,tsx}"],
+    files: ["src/scenes/**/*.{ts,tsx}", "src/primitives/**/*.{ts,tsx}", "src/compositions/**/*.{ts,tsx}", "src/api/program-root.tsx"],
     rules: restrictions({
       engine: true,
       adapterStatic: true,

@@ -1,11 +1,15 @@
 import { Composition, type CalculateMetadataFunction } from "remotion";
 
+import { resolveProgram } from "../../api/composition";
 import { ASPECT_SIZES, STUDIO_FPS } from "../../api/layout";
 import { sceneDuration } from "../../api/scene-root";
 import { parseTrace } from "../../api/trace/schema";
 import { getScene, scenes } from "../../scenes";
 import { illustrativeTraces } from "../../scenes/illustrative-traces";
+import { teaser } from "../../compositions/teaser";
 import { StudioComposition, type StudioCompositionProps } from "./StudioComposition";
+import { PROGRAM_COMPOSITION_ID } from "./program-id";
+import { StudioProgram, type StudioProgramProps } from "./StudioProgram";
 
 /**
  * Default (preview) trace per scene: its committed illustrative trace. A CLI
@@ -24,9 +28,34 @@ const calculateMetadata: CalculateMetadataFunction<StudioCompositionProps> = ({ 
   };
 };
 
+const programMetadata: CalculateMetadataFunction<StudioProgramProps> = ({ props }) => {
+  const { width, height } = ASPECT_SIZES[props.aspect];
+  return { width, height, fps: STUDIO_FPS, durationInFrames: props.program.durationInFrames };
+};
+
+/** Preview default for the program composition: the teaser from illustrative traces, no b-roll, no narration. */
+function defaultProgramProps(): StudioProgramProps {
+  const traces = Object.fromEntries(
+    teaser.segments.flatMap((segment) =>
+      segment.kind === "scene" ? [[segment.id, parseTrace(defaultTraces[segment.scene])]] : [],
+    ),
+  );
+  return { program: resolveProgram({ definition: teaser, scenes, traces }), aspect: "16:9" };
+}
+
 export function RemotionRoot() {
   return (
     <>
+      <Composition
+        id={PROGRAM_COMPOSITION_ID}
+        component={StudioProgram}
+        defaultProps={defaultProgramProps()}
+        calculateMetadata={programMetadata}
+        fps={STUDIO_FPS}
+        width={ASPECT_SIZES["16:9"].width}
+        height={ASPECT_SIZES["16:9"].height}
+        durationInFrames={1}
+      />
       {Object.values(scenes).map((scene) => {
         const defaultTrace = defaultTraces[scene.id];
         if (defaultTrace === undefined) {

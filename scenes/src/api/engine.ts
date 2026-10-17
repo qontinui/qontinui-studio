@@ -4,6 +4,7 @@
  * (`src/adapters/remotion/`); a second engine is another implementation of
  * these interfaces, with no scene changes.
  */
+import type { Program } from "./composition";
 import type { Aspect } from "./layout";
 import type { SceneTrace } from "./trace/schema";
 
@@ -55,6 +56,27 @@ export interface StillsRequest {
   overwrite?: boolean;
 }
 
+/** The video formats a composition renders to (it carries audio; gif and png do not). */
+export const COMPOSITION_FORMATS = ["mp4", "webm"] as const;
+export type CompositionFormat = (typeof COMPOSITION_FORMATS)[number];
+
+export interface CompositionRenderRequest {
+  /** A resolved program (`resolveProgram`). Every replay trace in it must be attested. */
+  program: Program;
+  format: CompositionFormat;
+  aspect: Aspect;
+  /** Output file. */
+  outPath: string;
+  /**
+   * Files the program refers to by published name (its b-roll `src` and
+   * narration clip `src`): published name -> local path. The adapter serves
+   * exactly these; a name the program uses that is missing here is refused.
+   */
+  media: Readonly<Record<string, string>>;
+  overwrite?: boolean;
+  onProgress?: (fraction: number) => void;
+}
+
 /**
  * An adapter is SINGLE-USE with respect to close(): once close() has been
  * called, every render or renderStills call (new or in flight) rejects with
@@ -67,6 +89,11 @@ export interface EngineAdapter {
   render(request: RenderRequest): Promise<RenderResult>;
   /** Render chosen frames to PNG (golden tests, posters). */
   renderStills(request: StillsRequest): Promise<string[]>;
+  /**
+   * Render a composition (plan Phase 5). Optional: an adapter without it
+   * cannot compose, and the CLI refuses `compose` on that engine.
+   */
+  renderComposition?(request: CompositionRenderRequest): Promise<RenderResult>;
   /** Stop any render in flight and release resources. Idempotent; see above. */
   close(): Promise<void>;
 }
@@ -79,7 +106,6 @@ export class AdapterClosed extends Error {
   }
 }
 
-/** Props of an adapter's embeddable web player. */
 /**
  * Props of an adapter's embeddable web player.
  *
