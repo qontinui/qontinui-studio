@@ -480,7 +480,7 @@ def build_style_sheet(
                 shutil.copyfile(preview, shown)
             except OSError as e:
                 parts.append(
-                    f"<div class='card'><p class='fail'>{_e(a.uid)}: preview file missing "
+                    f"<div class='card'><p class='fail'>{_e(a.uid)}: preview not copied "
                     f"({_e(type(e).__name__)})</p></div>"
                 )
                 continue

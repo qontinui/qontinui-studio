@@ -210,7 +210,7 @@ def test_a_missing_preview_file_renders_a_note(
     sheet = build_style_sheet(
         load_guide(STYLE), STYLE, tmp_path / "o", NOW, tokens=None, tokens_source=None, library=lib
     )
-    assert "preview file missing" in sheet.page.read_text()
+    assert "preview not copied" in sheet.page.read_text()
 
 
 def test_render_does_not_create_a_library(studio_root: Path) -> None:
