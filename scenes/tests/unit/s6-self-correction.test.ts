@@ -47,6 +47,8 @@ describe("S6 trace fields", () => {
     expect(run("ci.failed", "ci.passed", "ci.diagnosed").join("\n")).toMatch(/is not red/);
     expect(run("ci.failed", "ci.diagnosed", "fix.pushed", "fix.pushed").join("\n")).toMatch(/events.3.pr: fix.pushed without/);
     expect(run("ci.failed", "ci.diagnosed", "fix.pushed", "ci.failed", "ci.diagnosed", "fix.pushed", "ci.passed")).toEqual([]);
+    // A re-queue clears red: a fix after it answers no red run.
+    expect(run("ci.failed", "ci.diagnosed", "merge_train.queued", "fix.pushed").join("\n")).toMatch(/events.3.pr: fix.pushed without/);
   });
 
   it("judges a diagnosis by its own PR only", () => {
