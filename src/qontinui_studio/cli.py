@@ -818,6 +818,62 @@ def launch_register_trigger(work_unit_slug: str, product_slug: str, coord_base: 
     sys.exit(0 if result.read_back == "confirmed" else 5)
 
 
+# ---- weekly factory pulse (explainers plan Phase 5) ------------------------------
+
+
+@main.group()
+def pulse() -> None:
+    """The weekly factory pulse: render, gate, review page and draft posts (posts nothing)."""
+
+
+@pulse.command("run")
+@click.option("--week", default=None, help="ISO week YYYY-Www (default: the previous week, UTC).")
+@click.option("--force", is_flag=True, help="Redo a week that already has a pulse.")
+@click.option(
+    "--scenes-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="The studio-scenes package (default: the one in this repository).",
+)
+@click.pass_obj
+def pulse_run(obj: Obj, week: str | None, force: bool, scenes_dir: Path | None) -> None:
+    """Produce one week's pulse under <root>/.studio/pulse/<week>/.
+
+    Exits 0 for every honest outcome (ready, blocked, no-export) and 1 only
+    when the pulse could not be produced (failed)."""
+    from qontinui_studio.pulse import node_runner, run_pulse
+
+    result = run_pulse(
+        obj.root,
+        now=utc_now(),
+        week_label=week,
+        force=force,
+        runner=node_runner(scenes_dir.resolve()) if scenes_dir else None,
+    )
+    click.echo(
+        f"pulse {result.week}: {result.outcome}" + (f" ({result.mode})" if result.mode else "")
+    )
+    for reason in result.reasons:
+        click.echo(f"  {reason}")
+    for name, path in sorted(result.files.items()):
+        click.echo(f"  {name}: {path}")
+    sys.exit(1 if result.outcome == "failed" else 0)
+
+
+@pulse.command("status")
+@click.pass_obj
+def pulse_status(obj: Obj) -> None:
+    """Every week's pulse outcome, and the run of consecutive ready weeks."""
+    from qontinui_studio.pulse import pulse_history, ready_streak
+
+    rows = pulse_history(obj.root)
+    for row in rows:
+        click.echo(
+            f"{row['week']}  {row['outcome']}" + (f"  ({row['mode']})" if row["mode"] else "")
+        )
+    click.echo(f"consecutive ready weeks: {ready_streak(rows)} (target 4)")
+
+
 def run() -> None:
     try:
         main(standalone_mode=True)

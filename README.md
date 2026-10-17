@@ -804,6 +804,61 @@ segment is refused when the product file loads. The domain is decided
 (`build.qontinui.io`); the hub that serves these scripts is plan
 `2026-10-17-build-qontinui-io-factory-hub`.
 
+## Weekly factory pulse (explainers plan Phase 5)
+
+Plan: `2026-10-09-qontinui-marketing-studio-animated-process-explainers`, Phase 5.
+
+```sh
+studio --root <project> pulse run [--week 2026-W41] [--force]   # one week (default: last week, UTC)
+studio --root <project> pulse status                            # every week's outcome + the ready streak
+```
+
+`<project>/pulse.yaml` names the product whose build record drives the
+pulse (absent file = no product, so every pulse is `no-export`):
+
+```yaml
+product: products/qontinui-studio.yaml   # its record door (public/authed) is read from there
+aspect: "16:9"                           # optional: 16:9 | 9:16 | 1:1
+```
+
+One run writes `<project>/.studio/pulse/<YYYY-Www>/` and ends in one of four
+outcomes, recorded in `pulse.json` and shown on `review.html`:
+
+| Outcome | When | What is written |
+| --- | --- | --- |
+| `no-export` | no product configured, or its build record cannot be read (404, unreachable, no credential, refused) | review page and `pulse.json` only: nothing is rendered from nothing |
+| `blocked` | the clip was rendered and the publish gate (`studio-scenes gate`, exit 3) refused it; or it passed but the record was not a published public snapshot (readers could not check its numbers) | the clip, its gate report and the review page saying why; no `publish/`, no drafts |
+| `ready` | the gate passed on a public snapshot's numbers | `publish/` (clip, captions, manifest, gate report) and `drafts/<network>.txt` |
+| `failed` | anything else: compose, narrate or the gate crashed (any exit but the documented ones), a timeout, an unreadable report | review page and the reason (exit 1) |
+
+- **The week's numbers** (pull requests landed, plans shipped) are counted
+  inside the week from the record. A count is "at least N" when the record
+  could only partly establish the list, when an item that happened has no
+  readable time, or when the record was generated before the week ended (a
+  frozen snapshot cannot see later lands); an unreadable list is left out,
+  never 0. Only finished weeks are produced.
+- **Replay or illustrative, never pretend.** The run first asks
+  `studio-scenes compose factory-pulse --build-record` for a replay. While
+  replays are unavailable (it exits 5 until the export can drive a trace,
+  qontinui-coord#3083) the clip is rendered from the scenes' illustrative
+  traces, and that is said on every frame (the D2 label), on the closing
+  card, in the narration, on the review page and in every draft.
+- **Narration** is a script written from the numbers, voiced by
+  `studio-scenes narrate` (Kokoro-FastAPI, checked by Whisper; see
+  `scenes/README.md`). With no TTS service the clip is silent, and the gate
+  then blocks it (no audio, no captions, no speech check).
+- **Operator-owned:** which social accounts post the drafts, and the final
+  publish click. The pulse posts nothing and publishes nothing outside its
+  own directory.
+- A week that ended `ready` or `blocked` is settled: a later run skips it
+  unless `--force`. A `no-export` or `failed` week is retried by the next
+  run, so a record outage on the scheduled day does not cost the week. A
+  redo first removes the previous run's own outputs (never anything else),
+  so no stale clip, captions or outcome survives into it. The directory may
+  hold only the pulse's own files (anything else is refused, never
+  overwritten). `pulse status` counts consecutive `ready` weeks — the
+  Phase 5 acceptance is four in a row with no authoring work.
+
 ## Development
 
 ```bash
