@@ -129,8 +129,8 @@ export function GatesContinuations({ trace, frame, layout, timeline }: SceneProp
         unit={u}
       />
 
-      {edge("edge-in", p.edgeIn.from, p.edgeIn.to, state.edgeIn)}
-      {edge("edge-out", p.edgeOut.from, p.edgeOut.to, state.edgeOut)}
+      {state.registrant ? edge("edge-in", p.edgeIn.from, p.edgeIn.to, state.edgeIn) : null}
+      {state.gate ? edge("edge-out", p.edgeOut.from, p.edgeOut.to, state.edgeOut) : null}
 
       {state.registrant ? (
         <Node
