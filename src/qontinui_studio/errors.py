@@ -40,7 +40,14 @@ class OperatorHandoff(QuotaExhaustedError):
     provider leaves the rotation until its reset (no retry loop against the
     site), and an interactive job falls through to the next provider."""
 
-    REASONS = ("login_wall", "captcha", "bot_challenge", "rate_limited", "ui_changed")
+    REASONS = (
+        "login_wall",
+        "captcha",
+        "bot_challenge",
+        "rate_limited",
+        "ui_changed",
+        "state_unreadable",
+    )
 
     def __init__(self, message: str, reason: str) -> None:
         super().__init__(message)

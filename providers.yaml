@@ -179,14 +179,15 @@ providers:
       source: https://gemini.google.com/robots.txt
       quote: 'Disallow: /app/'
       note: >-
-        Google's Terms bar "using automated means to access content from any of our
-        services in violation of the machine-readable instructions on our web pages"
-        (policies.google.com/terms, read 2026-10-17); robots.txt disallows /app/.
-        Overridden by the operator, below.
+        Read first-hand 2026-10-17: Google's Terms bar "using automated means to
+        access content from any of our services in violation of the machine-readable
+        instructions on our web pages" (policies.google.com/terms), and robots.txt
+        disallows /app/. Overridden by the operator, below.
     commercial_use:
       value: "yes"
       source: https://policies.google.com/terms
       quote: "Google won’t claim ownership over that content."
+      note: 'read first-hand at policies.google.com/terms on 2026-10-17'
     watermark: SynthID (invisible); whether the free web app adds a visible mark is not verified
     media: [image]
     adapter: ui_bridge_wrapper
@@ -218,8 +219,10 @@ providers:
       value: "no"
       source: https://chatgpt.com/robots.txt
       note: >-
-        OpenAI's Terms of Use (third-party mirror; openai.com answers 403) forbid
-        "Automatically or programmatically extract data or Output". Overridden by the
+        UNVERIFIED first-hand: openai.com/policies/terms-of-use answered HTTP 403 to
+        curl and to WebFetch on 2026-10-17. A third-party mirror of the Terms of Use
+        forbids "Automatically or programmatically extract data or Output"; the
+        verdict is held at "no" on that unconfirmed reading. Overridden by the
         operator, below.
     commercial_use:
       value: unknown

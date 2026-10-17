@@ -5,27 +5,37 @@ ChatGPT), reached through the runner's wrapper dispatch door (plan
 The wrapper runs on the operator's machine, spawned by its runner, against a
 browser session the operator logged into by hand. Studio never sees a
 credential: it posts ``POST {runner}/wrappers/{wrapper_id}/dispatch`` with
-``{"action": "generate-image", "params": {"prompt", "aspectRatio"}}`` and
-reads the runner's ``{"success", "data": {"result": ...}, "error"}`` envelope.
+``{"action": "generate-image", "params": {"prompt", "aspectRatio",
+"maxPerDay", "minIntervalS"}}`` (the row's override bounds; the wrapper applies
+the stricter of its own and these) and reads the runner's ``{"success",
+"data": {"result": ...}, "error"}`` envelope.
 
 The wrapper's ``result`` (the contract this adapter is built against):
 
 * ``{"status": "done", "images": [{"b64_json": ...}, ...]}`` — staged at
   submit time, so ``poll`` reports ``done`` at once;
 * ``{"status": "handoff", "reason": ...}`` — a login wall, CAPTCHA, bot
-  challenge, usage limit or unrecognised page. The wrapper stopped and did
-  nothing further -> ``OperatorHandoff``, which the scheduler treats as a
-  spent quota: no retry against the site until the provider's reset;
+  challenge, usage limit, unreadable state or unrecognised page. The wrapper
+  stopped, did nothing further and latched it on its side. Studio latches it
+  too (``HandoffLatch``), posts one durable notice naming what to do, and
+  raises ``OperatorHandoff``. The provider stays out of every run — not just
+  until the daily reset — until the operator runs
+  ``studio providers clear-handoff <id>``;
 * ``{"status": "paced", "retry_after_s": n}`` — the wrapper's human-pace
-  interval has not elapsed; nothing was typed -> ``ProviderBusy``;
+  interval has not elapsed, or another run holds its lock; nothing was typed
+  -> ``ProviderBusy``;
 * ``{"status": "cap_reached"}`` — the wrapper's own daily counter is spent
   -> ``QuotaExhaustedError``.
 
 Transport outcomes, typed and never collapsed: the runner unreachable, or
-answering 503 (the wrapper could not be spawned) -> ``ProviderBusy`` (nothing
-started); 404 (wrapper not installed) and any other 4xx -> permanent; a drop
-after sending, a 502/504 or an unreadable body -> ``ProviderOutcomeUnknown``
-(the prompt may have been typed).
+answering 503 (the wrapper could not be spawned) -> ``ProviderBusy`` parked
+past the run horizon (nothing started); 404 (wrapper not installed) and any
+other 4xx -> permanent; a drop after sending, any 5xx other than 503, or an
+unreadable body -> ``ProviderOutcomeUnknown`` (the prompt may have been typed).
+
+Every message built from the runner's or wrapper's text is redacted (query
+strings and e-mail addresses removed) and truncated before it can reach a
+job row, a log or a notice.
 """
 
 from __future__ import annotations
@@ -33,6 +43,8 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +67,8 @@ from qontinui_studio.errors import (
     QuotaExhaustedError,
     clamp_retry_after,
 )
-from qontinui_studio.providers import is_local_network
+from qontinui_studio.notify import Notice, Notifier
+from qontinui_studio.providers import OperatorOverride, is_local_network
 
 KIND = "ui_bridge_wrapper"
 ACTION = "generate-image"
@@ -70,6 +83,70 @@ TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # once and reports it, rather than re-dialling a dead door for the whole run
 # (the same rule as the local facade's refused connection).
 UNREACHABLE_RETRY_AFTER_S = 3600.0
+MAX_DETAIL_CHARS = 300
+
+_URL_QUERY = re.compile(r"(https?://[^\s?#'\"]+)[?#][^\s'\"]*")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def redact(text: object) -> str:
+    """Text fit for a job row or a notice: URLs lose their query and fragment,
+    e-mail addresses are masked, and the result is bounded."""
+    out = _EMAIL.sub("<email>", _URL_QUERY.sub(r"\1", str(text)))
+    return out if len(out) <= MAX_DETAIL_CHARS else out[: MAX_DETAIL_CHARS - 1] + "…"
+
+
+class HandoffLatch:
+    """Studio's side of the hand-off latch: one JSON file per provider under the
+    workspace. While a provider's file exists it is built as unavailable and
+    its adapter answers ``OperatorHandoff`` without dialling. Only the operator
+    clears it (``studio providers clear-handoff <id>``)."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    def _path(self, provider_id: str) -> Path:
+        return self.directory / f"{provider_id}.json"
+
+    def get(self, provider_id: str) -> dict[str, Any] | None:
+        try:
+            data = json.loads(self._path(provider_id).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            # Unreadable is still latched: fail closed.
+            return {"reason": "state_unreadable", "detail": "the latch file is unreadable"}
+        return data if isinstance(data, dict) else {"reason": "state_unreadable"}
+
+    def set(self, provider_id: str, reason: str, detail: str) -> bool:
+        """Latch; returns False when it was already latched (notify once)."""
+        path = self._path(provider_id)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        payload = {"reason": reason, "detail": detail, "at": datetime.now(UTC).isoformat()}
+        try:
+            with path.open("x", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except FileExistsError:
+            return False
+        return True
+
+    def clear(self, provider_id: str) -> bool:
+        try:
+            self._path(provider_id).unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def describe(self, provider_id: str) -> str | None:
+        latch = self.get(provider_id)
+        if latch is None:
+            return None
+        return (
+            f"operator hand-off latched ({latch.get('reason')}) since {latch.get('at', '?')}: "
+            f"{latch.get('detail', '')}; resolve it in the browser, then clear it with "
+            f"`studio providers clear-handoff {provider_id}` and, on the wrapper's machine, "
+            f"`node <wrappers root>/{provider_id}/dist/cli.js clear-handoff`"
+        )
 
 
 class UIBridgeWrapperAdapter:
@@ -80,19 +157,25 @@ class UIBridgeWrapperAdapter:
         wrapper_id: str,
         runner_url: str = DEFAULT_RUNNER_URL,
         *,
+        override: OperatorOverride | None = None,
+        latch: HandoffLatch | None = None,
+        notifier: Notifier | None = None,
         client: httpx.Client | None = None,
         dispatch_timeout_s: float = DISPATCH_TIMEOUT_S,
     ) -> None:
         if not is_local_network(runner_url):
             raise PermanentProviderError(
-                f"{provider_id}: the runner URL {runner_url!r} is not on this machine or the "
-                "local network; the wrapper drives the operator's own browser session"
+                f"{provider_id}: the runner URL {redact(runner_url)!r} is not on this machine or "
+                "the local network; the wrapper drives the operator's own browser session"
             )
         self.provider_id = provider_id
         self.model = model
         self.kind = KIND
         self.wrapper_id = wrapper_id
         self.runner_url = runner_url.rstrip("/")
+        self.override = override
+        self.latch = latch
+        self.notifier = notifier
         self.dispatch_timeout_s = dispatch_timeout_s
         self.hard_timeout_s = dispatch_timeout_s + CONNECT_TIMEOUT_S
         self._client = client
@@ -104,11 +187,23 @@ class UIBridgeWrapperAdapter:
         # The web UI takes a prompt and nothing else; the ratio rides in it.
         return {"aspect_ratio": request.aspect_ratio}
 
-    def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
-        body = {
-            "action": ACTION,
-            "params": {"prompt": self.sent_prompt(request), "aspectRatio": request.aspect_ratio},
+    def _params(self, request: GenerationRequest) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "prompt": self.sent_prompt(request),
+            "aspectRatio": request.aspect_ratio,
         }
+        if self.override is not None:
+            params["maxPerDay"] = self.override.max_per_day
+            params["minIntervalS"] = self.override.min_interval_s
+        return params
+
+    def submit(self, request: GenerationRequest, staging_dir: Path) -> SubmittedJob:
+        if self.latch is not None:
+            latched = self.latch.describe(self.provider_id)
+            if latched is not None:
+                reason = str((self.latch.get(self.provider_id) or {}).get("reason", "ui_changed"))
+                raise OperatorHandoff(latched, reason)
+        body = {"action": ACTION, "params": self._params(request)}
         url = f"{self.runner_url}/wrappers/{self.wrapper_id}/dispatch"
         timeout = httpx.Timeout(self.dispatch_timeout_s + 5.0, connect=CONNECT_TIMEOUT_S)
         headers = {TIMEOUT_HEADER: str(int(self.dispatch_timeout_s))}
@@ -118,11 +213,13 @@ class UIBridgeWrapperAdapter:
         except httpx.TransportError as e:
             if never_sent(e):
                 raise ProviderBusy(
-                    f"{self.provider_id}: runner unreachable at {self.runner_url}: {e}",
+                    f"{self.provider_id}: runner unreachable at {self.runner_url}: {redact(e)}",
                     UNREACHABLE_RETRY_AFTER_S,
                     code="runner_unreachable",
                 ) from e
-            raise ProviderOutcomeUnknown(f"{self.provider_id}: dispatch dropped: {e}") from e
+            raise ProviderOutcomeUnknown(
+                f"{self.provider_id}: dispatch dropped: {redact(e)}"
+            ) from e
         finally:
             if self._client is None:
                 client.close()
@@ -136,7 +233,7 @@ class UIBridgeWrapperAdapter:
             raise ProviderOutcomeUnknown(
                 f"{self.provider_id}: runner answered HTTP {resp.status_code} with a non-JSON body"
             ) from e
-        error = envelope.get("error") if isinstance(envelope, dict) else None
+        error = redact(envelope.get("error")) if isinstance(envelope, dict) else ""
         status = resp.status_code
         if status == 503:
             raise ProviderBusy(
@@ -144,7 +241,7 @@ class UIBridgeWrapperAdapter:
                 UNREACHABLE_RETRY_AFTER_S,
                 code="wrapper_unavailable",
             )
-        if status in (502, 504) or status >= 500:
+        if status >= 500:
             raise ProviderOutcomeUnknown(
                 f"{self.provider_id}: wrapper dispatch failed after sending (HTTP {status}): "
                 f"{error}"
@@ -161,6 +258,23 @@ class UIBridgeWrapperAdapter:
             )
         return result
 
+    def _hand_off(self, reason: str, detail: str) -> OperatorHandoff:
+        message = (
+            f"operator hand-off needed ({reason}): {self.provider_id} stopped and did nothing "
+            f"further; {detail}"
+        )
+        if self.latch is not None and self.latch.set(self.provider_id, reason, detail):
+            if self.notifier is not None:
+                self.notifier.notify(
+                    Notice(
+                        batch_id=self.provider_id,
+                        outcome="handoff",
+                        title=f"{self.provider_id} needs the operator ({reason})",
+                        body=self.latch.describe(self.provider_id) or message,
+                    )
+                )
+        return OperatorHandoff(message, reason)
+
     def _stage(
         self, request: GenerationRequest, result: dict[str, Any], staging_dir: Path
     ) -> SubmittedJob:
@@ -169,11 +283,8 @@ class UIBridgeWrapperAdapter:
             reason = str(result.get("reason") or "ui_changed")
             if reason not in OperatorHandoff.REASONS:
                 reason = "ui_changed"
-            raise OperatorHandoff(
-                f"operator hand-off needed ({reason}): {self.provider_id} stopped and did "
-                f"nothing further; {result.get('detail') or 'resolve it in the browser'}",
-                reason,
-            )
+            detail = redact(result.get("detail") or "resolve it in the browser")
+            raise self._hand_off(reason, detail)
         if state == "paced":
             raise ProviderBusy(
                 f"{self.provider_id}: human-pace interval not yet elapsed",
@@ -184,7 +295,7 @@ class UIBridgeWrapperAdapter:
             raise QuotaExhaustedError(f"{self.provider_id}: the wrapper's daily cap is spent")
         if state != "done":
             raise ProviderOutcomeUnknown(
-                f"{self.provider_id}: wrapper answered an unknown status {state!r}"
+                f"{self.provider_id}: wrapper answered an unknown status {redact(state)!r}"
             )
         images = result.get("images")
         if not isinstance(images, list) or not images:
@@ -201,9 +312,10 @@ class UIBridgeWrapperAdapter:
                     f"{self.provider_id}: image {i} is not valid base64"
                 ) from e
             staged.append(str(write_staged(staging_dir, f"{request.job_id}-{i}", data)))
+        # Only the staged paths are kept: no conversation URL (it can identify
+        # the account) ever reaches the job's handle.
         return SubmittedJob(
-            external_id=f"{self.wrapper_id}:{request.job_id}",
-            data={"staged": staged, "conversation_url": result.get("conversation_url")},
+            external_id=f"{self.wrapper_id}:{request.job_id}", data={"staged": staged}
         )
 
     def poll(self, job: SubmittedJob) -> PollResult:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from qontinui_studio.adapters.base import (
     GenerationRequest,
@@ -11,6 +12,7 @@ from qontinui_studio.adapters.base import (
     ProviderAdapter,
     SubmittedJob,
 )
+from qontinui_studio.adapters.ui_bridge_wrapper import HandoffLatch
 from qontinui_studio.errors import (
     AdapterDisabledError,
     GatewayRefusal,
@@ -18,6 +20,7 @@ from qontinui_studio.errors import (
     PermanentProviderError,
 )
 from qontinui_studio.gateway import GATEWAY_CREDENTIAL_ENV, GatewayState, credential_env_acceptable
+from qontinui_studio.notify import Notifier
 from qontinui_studio.providers import Provider, ProviderInventory, is_local_network
 
 __all__ = [
@@ -35,6 +38,8 @@ def build_adapter(
     provider: Provider,
     gateway_route: str | None = None,
     gateway_credential_env: str | None = None,
+    latch: HandoffLatch | None = None,
+    notifier: Notifier | None = None,
 ) -> ProviderAdapter:
     """Construct one adapter, refusing with a typed error when D4 keeps it off.
 
@@ -80,7 +85,15 @@ def build_adapter(
 
         runner = base or os.environ.get(RUNNER_URL_ENV, "").strip() or DEFAULT_RUNNER_URL
         try:
-            return UIBridgeWrapperAdapter(provider.id, model, provider.wrapper_id or "", runner)
+            return UIBridgeWrapperAdapter(
+                provider.id,
+                model,
+                provider.wrapper_id or "",
+                runner,
+                override=provider.operator_override,
+                latch=latch,
+                notifier=notifier,
+            )
         except PermanentProviderError as e:  # a non-local runner URL
             raise AdapterDisabledError(str(e)) from e
     if provider.adapter == "fake":
@@ -143,11 +156,14 @@ def build_adapters(
     inventory: ProviderInventory,
     only: list[str] | None = None,
     gateway: GatewayState | None = None,
+    handoff_dir: Path | None = None,
+    notifier: Notifier | None = None,
 ) -> AdapterSet:
     """Build every provider's adapter. With a ``gateway`` reading, a refusing
     state builds none, and a declared images route carries every OpenAI-images
     -wire adapter (other wires cannot go through it)."""
     result = AdapterSet()
+    latch = HandoffLatch(handoff_dir) if handoff_dir is not None else None
     refusal = gateway.refusal() if gateway is not None else None
     if refusal is None and gateway is not None and gateway.images_credential_env is not None:
         vendor = frozenset(p.api_key_env for p in inventory.providers if p.api_key_env)
@@ -169,6 +185,11 @@ def build_adapters(
         if refusal is not None:
             result.unavailable[provider.id] = str(refusal)
             continue
+        if latch is not None and (held := latch.describe(provider.id)) is not None:
+            # An operator hand-off keeps the provider out of EVERY run until the
+            # operator clears it (not only until the daily reset).
+            result.unavailable[provider.id] = f"{provider.id}: {held}"
+            continue
         if route is not None and provider.capacity == "unmetered" and not is_local_network(route):
             # Unmetered means "costs nothing per image": only true on the local
             # network. Through a remote gateway it is not, so the row is off.
@@ -180,6 +201,8 @@ def build_adapters(
         try:
             result.adapters[provider.id] = build_adapter(
                 provider,
+                latch=latch,
+                notifier=notifier,
                 gateway_route=route,
                 gateway_credential_env=gateway.images_credential_env
                 if gateway is not None and route is not None
