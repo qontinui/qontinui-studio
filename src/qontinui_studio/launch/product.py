@@ -21,9 +21,20 @@ from qontinui_studio.gates import origin
 from qontinui_studio.launch.record import SLUG_PATTERN, WEB_BASE, public_record_url
 from qontinui_studio.sites import Site, forbidden_bridge_reason
 
-#: A page script: one leading slash, then path segments of URL-safe characters,
-#: ending in .js or .mjs. Excludes `//host`, schemes, queries and fragments.
-PAGE_SCRIPT_RE = re.compile(r"/[A-Za-z0-9_~-][A-Za-z0-9._~/-]*\.m?js")
+#: A page script: one or more `/segment`s ending in .js or .mjs. Every segment
+#: is non-empty and starts with a non-dot URL-safe character, so `//host`,
+#: empty segments and every dot-led segment (`.`, `..`, `...`, `.hidden`) are
+#: refused, as are schemes, queries, fragments and ports (no `:`).
+PAGE_SCRIPT_RE = re.compile(r"(?:/[A-Za-z0-9_~-][A-Za-z0-9._~-]*)+\.m?js")
+#: A segment that names a machine rather than a site path: loopback, a private
+#: zone, an IPv4 literal, or an operator home/system root. The publish leak
+#: scan would catch these later; refusing at load says so where it is written.
+_PAGE_SCRIPT_MACHINE_RE = re.compile(
+    r"(?:^|/)(?:localhost|home|users|root|tmp|var|etc|mnt|private)(?=/|\.m?js$)"
+    r"|(?:^|/)\d{1,3}(?:\.\d{1,3}){3}(?=/|\.m?js$)"
+    r"|\.(?:local|internal|lan|corp)(?=/|\.m?js$)",
+    re.IGNORECASE,
+)
 
 
 class RecordSource(BaseModel):
@@ -100,11 +111,16 @@ class PublishTarget(BaseModel):
     @classmethod
     def _page_scripts(cls, scripts: tuple[str, ...]) -> tuple[str, ...]:
         for path in scripts:
-            if not PAGE_SCRIPT_RE.fullmatch(path) or "/../" in f"{path}/" or "/./" in f"{path}/":
+            if not PAGE_SCRIPT_RE.fullmatch(path):
                 raise ValueError(
                     f"page_scripts entry {path!r} must be a site-root-relative path to a .js "
-                    "or .mjs file (e.g. /_hub/ui-bridge.js): no scheme, host, query, "
-                    "fragment or dot segment"
+                    "or .mjs file (e.g. /_hub/ui-bridge.js): no scheme, host, port, query, "
+                    "fragment, empty segment or dot-led segment"
+                )
+            if _PAGE_SCRIPT_MACHINE_RE.search(path):
+                raise ValueError(
+                    f"page_scripts entry {path!r} names a machine (loopback, private zone, IP "
+                    "literal or operator path), not a public site path"
                 )
         if len(set(scripts)) != len(scripts):
             raise ValueError("page_scripts lists a path twice")

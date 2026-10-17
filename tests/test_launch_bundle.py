@@ -1156,6 +1156,16 @@ def test_page_scripts_without_any_render_no_script_tag(
         "/_hub/../secret.js",
         "/_hub/./ui-bridge.js",
         "/.hidden/x.js",
+        "/a/.hidden/x.js",
+        "/a/x/.js",
+        "/a/.../x.js",
+        "/a//b.js",
+        "/_hub/ui-bridge.js/",
+        "/localhost/x.js",
+        "/home/op/x.js",
+        "/127.0.0.1/x.js",
+        "/box.local/x.js",
+        "/_hub:9876/x.js",
         "/_hub/ui-bridge.css",
         "/_hub/ui bridge.js",
         "/_hub/x.js'><script>",
@@ -1167,6 +1177,32 @@ def test_page_scripts_refuse_anything_but_a_root_relative_js_path(
     path = write_product(studio_root, capture=False, page_scripts=(bad,))
     with pytest.raises(ConfigError, match="page_scripts"):
         load_product(path)
+
+
+@pytest.mark.parametrize(
+    "good", ["/_hub/ui-bridge.js", "/a/b.c/x.min.js", "/x.mjs", "/home-page/x.js"]
+)
+def test_page_scripts_accept_site_paths(studio_root: Path, good: str) -> None:
+    path = write_product(studio_root, capture=False, page_scripts=(good,))
+    assert load_product(path).publish.page_scripts == (good,)
+
+
+def test_page_scripts_load_when_no_build_record_is_published(
+    make_context: Callable[..., Context], studio_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-record branch of how_it_was_built still carries the scripts."""
+    ctx = make_context(**preview_ctx(studio_root))
+    product_path = write_product(studio_root, capture=False, page_scripts=("/_hub/ui-bridge.js",))
+
+    def absent(*_: object) -> NoBuildRecord:
+        return NoBuildRecord("not_found", "https://api.example.test/x", "HTTP 404")
+
+    monkeypatch.setattr("qontinui_studio.launch.kit.fetch_record", absent)
+    run = run_kit(ctx, product_path, KitOptions(video=False))
+    text = (run.bundle.out_dir / "how-it-was-built.html").read_text()
+    assert "data-record='absent'" in text
+    head = text.split("</head>", 1)[0]
+    assert "<script type='module' src='/_hub/ui-bridge.js'></script>" in head
 
 
 def test_page_scripts_refuse_a_duplicate(studio_root: Path) -> None:
