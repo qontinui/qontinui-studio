@@ -62,7 +62,7 @@ const STATUS: Record<S4Kind, { text: string; level: AttentionLevel }> = {
 
 /** Where each PR stands after the first `count` beats. */
 interface Standing {
-  /** Order key: the beat that put it in line (queued / resolved / conflicted). */
+  /** Order key: the beat it joined, re-queued, or stepped out of / back into line. */
   key: number;
   /** An unresolved conflict. */
   conflict: boolean;
@@ -80,6 +80,8 @@ function standings(beats: readonly Beat[], count: number): Map<string, Standing>
     const event = beat.event;
     if (!("pr" in event)) continue;
     const kind = event.kind as S4Kind;
+    // A PR first seen landing was never in the train: no car for it.
+    if (kind === "pr.landed" && !out.has(event.pr)) continue;
     const prev = out.get(event.pr) ?? { key: beat.index, conflict: false, red: false, aside: false, landed: false, last: kind };
     const next = { ...prev, last: kind };
     if (kind === "merge_train.queued") Object.assign(next, { conflict: false, red: false });
