@@ -15,11 +15,17 @@ export interface PrCardProps {
   level: AttentionLevel;
   /** 0..1 entrance. */
   appear?: number;
+  /** Clamp the title to this many lines with an ellipsis (default: no clamp). */
+  titleLines?: number;
   unit: number;
 }
 
 /** A pull request: repo#number, title and a status badge. */
-export function PrCard({ x, y, width, repo, number, title, status, level, appear = 1, unit }: PrCardProps) {
+export function PrCard({ x, y, width, repo, number, title, status, level, appear = 1, titleLines, unit }: PrCardProps) {
+  const clamp =
+    titleLines === undefined
+      ? {}
+      : { display: "-webkit-box", WebkitBoxOrient: "vertical" as const, WebkitLineClamp: titleLines, overflow: "hidden" };
   const palette = attention[level];
   const accent = "accent" in palette ? palette.accent : palette.border;
   return (
@@ -88,6 +94,7 @@ export function PrCard({ x, y, width, repo, number, title, status, level, appear
           fontSize: Math.round(typeScale.body * unit),
           fontWeight: fontWeights.semibold,
           lineHeight: 1.25,
+          ...clamp,
         }}
       >
         {title}

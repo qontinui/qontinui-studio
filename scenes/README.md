@@ -24,7 +24,7 @@ src/api/          the studio scene API — the only thing scenes import (besides
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
-                  S3 "Gates and continuations", ...)
+                  S3 "Gates and continuations", S4 "The merge train", ...)
 src/adapters/     engines. remotion/ is the first adapter, hyperframes/ the tested fallback;
                   fonts.ts and output.ts are engine-neutral
 docker/hyperframes/  the pinned HyperFrames render image (Dockerfile + npm lockfile)
@@ -47,6 +47,7 @@ assets/fonts/     bundled Inter 4.1, full character set (OFL)
 | `s1-plan-lifecycle` | one plan, draft to shipped | illustrative; replay once the build-record export lands in coord |
 | `s2-digital-twin` | GitHub, CI, machines and sessions mirrored into coord; decisions from the twin; the developer twin answering from served documents | illustrative only: the export carries no twin, webhook or question events |
 | `s3-gates-continuations` | a session registers a gate on a condition and ends; coord observes the condition and clears the gate; a new session continues | illustrative only: the export carries gate counts, not gate events |
+| `s4-merge-train` | PRs queued, rebased onto main, tested and landed in order; a conflicted PR steps out and rejoins at the back | illustrative only: the export carries land times but no queue order, rebase or conflict events |
 
 ## The engine seam (plan D7)
 
@@ -192,7 +193,8 @@ as an unknown event. A trace contains:
     `continues`)
   - `pr.opened`
   - `ci.started|passed|failed`
-  - `merge_train.queued`
+  - `merge_train.queued|rebased|conflicted|resolved` (a resolution must
+    follow a conflict of the same PR)
   - `pr.landed`
   - `twin.mirrored` (a fact from a source) and `twin.decided` (a decision and
     the twin state it was made from)
@@ -225,7 +227,7 @@ The validator also checks that:
 Each scene declares what it reads (`requires.kinds`, `requires.entities`) and
 may add shape checks (`check`; S1 needs exactly one plan and at most one PR,
 S2 at most four sources, S3 at least one continuation and at most three
-sessions).
+sessions, S4 at most four PRs).
 The CLI, the adapter and the player refuse a trace that cannot drive the scene.
 
 **Replays are refused unless they come from a build record (plan D2).** The

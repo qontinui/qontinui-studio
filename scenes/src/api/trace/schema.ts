@@ -137,6 +137,11 @@ export const traceEvent = z.discriminatedUnion("kind", [
     })
     .strict(),
   z.object({ ...eventBase, kind: z.literal("merge_train.queued"), ...prRef }).strict(),
+  // The merge train (S4): the head of the train is rebased onto main; a
+  // rebase that conflicts takes the PR out of the train until it is resolved.
+  z.object({ ...eventBase, kind: z.literal("merge_train.rebased"), ...prRef }).strict(),
+  z.object({ ...eventBase, kind: z.literal("merge_train.conflicted"), ...prRef }).strict(),
+  z.object({ ...eventBase, kind: z.literal("merge_train.resolved"), ...prRef }).strict(),
   z.object({ ...eventBase, kind: z.literal("pr.landed"), ...prRef }).strict(),
   // The digital twin (S2): state mirrored from a source, and what is decided
   // from it.
@@ -197,6 +202,9 @@ export const EVENT_KINDS = [
   "ci.passed",
   "ci.failed",
   "merge_train.queued",
+  "merge_train.rebased",
+  "merge_train.conflicted",
+  "merge_train.resolved",
   "pr.landed",
   "twin.mirrored",
   "twin.decided",
@@ -425,6 +433,18 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       // A session registers a gate while it is running, not after it ended.
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
+    }
+    if (event.kind === "merge_train.resolved" && prs.has(event.pr)) {
+      const conflicted = trace.events.findIndex(
+        (e, j) => e.kind === "merge_train.conflicted" && e.pr === event.pr && precedes(j, i),
+      );
+      if (conflicted < 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["events", i, "pr"],
+          message: `merge_train.resolved before any merge_train.conflicted for "${event.pr}"`,
+        });
+      }
     }
     if (event.kind === "session.started" && event.continues !== undefined) {
       mustFollow(

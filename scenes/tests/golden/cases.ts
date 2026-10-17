@@ -195,7 +195,14 @@ const S3_CASES: readonly GoldenCase[] = [
   { id: "s3-gates-continuations-1x1-long-labels", scene: "s3-gates-continuations", aspect: "1:1", frames: [251], trace: s3LongLabelsTrace },
 ];
 
-export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES];
+/**
+ * S4 (588 frames: 36-frame intro, one beat every 27): 0 intro, 100 the train
+ * filling, 359 the poster (the conflicted PR out of line while the next one
+ * is tested at the head), 587 the end (all four landed).
+ */
+const S4_CASES = illustrativeCases("s4-merge-train", { "16:9": [0, 100, 359, 587], "9:16": [359], "1:1": [359] });
+
+export const GOLDEN_CASES: readonly GoldenCase[] = [...S1_CASES, ...S2_CASES, ...S3_CASES, ...S4_CASES];
 
 export function goldenName(c: GoldenCase, frame: number): string {
   return `${c.id}-f${String(frame).padStart(4, "0")}.png`;

@@ -1,0 +1,159 @@
+{
+  "trace_version": 1,
+  "meta": {
+    "mode": "illustrative",
+    "title": "Every PR lands in order, tested on the main it lands on",
+    "source": {
+      "kind": "hand-authored",
+      "ref": "traces/illustrative/s4-merge-train.json"
+    }
+  },
+  "entities": {
+    "plans": [
+      {
+        "id": "plan-sync",
+        "title": "Harden the sync service"
+      }
+    ],
+    "prs": [
+      {
+        "id": "pr-412",
+        "plan": "plan-sync",
+        "repo": "example/sync-service",
+        "number": 412,
+        "title": "feat: retry budget for sync jobs"
+      },
+      {
+        "id": "pr-415",
+        "plan": "plan-sync",
+        "repo": "example/sync-service",
+        "number": 415,
+        "title": "feat: export sync metrics"
+      },
+      {
+        "id": "pr-418",
+        "plan": "plan-sync",
+        "repo": "example/sync-service",
+        "number": 418,
+        "title": "refactor: split the job runner"
+      },
+      {
+        "id": "pr-421",
+        "plan": "plan-sync",
+        "repo": "example/sync-service",
+        "number": 421,
+        "title": "fix: config loader defaults"
+      }
+    ]
+  },
+  "events": [
+    {
+      "id": "e01",
+      "at": "2026-09-16T09:00:00Z",
+      "kind": "merge_train.queued",
+      "pr": "pr-412"
+    },
+    {
+      "id": "e02",
+      "at": "2026-09-16T09:02:00Z",
+      "kind": "merge_train.queued",
+      "pr": "pr-415"
+    },
+    {
+      "id": "e03",
+      "at": "2026-09-16T09:04:00Z",
+      "kind": "merge_train.queued",
+      "pr": "pr-418"
+    },
+    {
+      "id": "e04",
+      "at": "2026-09-16T09:06:00Z",
+      "kind": "merge_train.queued",
+      "pr": "pr-421"
+    },
+    {
+      "id": "e05",
+      "at": "2026-09-16T09:13:00Z",
+      "kind": "merge_train.rebased",
+      "pr": "pr-412"
+    },
+    {
+      "id": "e06",
+      "at": "2026-09-16T09:34:00Z",
+      "kind": "ci.passed",
+      "pr": "pr-412"
+    },
+    {
+      "id": "e07",
+      "at": "2026-09-16T09:36:00Z",
+      "kind": "pr.landed",
+      "pr": "pr-412"
+    },
+    {
+      "id": "e08",
+      "at": "2026-09-16T09:39:00Z",
+      "kind": "merge_train.rebased",
+      "pr": "pr-415"
+    },
+    {
+      "id": "e09",
+      "at": "2026-09-16T09:58:00Z",
+      "kind": "ci.passed",
+      "pr": "pr-415"
+    },
+    {
+      "id": "e10",
+      "at": "2026-09-16T10:00:00Z",
+      "kind": "pr.landed",
+      "pr": "pr-415"
+    },
+    {
+      "id": "e11",
+      "at": "2026-09-16T10:03:00Z",
+      "kind": "merge_train.conflicted",
+      "pr": "pr-418"
+    },
+    {
+      "id": "e12",
+      "at": "2026-09-16T10:05:00Z",
+      "kind": "merge_train.rebased",
+      "pr": "pr-421"
+    },
+    {
+      "id": "e13",
+      "at": "2026-09-16T10:23:00Z",
+      "kind": "ci.passed",
+      "pr": "pr-421"
+    },
+    {
+      "id": "e14",
+      "at": "2026-09-16T10:25:00Z",
+      "kind": "pr.landed",
+      "pr": "pr-421"
+    },
+    {
+      "id": "e15",
+      "at": "2026-09-16T10:35:00Z",
+      "kind": "merge_train.resolved",
+      "pr": "pr-418"
+    },
+    {
+      "id": "e16",
+      "at": "2026-09-16T10:38:00Z",
+      "kind": "merge_train.rebased",
+      "pr": "pr-418"
+    },
+    {
+      "id": "e17",
+      "at": "2026-09-16T10:58:00Z",
+      "kind": "ci.passed",
+      "pr": "pr-418"
+    },
+    {
+      "id": "e18",
+      "at": "2026-09-16T11:00:00Z",
+      "kind": "pr.landed",
+      "pr": "pr-418"
+    }
+  ]
+}
