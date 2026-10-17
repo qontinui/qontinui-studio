@@ -35,6 +35,10 @@ class TermsSnapshot:
     automation_allowed: str
     watermark: str
     watermark_visible: bool | None
+    # The operator's override of ``automation_allowed`` in force when the job
+    # was claimed (decided, record and bounds), or ``None``. Recorded beside the
+    # verdict, never in place of it.
+    operator_override: dict[str, Any] | None = None
 
     @classmethod
     def of(cls, provider: Provider) -> TermsSnapshot:
@@ -47,6 +51,9 @@ class TermsSnapshot:
             automation_allowed=provider.automation_allowed.value,
             watermark=provider.watermark,
             watermark_visible=provider.watermark_visible,
+            operator_override=provider.operator_override.model_dump(mode="json")
+            if provider.operator_override is not None
+            else None,
         )
 
     def to_json(self) -> str:
