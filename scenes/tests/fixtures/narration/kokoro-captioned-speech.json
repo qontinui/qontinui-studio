@@ -1,0 +1,30 @@
+{
+  "A plan ships, and twenty checks pass.": {
+    "audio": "<generated>",
+    "audio_format": "audio/wav",
+    "timestamps": [
+      { "word": "A", "start_time": 0.05, "end_time": 0.15 },
+      { "word": "plan", "start_time": 0.15, "end_time": 0.45 },
+      { "word": "ships", "start_time": 0.45, "end_time": 0.8 },
+      { "word": ",", "start_time": 0.8, "end_time": 0.85 },
+      { "word": "and", "start_time": 0.9, "end_time": 1.05 },
+      { "word": "twenty", "start_time": 1.05, "end_time": 1.4 },
+      { "word": "checks", "start_time": 1.4, "end_time": 1.75 },
+      { "word": "pass", "start_time": 1.75, "end_time": 2.1 },
+      { "word": ".", "start_time": 2.1, "end_time": 2.15 }
+    ],
+    "duration_seconds": 2.3
+  },
+  "The sequel job lands.": {
+    "audio": "<generated>",
+    "audio_format": "audio/wav",
+    "timestamps": [
+      { "word": "The", "start_time": 0.05, "end_time": 0.2 },
+      { "word": "sequel", "start_time": 0.2, "end_time": 0.6 },
+      { "word": "job", "start_time": 0.6, "end_time": 0.9 },
+      { "word": "lands", "start_time": 0.9, "end_time": 1.3 },
+      { "word": ".", "start_time": 1.3, "end_time": 1.35 }
+    ],
+    "duration_seconds": 1.5
+  }
+}

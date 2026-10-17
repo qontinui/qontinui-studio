@@ -28,6 +28,8 @@ src/api/          the studio scene API — the only thing scenes import (besides
 src/primitives/   node, edge, PR card, session lane, gate, timeline, counter, caption, mode label,
                   feed (a panel of short rows), scene header, label (a small pill on a point)
 src/compositions/ the teaser, the explainer and the factory pulse (plan Phase 5)
+src/narration/    speak -> re-transcribe -> align (Kokoro-FastAPI, Whisper); vendor/explainroo (MIT)
+narration/examples/  an example narration script (a production's own scripts live in its repo)
 src/scenes/       the scenes of the plan's catalogue (S1 "Plan lifecycle", S2 "The digital twin",
                   S3 "Gates and continuations", S4 "The merge train", S5 "The fleet",
                   S6 "Self-correction", S7 "Model-based GUI automation")
@@ -525,6 +527,72 @@ pnpm studio-scenes compositions
   b-roll still and a narration clip is byte-identical across two runs
   (`tests/golden/compose.test.ts`).
 
+## Narration (plan Phase 5)
+
+```sh
+STUDIO_TTS_URL=http://<host>:8880 STUDIO_ASR_URL=http://<host>:<port> \
+  pnpm studio-scenes narrate teaser --script narration/examples/teaser.md --out out/teaser-voice
+pnpm studio-scenes compose teaser --format mp4 --aspect 16:9 --out out/teaser.mp4 \
+  --narration out/teaser-voice/teaser.timing.json
+```
+
+The loop is explainroo's (`src/narration/vendor/explainroo/`, MIT, vendored
+with its licence and a list of what was changed):
+
+1. **Speak.** The script has one `## <segment-id>` section per narrated
+   segment. Each section is cut into sentences; each sentence is spoken by
+   **Kokoro-82M through Kokoro-FastAPI** (`POST /dev/captioned_speech`), and
+   the clips are joined, with the script's pauses, into one clip per segment.
+2. **Align (seed).** The script's words are aligned, number- and
+   name-aware, against Kokoro's own word timestamps, so every word and every
+   `[#mark]` gets a time in its clip.
+3. **Re-transcribe (check).** The clip is transcribed by an
+   **OpenAI-compatible Whisper endpoint** (`POST /v1/audio/transcriptions`,
+   `verbose_json`, word timestamps) and aligned against the script again.
+   The share of script tokens heard is the segment's speech match (the
+   publish gate needs 0.9). With no recogniser the check is recorded as
+   `unavailable`, which the gate refuses.
+
+Cue grammar: `[#name]` marks a moment (named after an event id of the
+segment's trace, it pins that beat when composed); `[pause 0.6]` adds
+silence; `{shown|spoken}` puts `shown` in the captions and makes the voice
+say `spoken`; `<!-- -->` and `>` lines are not spoken.
+
+The result is `<out>/<segment>.wav` per section and
+`<out>/<composition>.timing.json`, the timing table `compose --narration`
+reads (`src/api/narration-timing.ts`). It is separate from scene code, so
+re-voicing (another voice, another script) never edits a scene.
+
+**Services, by HTTP only.** Kokoro's Python stack links GPL code
+(phonemizer, espeak-ng), so it runs as a separate service and only its audio
+enters a render; this package never links it (plan Phase 0). Configuration:
+
+| Variable | Meaning |
+| --- | --- |
+| `STUDIO_TTS_URL` | Kokoro-FastAPI base URL (`--tts-url`). Unset: `narrate` exits **6** and writes nothing. |
+| `STUDIO_TTS_VOICE` | Kokoro voice (`--voice`), default `af_heart` |
+| `STUDIO_ASR_URL` | OpenAI-compatible transcription base URL (`--asr-url`). Unset: the check is `unavailable`. |
+| `STUDIO_ASR_MODEL` | model name sent to it (`--asr-model`), default `whisper-1` |
+| `STUDIO_TTS_API_KEY_FILE`, `STUDIO_ASR_API_KEY_FILE` | a file holding a bearer key, when a service needs one (never a flag) |
+| `STUDIO_SPEECH_TIMEOUT_MS` | per-request timeout, default 120000 |
+
+A service URL may not carry credentials or a query (they would end up in
+the timing table and in logs); a key goes in the key file. Exit codes: **6**
+when the TTS service is missing, unreachable, failing or answering with
+something unusable (unreadable key file, audio that is not 16-bit PCM WAV),
+so a scheduled caller can render without narration and say why (a missing
+or failing ASR service does not fail `narrate`: the check is recorded as
+`unavailable`, and the publish gate refuses it); **2** for a
+script or usage problem (an unknown `## <segment-id>`, a malformed cue, a
+repeated mark, a section without words). The table is validated before it
+is written, so `narrate` never writes one that `compose` would refuse; a
+speech match is floored, never rounded up past the gate.
+
+`narrate` writes only into an absent or empty directory, or (with
+`--force`) one holding only its own files. The tests run the loop against
+shape fixtures (`tests/fixtures/narration/`) through a fake `fetch` and a
+loopback server; no live service is needed.
+
 ## Tests
 
 ```sh
@@ -650,6 +718,12 @@ imports, or a vendored copy if the licences still differ.
   `docker/hyperframes/`'s image, with `HYPERFRAMES_NO_TELEMETRY=1`,
   `DO_NOT_TRACK=1` and `--network none` (its CLI sends PostHog telemetry by
   default).
+- **explainroo** (`src/narration/vendor/explainroo/`): MIT, Copyright (c)
+  2026 Vincent Schmalbach. `align.js` and `script.js` are vendored from commit
+  `025809e3`, modified as their headers list; the licence is in `LICENSE`
+  beside them.
+- **Kokoro-82M / Kokoro-FastAPI, Whisper**: not dependencies. They are HTTP
+  services; only their audio and transcripts reach this package.
 - **Inter** (`assets/fonts/`): SIL Open Font License 1.1 (`assets/fonts/OFL.txt`).
   Inter 4.1, full character set (latin, latin-ext, Greek, Cyrillic, Vietnamese,
   arrows and symbols; no CJK), from `inter-ui@4.1.1` (`web/Inter-*.woff2`,

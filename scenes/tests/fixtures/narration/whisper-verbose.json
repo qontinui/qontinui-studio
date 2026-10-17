@@ -1,0 +1,36 @@
+{
+  "good": {
+    "task": "transcribe",
+    "language": "english",
+    "duration": 4.1,
+    "text": "A plan ships, and 20 checks pass. The SQL job lands.",
+    "words": [
+      { "word": "A", "start": 0.06, "end": 0.16 },
+      { "word": "plan", "start": 0.16, "end": 0.46 },
+      { "word": "ships,", "start": 0.46, "end": 0.84 },
+      { "word": "and", "start": 0.9, "end": 1.06 },
+      { "word": "20", "start": 1.06, "end": 1.42 },
+      { "word": "checks", "start": 1.42, "end": 1.76 },
+      { "word": "pass.", "start": 1.76, "end": 2.14 },
+      { "word": "The", "start": 2.65, "end": 2.8 },
+      { "word": "SQL", "start": 2.8, "end": 3.2 },
+      { "word": "job", "start": 3.2, "end": 3.5 },
+      { "word": "lands.", "start": 3.5, "end": 3.9 }
+    ]
+  },
+  "garbled": {
+    "task": "transcribe",
+    "language": "english",
+    "duration": 4.1,
+    "text": "A plant chips and checks. The job.",
+    "words": [
+      { "word": "A", "start": 0.06, "end": 0.16 },
+      { "word": "plant", "start": 0.16, "end": 0.46 },
+      { "word": "chips", "start": 0.46, "end": 0.84 },
+      { "word": "and", "start": 0.9, "end": 1.06 },
+      { "word": "checks.", "start": 1.42, "end": 1.76 },
+      { "word": "The", "start": 2.65, "end": 2.8 },
+      { "word": "job.", "start": 3.2, "end": 3.5 }
+    ]
+  }
+}

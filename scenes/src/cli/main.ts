@@ -28,6 +28,7 @@ import { renderRefusal } from "../api/trace/provenance";
 import type { SceneTrace } from "../api/trace/schema";
 import { scenes } from "../scenes";
 import { COMPOSE_USAGE, ReplayUnavailable, compose, listCompositions } from "./compose";
+import { NARRATE_USAGE, NarrationUnavailable, narrateCommand } from "./narrate";
 import { ENGINES, intOption, loadAdapter, loadTrace, parse, readJson, requireScene, type Engine } from "./common";
 import { Interrupted, UsageError, exitCodeFor, runInterruptible } from "./interruptible";
 
@@ -40,6 +41,7 @@ const USAGE = `usage:
   studio-scenes validate <trace-file> [--scene <scene>]
   studio-scenes list
 ${COMPOSE_USAGE}
+${NARRATE_USAGE}
 
 png: with --frame, one still at --out (file); without it, a PNG frame sequence in --out (directory).
 --force replaces an existing output file, or a previous element-*.png sequence; nothing else.
@@ -185,6 +187,8 @@ async function main(argv: string[]) {
       return compose(rest);
     case "compositions":
       return listCompositions();
+    case "narrate":
+      return narrateCommand(rest);
     case "list":
       for (const scene of Object.values(scenes)) process.stdout.write(`${scene.id}\t${scene.title}\n`);
       return;
@@ -207,6 +211,10 @@ main(process.argv.slice(2)).catch((err: unknown) => {
   if (err instanceof ReplayUnavailable) {
     process.stderr.write(`${err.message}\n`);
     process.exit(5);
+  }
+  if (err instanceof NarrationUnavailable) {
+    process.stderr.write(`${err.message}\n`);
+    process.exit(6);
   }
   if (err instanceof UsageError) {
     process.stderr.write(`${err.message}\n\n${USAGE}\n`);
