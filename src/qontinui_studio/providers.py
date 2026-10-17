@@ -40,6 +40,10 @@ UNMETERED_ADAPTERS = ("openai_compatible_images",)
 # runner on the operator's machine. It runs only under an ``operator_override``
 # (plan 2026-10-17-free-image-generation-local-gpu-and-private-ui-bridge-wrappers D2).
 WRAPPER_ADAPTERS = ("ui_bridge_wrapper",)
+# The manual-equivalent ceiling on an override's daily cap and its pace floor;
+# the private wrappers hold the same numbers (web-image-core index.ts).
+MAX_PER_DAY_CEILING = 25
+MIN_INTERVAL_FLOOR_S = 30
 
 
 # Literal address ranges that count as "this machine or the local network".
@@ -174,9 +178,9 @@ class OperatorOverride(BaseModel):
     # Where the decision is written down (a plan path or a coord record id).
     record: str = Field(min_length=1)
     # The manual-equivalent daily cap. The row's ``daily_quota`` must equal it.
-    max_per_day: int = Field(ge=1)
+    max_per_day: int = Field(ge=1, le=MAX_PER_DAY_CEILING)
     # Human pace: the least time between two prompts, enforced by the wrapper.
-    min_interval_s: int = Field(ge=30)
+    min_interval_s: int = Field(ge=MIN_INTERVAL_FLOOR_S)
     # A login wall, CAPTCHA or bot challenge stops the run and hands it to the
     # operator. No other value exists: nothing ever tries to get past one.
     on_challenge: Literal["stop_and_hand_off"]

@@ -306,3 +306,182 @@ def test_the_inventory_loader_reports_a_bad_override_as_config(tmp_path: Path) -
     )
     with pytest.raises(ConfigError, match="must equal"):
         load_providers(path)
+
+
+# --- review round 1: bounds on the wire, the latch, the notice, redaction ------
+
+
+@respx.mock
+def test_the_override_bounds_ride_every_dispatch(tmp_path: Path) -> None:
+    from qontinui_studio.providers import OperatorOverride
+
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
+    )
+    adapter = UIBridgeWrapperAdapter(
+        "gemini-web",
+        "m",
+        "gemini-web",
+        RUNNER,
+        override=OperatorOverride.model_validate(OVERRIDE),
+    )
+    adapter.submit(_request(), tmp_path)
+    params = json.loads(route.calls.last.request.content)["params"]
+    assert params["maxPerDay"] == 10 and params["minIntervalS"] == 90
+
+
+def test_the_override_cap_has_a_manual_equivalent_ceiling() -> None:
+    with pytest.raises(ValueError, match="max_per_day"):
+        _inventory(_row(operator_override={**OVERRIDE, "max_per_day": 26}, daily_quota=26))
+    assert _inventory(_row(operator_override={**OVERRIDE, "max_per_day": 25}, daily_quota=25))
+
+
+def test_a_wrapper_row_without_an_override_is_refused_at_build() -> None:
+    bare = _inventory(_row(operator_override=None)).providers[0]
+    with pytest.raises(AdapterDisabledError, match="automation_allowed is 'no'"):
+        build_adapter(bare)
+
+
+class _Notices:
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    def notify(self, notice: Any) -> Any:
+        self.sent.append(notice)
+        return None
+
+
+@respx.mock
+def test_a_handoff_latches_until_the_operator_clears_it(tmp_path: Path) -> None:
+    from qontinui_studio.adapters import build_adapters
+    from qontinui_studio.adapters.ui_bridge_wrapper import HandoffLatch
+
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer(
+            {
+                "status": "handoff",
+                "reason": "captcha",
+                "detail": "frame https://www.google.com/recaptcha/api2?k=SECRET for a@b.example",
+            }
+        )
+    )
+    latch = HandoffLatch(tmp_path / "handoffs")
+    notices = _Notices()
+    adapter = UIBridgeWrapperAdapter(
+        "gemini-web", "m", "gemini-web", RUNNER, latch=latch, notifier=notices
+    )
+    with pytest.raises(OperatorHandoff) as first:
+        adapter.submit(_request(), tmp_path / "s")
+    assert "SECRET" not in str(first.value) and "a@b.example" not in str(first.value)
+    assert len(notices.sent) == 1
+    assert "studio providers clear-handoff gemini-web" in notices.sent[0].body
+
+    # A second submit never dials and sends no second notice.
+    with pytest.raises(OperatorHandoff):
+        adapter.submit(_request(), tmp_path / "s")
+    assert route.call_count == 1 and len(notices.sent) == 1
+
+    # Every later run builds the provider as unavailable — not only until reset.
+    built = build_adapters(_inventory(_row()), handoff_dir=tmp_path / "handoffs")
+    assert "gemini-web" not in built.adapters
+    assert "operator hand-off latched (captcha)" in built.unavailable["gemini-web"]
+
+    assert latch.clear("gemini-web")
+    assert (
+        "gemini-web"
+        in build_adapters(_inventory(_row()), handoff_dir=tmp_path / "handoffs").adapters
+    )
+
+
+def test_an_unreadable_latch_fails_closed(tmp_path: Path) -> None:
+    from qontinui_studio.adapters.ui_bridge_wrapper import HandoffLatch
+
+    latch = HandoffLatch(tmp_path)
+    (tmp_path / "gemini-web.json").write_text("{not json")
+    assert latch.describe("gemini-web") is not None
+
+
+def test_clear_handoff_command(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from qontinui_studio.adapters.ui_bridge_wrapper import HandoffLatch
+    from qontinui_studio.cli import main
+    from qontinui_studio.workspace import Workspace
+
+    root = tmp_path / "studio"
+    root.mkdir()
+    (root / "providers.yaml").write_text(
+        yaml.safe_dump({"note": "t", "operator_accounts_owed": False, "providers": [_row()]})
+    )
+    ws = Workspace(root)
+    HandoffLatch(ws.handoffs_dir).set("gemini-web", "login_wall", "signed out")
+    listed = CliRunner().invoke(main, ["--root", str(root), "providers", "list"])
+    assert "operator hand-off latched (login_wall)" in listed.output
+    r = CliRunner().invoke(main, ["--root", str(root), "providers", "clear-handoff", "gemini-web"])
+    assert r.exit_code == 0, r.output
+    assert "cleared the hand-off latch for gemini-web" in r.output
+    assert "dist/cli.js clear-handoff" in r.output
+    assert HandoffLatch(ws.handoffs_dir).get("gemini-web") is None
+
+
+def test_redact_strips_queries_and_emails_and_bounds_length() -> None:
+    from qontinui_studio.adapters.ui_bridge_wrapper import MAX_DETAIL_CHARS, redact
+
+    out = redact("see https://accounts.google.com/signin?continue=x#f for me@mail.example")
+    assert out == "see https://accounts.google.com/signin for <email>"
+    assert len(redact("x" * 5000)) == MAX_DETAIL_CHARS
+
+
+@respx.mock
+def test_a_runner_503_parks_past_the_run_horizon(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(return_value=httpx.Response(503, json={"error": "spawn failed"}))
+    adapter = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER)
+    with pytest.raises(ProviderBusy) as busy:
+        adapter.submit(_request(), tmp_path)
+    assert busy.value.retry_after_s == 3600
+
+
+@respx.mock
+def test_no_conversation_url_reaches_the_handle(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=_answer(
+            {
+                "status": "done",
+                "images": [{"b64_json": _png()}],
+                "conversation_url": "https://chatgpt.com/c/abc",
+            }
+        )
+    )
+    job = UIBridgeWrapperAdapter("gemini-web", "m", "gemini-web", RUNNER).submit(
+        _request(), tmp_path
+    )
+    assert set(job.data) == {"staged"}
+
+
+class Paced(FakeImageAdapter):
+    def __init__(self, provider_id: str) -> None:
+        super().__init__(provider_id, "fake-v1")
+        self.calls = 0
+
+    def submit(self, request: GenerationRequest, staging_dir: Path):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        raise ProviderBusy("human-pace interval not yet elapsed", 45, code="paced")
+
+
+def test_a_paced_answer_refunds_the_unit_and_falls_back(
+    make_context: Callable[..., Context], write_brief: Callable[..., Path]
+) -> None:
+    paced = Paced("fake")
+    ctx = make_context(
+        adapters=AdapterSet(adapters={"fake": paced, "fake2": FakeImageAdapter("fake2", "fake-v2")})
+    )
+    out = drive_batch(
+        ctx, new_batch(ctx, load_brief(write_brief(providers="fake, fake2"))), publish=False
+    )
+    assert out.status == "generated"
+    assert paced.calls == 1
+    assert ctx.conn.execute("SELECT provider FROM jobs").fetchone()["provider"] == "fake2"
+    used = ctx.conn.execute(
+        "SELECT COALESCE(SUM(used), 0) AS u FROM quota_usage WHERE provider='fake'"
+    ).fetchone()
+    assert used["u"] == 0  # the refused submission's unit was refunded
