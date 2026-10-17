@@ -75,7 +75,7 @@ def test_install_creates_once_then_is_unchanged() -> None:
     assert ps.install(runner.client(), INTENDED).startswith("UNCHANGED")
     assert [w[0] for w in runner.writes] == ["POST"]
     task = next(t for t in runner.tasks if t["name"] == "factory-pulse")
-    assert task["schedule"] == {"type": "Cron", "value": "30 6 * * 1"}
+    assert task["schedule"] == {"type": "Cron", "value": "30 6 * * Mon"}
     assert task["task"]["task_type"] == "RemoteAgent"
     assert "scripts/run-factory-pulse.sh" in task["task"]["prompt"]
     assert "posts nothing" in task["task"]["prompt"]
@@ -141,8 +141,8 @@ def test_a_body_without_the_envelope_is_unknown() -> None:
 
 
 def test_cron_for() -> None:
-    assert ps.cron_for("06:30", "mon") == "30 6 * * 1"
-    assert ps.cron_for("23:05", "sun") == "5 23 * * 0"
+    assert ps.cron_for("06:30", "mon") == "30 6 * * Mon"
+    assert ps.cron_for("23:05", "sun") == "5 23 * * Sun"
     for at, day in (("6:30", "mon"), ("24:00", "mon"), ("06:30", "monday")):
         with pytest.raises(ps.ScheduleError):
             ps.cron_for(at, day)
@@ -154,7 +154,7 @@ def test_cli_dry_run_and_usage() -> None:
         main, ["pulse", "schedule", "--dry-run", "--workdir", "/w", "--at", "07:15", "--day", "tue"]
     )
     assert dry.exit_code == 0
-    assert '"value": "15 7 * * 2"' in dry.output
+    assert '"value": "15 7 * * Tue"' in dry.output
     assert runner.invoke(main, ["pulse", "schedule"]).exit_code == ps.EXIT_USAGE
     assert (
         runner.invoke(main, ["pulse", "schedule", "--dry-run", "--at", "25:00"]).exit_code
@@ -178,7 +178,7 @@ def test_a_task_stored_in_the_runners_real_shape_is_unchanged() -> None:
         "modifiedAt": "2026-10-17T08:00:00+00:00",
         "name": "factory-pulse",
         "nextRun": "2026-10-19T04:30:00+00:00",
-        "schedule": {"type": "Cron", "value": "30 6 * * 1"},
+        "schedule": {"type": "Cron", "value": "30 6 * * Mon"},
         "skipIfCompleted": False,
         "task": dict(sorted(body["task"].items())),
     }

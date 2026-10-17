@@ -39,7 +39,10 @@ import httpx
 TASK_NAME = "factory-pulse"
 DEFAULT_RUNNER = "http://127.0.0.1:9876"
 #: Monday 06:30 local: early in the week, after the week it reports on has ended.
-DEFAULT_CRON = "30 6 * * 1"
+#: Day-of-week by NAME: the runner's cron numbers days 1-7 from Sunday, so a
+#: numeric "1" (Monday in classic cron) fires on Sunday there. Measured
+#: 2026-10-17: "30 6 * * 1" gave nextRun Sunday 2026-10-18 04:30Z.
+DEFAULT_CRON = "30 6 * * Mon"
 MAX_TURNS = 40
 TIMEOUT_SECONDS = 5400
 
@@ -127,7 +130,15 @@ class Intended:
 def cron_for(at: str, day: str) -> str:
     """``--at HH:MM --day mon`` -> a weekly 5-field cron (the runner adds seconds)."""
     m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", at)
-    days = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+    days = {
+        "sun": "Sun",
+        "mon": "Mon",
+        "tue": "Tue",
+        "wed": "Wed",
+        "thu": "Thu",
+        "fri": "Fri",
+        "sat": "Sat",
+    }
     if not m:
         raise ScheduleError(EXIT_USAGE, f"--at must be HH:MM (24 h, local), got {at!r}")
     if day not in days:
