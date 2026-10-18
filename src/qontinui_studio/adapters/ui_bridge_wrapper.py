@@ -32,10 +32,12 @@ The wrapper's ``result`` (the contract this adapter is built against):
   -> ``QuotaExhaustedError``.
 
 Transport outcomes, typed and never collapsed. Only the RUNNER's typed
-refusals mean "nothing started": the runner unreachable, or a 503 carrying its
-``wrapper_spawn_failed`` code (or, from a runner predating the code, its own
-``failed to spawn wrapper`` message) -> ``ProviderBusy`` parked past the run
-horizon; a 429 carrying ``wrapper_busy`` -> ``ProviderBusy`` retried soon. A
+refusals mean "nothing started": the runner unreachable, or a 503 carrying
+one of its typed codes — ``wrapper_spawn_failed`` (or, from a runner
+predating the code, its own ``failed to spawn wrapper`` message),
+``wrappers_not_initialized`` (booting) or ``primary_unreachable`` (a
+secondary whose request never reached the primary) -> ``ProviderBusy`` parked
+past the run horizon; a 429 carrying ``wrapper_busy`` -> ``ProviderBusy`` retried soon. A
 404 (wrapper not installed) and any other 4xx except 429 -> permanent. Any
 other 429 or 5xx (the runner reports a wrapper's own 5xx as 502, never 503), a
 drop after sending, or an unreadable body -> ``ProviderOutcomeUnknown``
@@ -110,10 +112,15 @@ PRE_DISPATCH_ALLOWANCE_S = RUNNER_PRE_DISPATCH_CEILING_S
 # job comes back as soon as a paced run would (the wrapper's `paced` answer).
 RUNNER_BUSY_CODE = "wrapper_busy"
 RUNNER_BUSY_RETRY_AFTER_S = 30.0
-# The runner's typed spawn failure (HTTP 503): the RUNNER could not start the
-# wrapper, so nothing reached it. The runner answers every wrapper-originated
-# 5xx as 502, so this code — not the status — is what says "nothing started".
+# The runner's typed "nothing reached the wrapper" 503s (qontinui-runner
+# dispatch.rs NOTHING_STARTED_CODES): it could not start the wrapper, it is
+# still booting, or (through a secondary runner) the request never reached the
+# primary. The runner answers every wrapper-originated 5xx as 502, so one of
+# these codes — not the status — is what says "nothing started".
 RUNNER_SPAWN_FAILED_CODE = "wrapper_spawn_failed"
+RUNNER_NOTHING_STARTED_CODES = frozenset(
+    {RUNNER_SPAWN_FAILED_CODE, "wrappers_not_initialized", "primary_unreachable"}
+)
 # A runner that predates the code says the same thing by message prefix.
 LEGACY_SPAWN_FAILED_PREFIX = "failed to spawn wrapper '"
 # No runner listening, or a wrapper it cannot start, is not a busy site: park
@@ -328,8 +335,8 @@ class UIBridgeWrapperAdapter:
                 RUNNER_BUSY_RETRY_AFTER_S,
                 code=RUNNER_BUSY_CODE,
             )
-        if status == 503 and self._runner_spawn_failed(envelope, raw_error):
-            # The runner's TYPED spawn failure only: nothing reached the
+        if status == 503 and self._runner_nothing_started(envelope, raw_error):
+            # The runner's TYPED "nothing started" 503 only: nothing reached the
             # wrapper, so it is refunded and parked. An untyped 503 (a wrapper's
             # own, through a proxy that passes statuses on) is not known to mean
             # "nothing started" and falls through to the 5xx handling below.
@@ -375,12 +382,13 @@ class UIBridgeWrapperAdapter:
         return result
 
     @staticmethod
-    def _runner_spawn_failed(envelope: object, raw_error: object) -> bool:
-        """The runner's typed `wrapper_spawn_failed`: its envelope's `code`, or —
-        for a runner that predates the field — its own message prefix (a
-        wrapper's error is always reported as ``wrapper '<id>' returned …``, so
-        it cannot carry this prefix). Never echoed."""
-        if isinstance(envelope, dict) and envelope.get("code") == RUNNER_SPAWN_FAILED_CODE:
+    def _runner_nothing_started(envelope: object, raw_error: object) -> bool:
+        """One of the runner's typed "nothing started" codes in its envelope's
+        `code`, or — for a runner that predates the field — its own spawn
+        failure's message prefix (a wrapper's error is always reported as
+        ``wrapper '<id>' returned …``, so it cannot carry this prefix). Never
+        echoed."""
+        if isinstance(envelope, dict) and envelope.get("code") in RUNNER_NOTHING_STARTED_CODES:
             return True
         return isinstance(raw_error, str) and raw_error.startswith(LEGACY_SPAWN_FAILED_PREFIX)
 

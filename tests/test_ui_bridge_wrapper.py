@@ -1083,6 +1083,34 @@ def test_an_untyped_503_is_an_outcome_unknown_not_a_refund(
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
 
 
+@pytest.mark.parametrize(
+    "code", ["wrapper_spawn_failed", "wrappers_not_initialized", "primary_unreachable"]
+)
+@respx.mock
+def test_every_typed_nothing_started_503_parks(tmp_path: Path, code: str) -> None:
+    """A booting runner and a secondary whose request never reached the
+    primary are "nothing started" too: refunded and parked, not counted."""
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(503, json={"success": False, "error": "x", "code": code})
+    )
+    with pytest.raises(ProviderBusy) as busy:
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+    assert busy.value.code == "wrapper_unavailable" and busy.value.retry_after_s == 3600
+
+
+@respx.mock
+def test_a_proxy_post_send_failure_is_counted(tmp_path: Path) -> None:
+    """A secondary whose request reached the primary and then failed answers
+    502: the prompt may have run, so it is counted."""
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            502, json={"success": False, "error": "primary runner gave no usable answer"}
+        )
+    )
+    with pytest.raises(ProviderOutcomeUnknown):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
 @respx.mock
 def test_the_typed_spawn_failure_parks_whatever_the_message(tmp_path: Path) -> None:
     respx.post(DISPATCH).mock(
