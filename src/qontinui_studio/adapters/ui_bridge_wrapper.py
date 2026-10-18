@@ -92,12 +92,12 @@ TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # Kept back from the dispatch timeout when telling the wrapper its budget.
 BUDGET_MARGIN_S = 20
 # Everything the runner may spend BEFORE its dispatch clock starts: qontinui-
-# runner's wrappers/manager.rs PRE_DISPATCH_CEILING (80 s) — the exclusive turn
+# runner's wrappers/manager.rs PRE_DISPATCH_CEILING (90 s) — the exclusive turn
 # and the spawn lock under one 30 s wait (dispatch.rs PRE_DISPATCH_WAIT, then a
-# 429 `wrapper_busy`), retiring a degraded record (10 s), a browser wrapper's
-# readiness (30 s) and terminating a spawn that never became ready (10 s).
-# Every part is bounded there, so this is an honest ceiling.
-PRE_DISPATCH_ALLOWANCE_S = 80.0
+# 429 `wrapper_busy`), retiring a degraded record (15 s), a browser wrapper's
+# readiness (30 s), terminating a spawn that never became ready (15 s) and a
+# 10 s margin for the small costs around them.
+PRE_DISPATCH_ALLOWANCE_S = 90.0
 # The runner's typed busy refusal (HTTP 429): the action's turn or the spawn
 # lock was in use and NOTHING was started. The wrapper is not broken, so the
 # job comes back as soon as a paced run would (the wrapper's `paced` answer).
@@ -306,13 +306,13 @@ class UIBridgeWrapperAdapter:
         raw_error = envelope.get("error") if isinstance(envelope, dict) else None
         error = omitted(raw_error) if isinstance(envelope, dict) else "no body"
         status = resp.status_code
-        if status == 429:
-            # Only the typed code is read from the runner's text — matched,
-            # never echoed (the message is still omitted).
-            typed = isinstance(raw_error, str) and raw_error.startswith(RUNNER_BUSY_CODE)
+        if status == 429 and self._runner_busy(envelope, raw_error):
+            # The runner's TYPED busy refusal only: nothing was started, so it
+            # is refunded and retried soon. Any other 429 is not known to mean
+            # "nothing started" and falls through to the 4xx handling below.
             raise ProviderBusy(
                 f"{self.provider_id}: wrapper '{self.wrapper_id}' is busy "
-                f"({RUNNER_BUSY_CODE if typed else 'HTTP 429'}); nothing was started",
+                f"({RUNNER_BUSY_CODE}); nothing was started",
                 RUNNER_BUSY_RETRY_AFTER_S,
                 code=RUNNER_BUSY_CODE,
             )
@@ -349,6 +349,15 @@ class UIBridgeWrapperAdapter:
                 f"{self.provider_id}: runner answered 2xx without a result object"
             )
         return result
+
+    @staticmethod
+    def _runner_busy(envelope: object, raw_error: object) -> bool:
+        """The runner's typed `wrapper_busy`: its envelope's `code` field, or —
+        for a runner that predates the field — the message prefix. Only the
+        code is matched; the text itself is never echoed."""
+        if isinstance(envelope, dict) and envelope.get("code") == RUNNER_BUSY_CODE:
+            return True
+        return isinstance(raw_error, str) and raw_error.startswith(f"{RUNNER_BUSY_CODE}:")
 
     def _hand_off(self, reason: str, detail: str | None) -> OperatorHandoff:
         where = f" at {self.known_host}" if self.known_host else ""

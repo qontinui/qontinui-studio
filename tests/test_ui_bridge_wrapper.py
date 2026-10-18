@@ -923,15 +923,21 @@ def test_the_budget_is_never_below_one_second(tmp_path: Path) -> None:
     assert json.loads(route.calls.last.request.content)["params"]["budgetS"] == 1
 
 
+@respx.mock
 def test_the_read_timeout_covers_everything_before_the_dispatch_clock(tmp_path: Path) -> None:
-    from qontinui_studio.adapters.ui_bridge_wrapper import PRE_DISPATCH_ALLOWANCE_S
-
+    """The timeout actually put on the wire leaves room for the runner's
+    pre-dispatch ceiling on top of the dispatch timeout — read from the
+    request httpx sent, not from the constant."""
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
+    )
     adapter = _adapter(tmp_path / "state")
-    # qontinui-runner PRE_DISPATCH_CEILING: waits 30 + retire 10 + readiness
-    # 30 + failed-spawn terminate 10
-    assert PRE_DISPATCH_ALLOWANCE_S == 80
-    assert adapter.read_timeout_s >= adapter.dispatch_timeout_s + PRE_DISPATCH_ALLOWANCE_S
-    assert adapter.hard_timeout_s > adapter.read_timeout_s
+    adapter.submit(_request(), tmp_path)
+    sent = route.calls.last.request.extensions["timeout"]
+    # qontinui-runner manager.rs PRE_DISPATCH_CEILING is 90 s.
+    assert sent["read"] >= adapter.dispatch_timeout_s + 90
+    assert sent["connect"] <= 10
+    assert adapter.hard_timeout_s > sent["read"]
 
 
 # The runner's busy refusal, byte for byte as qontinui-runner's
@@ -944,14 +950,20 @@ RUNNER_BUSY_BODIES = [
 ]
 
 
-@pytest.mark.parametrize("message", RUNNER_BUSY_BODIES)
+@pytest.mark.parametrize(
+    "body",
+    [
+        # the runner's envelope: the typed `code` field
+        *({"success": False, "error": m, "code": "wrapper_busy"} for m in RUNNER_BUSY_BODIES),
+        # a runner predating the field: the message prefix alone
+        *({"success": False, "error": m} for m in RUNNER_BUSY_BODIES),
+    ],
+)
 @respx.mock
 def test_the_runners_busy_refusal_is_a_short_busy_not_a_parked_wrapper(
-    tmp_path: Path, message: str
+    tmp_path: Path, body: dict[str, Any]
 ) -> None:
-    respx.post(DISPATCH).mock(
-        return_value=httpx.Response(429, json={"success": False, "data": None, "error": message})
-    )
+    respx.post(DISPATCH).mock(return_value=httpx.Response(429, json=body))
     with pytest.raises(ProviderBusy) as busy:
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
     assert busy.value.code == "wrapper_busy"
@@ -970,3 +982,14 @@ def test_a_spawn_failure_is_still_parked(tmp_path: Path) -> None:
     with pytest.raises(ProviderBusy) as busy:
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
     assert busy.value.code == "wrapper_unavailable" and busy.value.retry_after_s == 3600
+
+
+@respx.mock
+def test_an_untyped_429_is_not_refunded(tmp_path: Path) -> None:
+    """Only the runner's typed busy means "nothing started": any other 429
+    falls through to the 4xx handling instead of a free retry."""
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(429, json={"success": False, "error": "too many requests"})
+    )
+    with pytest.raises(PermanentProviderError):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
