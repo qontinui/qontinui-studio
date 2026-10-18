@@ -927,7 +927,10 @@ def test_the_budget_is_never_below_one_second(tmp_path: Path) -> None:
 def test_the_read_timeout_covers_everything_before_the_dispatch_clock(tmp_path: Path) -> None:
     """The timeout actually put on the wire leaves room for the runner's
     pre-dispatch ceiling on top of the dispatch timeout — read from the
-    request httpx sent, not from the constant."""
+    request httpx sent. The `== 100` line is a REGRESSION PIN of the shared
+    contract value, not a behaviour test: qontinui-runner pins the same 100 s
+    (`the_pre_dispatch_ceiling_is_the_documented_100s`) and no test can read
+    both repos, so each side fails first when only one moves."""
     route = respx.post(DISPATCH).mock(
         return_value=_answer({"status": "done", "images": [{"b64_json": _png()}]})
     )
@@ -1012,3 +1015,23 @@ def test_the_typed_code_alone_is_a_busy_whatever_the_message(tmp_path: Path) -> 
     with pytest.raises(ProviderBusy) as busy:
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
     assert busy.value.code == "wrapper_busy" and busy.value.retry_after_s == 30
+
+
+@respx.mock
+def test_a_wrapper_busy_code_from_the_wrapper_is_not_runner_busy(tmp_path: Path) -> None:
+    """The runner never lets a wrapper's own body set the envelope `code`: it
+    reports it as `wrapper_code=` in the message. A wrapper that says
+    "wrapper_busy" is therefore NOT the runner's typed busy — not refunded,
+    not retried for free (the prompt may already have been sent)."""
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            429,
+            json={
+                "success": False,
+                "error": "wrapper 'gemini-web' returned 429 wrapper_code=wrapper_busy; "
+                "body omitted(len=40, hmac=0123456789ab)",
+            },
+        )
+    )
+    with pytest.raises(PermanentProviderError):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
