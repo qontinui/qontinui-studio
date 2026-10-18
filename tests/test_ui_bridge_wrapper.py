@@ -933,9 +933,13 @@ def test_the_read_timeout_covers_everything_before_the_dispatch_clock(tmp_path: 
     )
     adapter = _adapter(tmp_path / "state")
     adapter.submit(_request(), tmp_path)
+    from qontinui_studio.adapters.ui_bridge_wrapper import RUNNER_PRE_DISPATCH_CEILING_S
+
     sent = route.calls.last.request.extensions["timeout"]
-    # qontinui-runner manager.rs PRE_DISPATCH_CEILING is 90 s.
-    assert sent["read"] >= adapter.dispatch_timeout_s + 90
+    # The runner's ceiling, as the single documented constant (pinned at 100 s
+    # on the runner side too).
+    assert RUNNER_PRE_DISPATCH_CEILING_S == 100
+    assert sent["read"] >= adapter.dispatch_timeout_s + RUNNER_PRE_DISPATCH_CEILING_S
     assert sent["connect"] <= 10
     assert adapter.hard_timeout_s > sent["read"]
 
@@ -993,3 +997,18 @@ def test_an_untyped_429_is_not_refunded(tmp_path: Path) -> None:
     )
     with pytest.raises(PermanentProviderError):
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@respx.mock
+def test_the_typed_code_alone_is_a_busy_whatever_the_message(tmp_path: Path) -> None:
+    """The runner's `code` field decides, not the wording: a message without
+    the old prefix is still the typed busy."""
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            429,
+            json={"success": False, "error": "try again shortly", "code": "wrapper_busy"},
+        )
+    )
+    with pytest.raises(ProviderBusy) as busy:
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+    assert busy.value.code == "wrapper_busy" and busy.value.retry_after_s == 30

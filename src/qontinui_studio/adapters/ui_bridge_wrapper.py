@@ -91,13 +91,16 @@ CONNECT_TIMEOUT_S = 10.0
 TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # Kept back from the dispatch timeout when telling the wrapper its budget.
 BUDGET_MARGIN_S = 20
-# Everything the runner may spend BEFORE its dispatch clock starts: qontinui-
-# runner's wrappers/manager.rs PRE_DISPATCH_CEILING (90 s) — the exclusive turn
-# and the spawn lock under one 30 s wait (dispatch.rs PRE_DISPATCH_WAIT, then a
-# 429 `wrapper_busy`), retiring a degraded record (15 s), a browser wrapper's
-# readiness (30 s), terminating a spawn that never became ready (15 s) and a
-# 10 s margin for the small costs around them.
-PRE_DISPATCH_ALLOWANCE_S = 90.0
+# Everything the runner may spend BEFORE its dispatch clock starts. ONE number
+# on both sides: this mirrors qontinui-runner's wrappers/manager.rs
+# PRE_DISPATCH_CEILING, which a runner test pins at 100 s
+# (`the_pre_dispatch_ceiling_is_the_documented_100s`) — change both together.
+# It is the exclusive turn and the spawn lock under one 30 s wait (dispatch.rs
+# PRE_DISPATCH_WAIT, then a 429 `wrapper_busy`), retiring a degraded record
+# (15 s), a browser wrapper's readiness (30 s), terminating a spawn that never
+# became ready (15 s) and a 10 s margin.
+RUNNER_PRE_DISPATCH_CEILING_S = 100.0
+PRE_DISPATCH_ALLOWANCE_S = RUNNER_PRE_DISPATCH_CEILING_S
 # The runner's typed busy refusal (HTTP 429): the action's turn or the spawn
 # lock was in use and NOTHING was started. The wrapper is not broken, so the
 # job comes back as soon as a paced run would (the wrapper's `paced` answer).
