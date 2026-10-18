@@ -927,7 +927,46 @@ def test_the_read_timeout_covers_everything_before_the_dispatch_clock(tmp_path: 
     from qontinui_studio.adapters.ui_bridge_wrapper import PRE_DISPATCH_ALLOWANCE_S
 
     adapter = _adapter(tmp_path / "state")
-    # exclusive-turn wait 30 + browser readiness 30 + stop grace 5 + reap 5
-    assert PRE_DISPATCH_ALLOWANCE_S == 70
+    # qontinui-runner PRE_DISPATCH_CEILING: waits 30 + retire 10 + readiness
+    # 30 + failed-spawn terminate 10
+    assert PRE_DISPATCH_ALLOWANCE_S == 80
     assert adapter.read_timeout_s >= adapter.dispatch_timeout_s + PRE_DISPATCH_ALLOWANCE_S
     assert adapter.hard_timeout_s > adapter.read_timeout_s
+
+
+# The runner's busy refusal, byte for byte as qontinui-runner's
+# wrappers/dispatch.rs `turn_and_spawn` builds it (BUSY_CODE "wrapper_busy",
+# HTTP 429) for both of its causes.
+RUNNER_BUSY_BODIES = [
+    "wrapper_busy: wrapper 'gemini-web' action 'generate-image' is in use by another call; "
+    "nothing was started",
+    "wrapper_busy: wrapper 'gemini-web' is being started by another call; nothing was started",
+]
+
+
+@pytest.mark.parametrize("message", RUNNER_BUSY_BODIES)
+@respx.mock
+def test_the_runners_busy_refusal_is_a_short_busy_not_a_parked_wrapper(
+    tmp_path: Path, message: str
+) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(429, json={"success": False, "data": None, "error": message})
+    )
+    with pytest.raises(ProviderBusy) as busy:
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+    assert busy.value.code == "wrapper_busy"
+    assert busy.value.retry_after_s == 30  # like `paced`, never the 3600 s park
+    assert "gemini-web' action" not in str(busy.value)  # the text is not echoed
+    assert not (tmp_path / "state" / "handoffs" / "gemini-web.json").exists()
+
+
+@respx.mock
+def test_a_spawn_failure_is_still_parked(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            503, json={"success": False, "error": "failed to spawn wrapper 'gemini-web': x"}
+        )
+    )
+    with pytest.raises(ProviderBusy) as busy:
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+    assert busy.value.code == "wrapper_unavailable" and busy.value.retry_after_s == 3600

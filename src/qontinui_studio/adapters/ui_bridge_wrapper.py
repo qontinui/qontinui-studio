@@ -91,13 +91,18 @@ CONNECT_TIMEOUT_S = 10.0
 TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # Kept back from the dispatch timeout when telling the wrapper its budget.
 BUDGET_MARGIN_S = 20
-# Everything the runner may spend BEFORE its dispatch clock starts, from
-# qontinui-runner's wrappers module: the wait for an exclusive action's turn
-# (dispatch.rs EXCLUSIVE_WAIT, 30 s, then a 503), a browser wrapper's readiness
-# wait (manager.rs BROWSER_SPAWN_READY_TIMEOUT, 30 s) and, when that fails, the
-# stop grace before the error returns (STOP_GRACE, 5 s twice: the graceful wait
-# and the reap). Every one is bounded there, so this is an honest ceiling.
-PRE_DISPATCH_ALLOWANCE_S = 30.0 + 30.0 + 2 * 5.0
+# Everything the runner may spend BEFORE its dispatch clock starts: qontinui-
+# runner's wrappers/manager.rs PRE_DISPATCH_CEILING (80 s) — the exclusive turn
+# and the spawn lock under one 30 s wait (dispatch.rs PRE_DISPATCH_WAIT, then a
+# 429 `wrapper_busy`), retiring a degraded record (10 s), a browser wrapper's
+# readiness (30 s) and terminating a spawn that never became ready (10 s).
+# Every part is bounded there, so this is an honest ceiling.
+PRE_DISPATCH_ALLOWANCE_S = 80.0
+# The runner's typed busy refusal (HTTP 429): the action's turn or the spawn
+# lock was in use and NOTHING was started. The wrapper is not broken, so the
+# job comes back as soon as a paced run would (the wrapper's `paced` answer).
+RUNNER_BUSY_CODE = "wrapper_busy"
+RUNNER_BUSY_RETRY_AFTER_S = 30.0
 # No runner listening, or a wrapper it cannot start, is not a busy site: park
 # the job past the scheduler's run horizon (30 min) so ``brief run`` returns at
 # once and reports it, rather than re-dialling a dead door for the whole run
@@ -298,8 +303,19 @@ class UIBridgeWrapperAdapter:
             raise ProviderOutcomeUnknown(
                 f"{self.provider_id}: runner answered HTTP {resp.status_code} with a non-JSON body"
             ) from e
-        error = omitted(envelope.get("error")) if isinstance(envelope, dict) else "no body"
+        raw_error = envelope.get("error") if isinstance(envelope, dict) else None
+        error = omitted(raw_error) if isinstance(envelope, dict) else "no body"
         status = resp.status_code
+        if status == 429:
+            # Only the typed code is read from the runner's text — matched,
+            # never echoed (the message is still omitted).
+            typed = isinstance(raw_error, str) and raw_error.startswith(RUNNER_BUSY_CODE)
+            raise ProviderBusy(
+                f"{self.provider_id}: wrapper '{self.wrapper_id}' is busy "
+                f"({RUNNER_BUSY_CODE if typed else 'HTTP 429'}); nothing was started",
+                RUNNER_BUSY_RETRY_AFTER_S,
+                code=RUNNER_BUSY_CODE,
+            )
         if status == 503:
             raise ProviderBusy(
                 f"{self.provider_id}: runner could not start wrapper '{self.wrapper_id}': {error}",
