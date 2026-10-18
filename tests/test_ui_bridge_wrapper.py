@@ -845,15 +845,73 @@ def test_a_missing_error_reads_no_detail(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_a_wrapper_timeout_is_a_refunded_refusal_not_a_handoff(tmp_path: Path) -> None:
+def test_an_untyped_timeout_is_a_refunded_refusal_not_a_handoff(tmp_path: Path) -> None:
     respx.post(DISPATCH).mock(
-        return_value=_answer({"status": "timeout", "retry_after_s": 60, "typed": True})
+        return_value=_answer({"status": "timeout", "retry_after_s": 60, "typed": False})
     )
     adapter = _adapter(tmp_path / "state")
     with pytest.raises(ProviderBusy) as busy:
         adapter.submit(_request(), tmp_path)
     assert busy.value.code == "timeout" and busy.value.retry_after_s == 60
     assert not (tmp_path / "state" / "handoffs" / "gemini-web.json").exists()
+
+
+@respx.mock
+def test_a_typed_timeout_costs_an_attempt(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "timeout", "retry_after_s": 60, "typed": True})
+    )
+    with pytest.raises(ProviderOutcomeUnknown, match="after the prompt was sent"):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+    assert not (tmp_path / "state" / "handoffs" / "gemini-web.json").exists()
+
+
+@respx.mock
+def test_a_typed_timeout_spends_attempts_through_the_scheduler(
+    make_context: Callable[..., Context],
+    write_brief: Callable[..., Path],
+    studio_root: Path,
+    tmp_path: Path,
+) -> None:
+    """A site that is always too slow must not be retried for free: each typed
+    timeout is an attempt, so the job moves on (to the next provider) once the
+    provider's attempts are spent, and every one of those dispatches is on the
+    record."""
+    from qontinui_studio.providers import OperatorOverride
+    from qontinui_studio.scheduler import RetryPolicy
+
+    _studio_with(studio_root, _row())
+    route = respx.post(DISPATCH).mock(
+        return_value=_answer({"status": "timeout", "retry_after_s": 60, "typed": True})
+    )
+    ticks = iter(range(10**6))
+    real = UIBridgeWrapperAdapter(
+        "gemini-web",
+        "m",
+        "gemini-web",
+        RUNNER,
+        override=OperatorOverride.model_validate(OVERRIDE),
+        state_dir=tmp_path / "state",
+        clock=lambda: 1_000_000.0 + 1000.0 * next(ticks),
+    )
+    ctx = make_context(
+        adapters=AdapterSet(
+            adapters={"gemini-web": real, "fake": FakeImageAdapter("fake", "fake-v1")}
+        ),
+        policy=RetryPolicy(max_attempts_per_provider=2),
+    )
+    out = drive_batch(
+        ctx,
+        new_batch(ctx, load_brief(write_brief(providers="gemini-web, fake"))),
+        publish=False,
+    )
+    assert out.status == "generated"
+    rows = ctx.conn.execute(
+        "SELECT provider, outcome FROM job_attempts WHERE provider='gemini-web'"
+    ).fetchall()
+    assert len(rows) == route.call_count >= 1
+    assert all(r["outcome"] != "busy" for r in rows), [dict(r) for r in rows]
+    assert ctx.conn.execute("SELECT provider FROM jobs").fetchone()["provider"] == "fake"
 
 
 @respx.mock
@@ -865,10 +923,11 @@ def test_the_budget_is_never_below_one_second(tmp_path: Path) -> None:
     assert json.loads(route.calls.last.request.content)["params"]["budgetS"] == 1
 
 
-def test_the_read_timeout_covers_a_cold_browser_spawn(tmp_path: Path) -> None:
-    from qontinui_studio.adapters.ui_bridge_wrapper import SPAWN_ALLOWANCE_S
+def test_the_read_timeout_covers_everything_before_the_dispatch_clock(tmp_path: Path) -> None:
+    from qontinui_studio.adapters.ui_bridge_wrapper import PRE_DISPATCH_ALLOWANCE_S
 
     adapter = _adapter(tmp_path / "state")
-    assert adapter.read_timeout_s >= adapter.dispatch_timeout_s + 30
-    assert SPAWN_ALLOWANCE_S >= 30
+    # exclusive-turn wait 30 + browser readiness 30 + stop grace 5 + reap 5
+    assert PRE_DISPATCH_ALLOWANCE_S == 70
+    assert adapter.read_timeout_s >= adapter.dispatch_timeout_s + PRE_DISPATCH_ALLOWANCE_S
     assert adapter.hard_timeout_s > adapter.read_timeout_s

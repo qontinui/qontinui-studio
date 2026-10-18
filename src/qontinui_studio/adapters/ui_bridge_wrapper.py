@@ -91,9 +91,13 @@ CONNECT_TIMEOUT_S = 10.0
 TIMEOUT_HEADER = "X-Wrapper-Dispatch-Timeout"
 # Kept back from the dispatch timeout when telling the wrapper its budget.
 BUDGET_MARGIN_S = 20
-# The runner's readiness wait for a browser wrapper (qontinui-runner
-# BROWSER_SPAWN_READY_TIMEOUT, 30 s) plus a little.
-SPAWN_ALLOWANCE_S = 35.0
+# Everything the runner may spend BEFORE its dispatch clock starts, from
+# qontinui-runner's wrappers module: the wait for an exclusive action's turn
+# (dispatch.rs EXCLUSIVE_WAIT, 30 s, then a 503), a browser wrapper's readiness
+# wait (manager.rs BROWSER_SPAWN_READY_TIMEOUT, 30 s) and, when that fails, the
+# stop grace before the error returns (STOP_GRACE, 5 s twice: the graceful wait
+# and the reap). Every one is bounded there, so this is an honest ceiling.
+PRE_DISPATCH_ALLOWANCE_S = 30.0 + 30.0 + 2 * 5.0
 # No runner listening, or a wrapper it cannot start, is not a busy site: park
 # the job past the scheduler's run horizon (30 min) so ``brief run`` returns at
 # once and reports it, rather than re-dialling a dead door for the whole run
@@ -199,10 +203,10 @@ class UIBridgeWrapperAdapter:
         self.known_host = known_host
         self.clock = clock
         self.dispatch_timeout_s = dispatch_timeout_s
-        # The runner's dispatch timeout covers only the wrapper's answer; a cold
-        # wrapper is spawned (and its browser launched) BEFORE that clock
-        # starts, so the read timeout allows for the spawn on top.
-        self.read_timeout_s = dispatch_timeout_s + SPAWN_ALLOWANCE_S + 5.0
+        # The runner's dispatch timeout covers only the wrapper's answer; the
+        # exclusive-turn wait and a cold spawn come BEFORE that clock starts,
+        # so the read timeout allows for both on top.
+        self.read_timeout_s = dispatch_timeout_s + PRE_DISPATCH_ALLOWANCE_S + 5.0
         self.hard_timeout_s = self.read_timeout_s + CONNECT_TIMEOUT_S
         self._client = client
 
@@ -364,12 +368,20 @@ class UIBridgeWrapperAdapter:
                 code="paced",
             )
         if state == "timeout":
-            # The wrapper's budget ran out (a slow site or machine). Not the
-            # operator's to resolve, so never a hand-off: a typed refusal that
-            # refunds the unit and lets an interactive job fall back.
+            # The wrapper's budget ran out (a slow site or machine): never the
+            # operator's to resolve, so never a hand-off. Whether the PROMPT
+            # LEFT decides the rest. Not typed: provably nothing started, a
+            # busy refusal (refunded, no attempt spent). Typed: the site has the
+            # prompt and the wrapper counted it, so it must cost an attempt —
+            # a refund here would let an always-slow site be retried every
+            # minute until the wrapper's own cap stopped it.
+            if result.get("typed") is True:
+                raise ProviderOutcomeUnknown(
+                    f"{self.provider_id}: the wrapper's run budget ran out after the prompt "
+                    "was sent"
+                )
             raise ProviderBusy(
-                f"{self.provider_id}: the wrapper's run budget ran out"
-                f"{' after the prompt was sent' if result.get('typed') is True else ''}",
+                f"{self.provider_id}: the wrapper's run budget ran out before the prompt was sent",
                 clamp_retry_after(result.get("retry_after_s")),
                 code="timeout",
             )
