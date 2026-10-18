@@ -31,11 +31,15 @@ The wrapper's ``result`` (the contract this adapter is built against):
 * ``{"status": "cap_reached"}`` — the wrapper's own daily counter is spent
   -> ``QuotaExhaustedError``.
 
-Transport outcomes, typed and never collapsed: the runner unreachable, or
-answering 503 (the wrapper could not be spawned) -> ``ProviderBusy`` parked
-past the run horizon (nothing started); 404 (wrapper not installed) and any
-other 4xx -> permanent; a drop after sending, any 5xx other than 503, or an
-unreadable body -> ``ProviderOutcomeUnknown`` (the prompt may have been typed).
+Transport outcomes, typed and never collapsed. Only the RUNNER's typed
+refusals mean "nothing started": the runner unreachable, or a 503 carrying its
+``wrapper_spawn_failed`` code (or, from a runner predating the code, its own
+``failed to spawn wrapper`` message) -> ``ProviderBusy`` parked past the run
+horizon; a 429 carrying ``wrapper_busy`` -> ``ProviderBusy`` retried soon. A
+404 (wrapper not installed) and any other 4xx except 429 -> permanent. Any
+other 429 or 5xx (the runner reports a wrapper's own 5xx as 502, never 503), a
+drop after sending, or an unreadable body -> ``ProviderOutcomeUnknown``
+(the prompt may have been typed; counted).
 
 Nothing the runner or the wrapper SAYS is persisted. Their free text can carry
 a conversation id, a sign-in continuation, an account name or credentials in a
@@ -106,6 +110,12 @@ PRE_DISPATCH_ALLOWANCE_S = RUNNER_PRE_DISPATCH_CEILING_S
 # job comes back as soon as a paced run would (the wrapper's `paced` answer).
 RUNNER_BUSY_CODE = "wrapper_busy"
 RUNNER_BUSY_RETRY_AFTER_S = 30.0
+# The runner's typed spawn failure (HTTP 503): the RUNNER could not start the
+# wrapper, so nothing reached it. The runner answers every wrapper-originated
+# 5xx as 502, so this code — not the status — is what says "nothing started".
+RUNNER_SPAWN_FAILED_CODE = "wrapper_spawn_failed"
+# A runner that predates the code says the same thing by message prefix.
+LEGACY_SPAWN_FAILED_PREFIX = "failed to spawn wrapper '"
 # No runner listening, or a wrapper it cannot start, is not a busy site: park
 # the job past the scheduler's run horizon (30 min) so ``brief run`` returns at
 # once and reports it, rather than re-dialling a dead door for the whole run
@@ -311,19 +321,30 @@ class UIBridgeWrapperAdapter:
         status = resp.status_code
         if status == 429 and self._runner_busy(envelope, raw_error):
             # The runner's TYPED busy refusal only: nothing was started, so it
-            # is refunded and retried soon. Any other 429 is not known to mean
-            # "nothing started" and falls through to the 4xx handling below.
+            # is refunded and retried soon.
             raise ProviderBusy(
                 f"{self.provider_id}: wrapper '{self.wrapper_id}' is busy "
                 f"({RUNNER_BUSY_CODE}); nothing was started",
                 RUNNER_BUSY_RETRY_AFTER_S,
                 code=RUNNER_BUSY_CODE,
             )
-        if status == 503:
+        if status == 503 and self._runner_spawn_failed(envelope, raw_error):
+            # The runner's TYPED spawn failure only: nothing reached the
+            # wrapper, so it is refunded and parked. An untyped 503 (a wrapper's
+            # own, through a proxy that passes statuses on) is not known to mean
+            # "nothing started" and falls through to the 5xx handling below.
             raise ProviderBusy(
                 f"{self.provider_id}: runner could not start wrapper '{self.wrapper_id}': {error}",
                 UNREACHABLE_RETRY_AFTER_S,
                 code="wrapper_unavailable",
+            )
+        if status == 429:
+            # A 429 that is not the runner's typed busy came from the WRAPPER,
+            # which may have sent the prompt before refusing: counted, like any
+            # outcome that may have run.
+            raise ProviderOutcomeUnknown(
+                f"{self.provider_id}: wrapper '{self.wrapper_id}' answered HTTP 429 after the "
+                f"dispatch reached it: {error}"
             )
         if status >= 500:
             raise ProviderOutcomeUnknown(
@@ -352,6 +373,16 @@ class UIBridgeWrapperAdapter:
                 f"{self.provider_id}: runner answered 2xx without a result object"
             )
         return result
+
+    @staticmethod
+    def _runner_spawn_failed(envelope: object, raw_error: object) -> bool:
+        """The runner's typed `wrapper_spawn_failed`: its envelope's `code`, or —
+        for a runner that predates the field — its own message prefix (a
+        wrapper's error is always reported as ``wrapper '<id>' returned …``, so
+        it cannot carry this prefix). Never echoed."""
+        if isinstance(envelope, dict) and envelope.get("code") == RUNNER_SPAWN_FAILED_CODE:
+            return True
+        return isinstance(raw_error, str) and raw_error.startswith(LEGACY_SPAWN_FAILED_PREFIX)
 
     @staticmethod
     def _runner_busy(envelope: object, raw_error: object) -> bool:

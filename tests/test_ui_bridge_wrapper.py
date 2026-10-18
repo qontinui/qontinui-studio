@@ -257,7 +257,18 @@ def test_wrapper_outcomes_are_typed(
             httpx.Response(404, json={"success": False, "error": "not installed"}),
             PermanentProviderError,
         ),
-        (httpx.Response(503, json={"success": False, "error": "spawn failed"}), ProviderBusy),
+        (
+            httpx.Response(
+                503,
+                json={"success": False, "error": "x", "code": "wrapper_spawn_failed"},
+            ),
+            ProviderBusy,
+        ),
+        # An untyped 503 is not the runner's "nothing started".
+        (
+            httpx.Response(503, json={"success": False, "error": "spawn failed"}),
+            ProviderOutcomeUnknown,
+        ),
         (
             httpx.Response(504, json={"success": False, "error": "timed out"}),
             ProviderOutcomeUnknown,
@@ -443,7 +454,11 @@ def test_clear_handoff_command(tmp_path: Path) -> None:
 
 @respx.mock
 def test_a_runner_503_parks_past_the_run_horizon(tmp_path: Path) -> None:
-    respx.post(DISPATCH).mock(return_value=httpx.Response(503, json={"error": "spawn failed"}))
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            503, json={"error": "spawn failed", "code": "wrapper_spawn_failed"}
+        )
+    )
     adapter = _adapter(tmp_path / "state")
     with pytest.raises(ProviderBusy) as busy:
         adapter.submit(_request(), tmp_path)
@@ -748,7 +763,7 @@ def test_no_runner_error_text_is_persisted(tmp_path: Path, leak: str, status: in
         _adapter(tmp_path / "state").submit(_request(), tmp_path / "s")
     for bad in FORBIDDEN:
         assert bad not in str(e.value), (leak, bad)
-    assert f"HTTP {status}" in str(e.value) or status == 503
+    assert f"HTTP {status}" in str(e.value)
 
 
 @pytest.mark.parametrize("leak", LEAKS)
@@ -980,7 +995,8 @@ def test_the_runners_busy_refusal_is_a_short_busy_not_a_parked_wrapper(
 
 
 @respx.mock
-def test_a_spawn_failure_is_still_parked(tmp_path: Path) -> None:
+def test_a_legacy_runners_spawn_failure_is_still_parked(tmp_path: Path) -> None:
+    """A runner that predates the typed code: its own message prefix decides."""
     respx.post(DISPATCH).mock(
         return_value=httpx.Response(
             503, json={"success": False, "error": "failed to spawn wrapper 'gemini-web': x"}
@@ -993,12 +1009,13 @@ def test_a_spawn_failure_is_still_parked(tmp_path: Path) -> None:
 
 @respx.mock
 def test_an_untyped_429_is_not_refunded(tmp_path: Path) -> None:
-    """Only the runner's typed busy means "nothing started": any other 429
-    falls through to the 4xx handling instead of a free retry."""
+    """Only the runner's typed busy means "nothing started": any other 429 came
+    from the wrapper, which may have sent the prompt — an outcome unknown
+    (counted), neither a free retry nor a permanent refusal."""
     respx.post(DISPATCH).mock(
         return_value=httpx.Response(429, json={"success": False, "error": "too many requests"})
     )
-    with pytest.raises(PermanentProviderError):
+    with pytest.raises(ProviderOutcomeUnknown):
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
 
 
@@ -1022,7 +1039,8 @@ def test_a_wrapper_busy_code_from_the_wrapper_is_not_runner_busy(tmp_path: Path)
     """The runner never lets a wrapper's own body set the envelope `code`: it
     reports it as `wrapper_code=` in the message. A wrapper that says
     "wrapper_busy" is therefore NOT the runner's typed busy — not refunded,
-    not retried for free (the prompt may already have been sent)."""
+    not retried for free: the prompt may already have been sent, so it is an
+    outcome unknown, counted."""
     respx.post(DISPATCH).mock(
         return_value=httpx.Response(
             429,
@@ -1033,5 +1051,45 @@ def test_a_wrapper_busy_code_from_the_wrapper_is_not_runner_busy(tmp_path: Path)
             },
         )
     )
-    with pytest.raises(PermanentProviderError):
+    with pytest.raises(ProviderOutcomeUnknown):
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A wrapper's own 503 through a legacy runner that passed statuses on.
+        {
+            "success": False,
+            "error": "wrapper 'gemini-web' returned 503; body omitted(len=4, hmac=0)",
+        },
+        # A wrapper body that NAMES the runner's code: the runner reports it in
+        # the message, never as the envelope code.
+        {
+            "success": False,
+            "error": "wrapper 'gemini-web' returned 503 wrapper_code=wrapper_spawn_failed",
+        },
+    ],
+)
+@respx.mock
+def test_an_untyped_503_is_an_outcome_unknown_not_a_refund(
+    tmp_path: Path, body: dict[str, object]
+) -> None:
+    """Only the runner's typed spawn failure means "nothing reached the
+    wrapper". A 503 without it may be a wrapper that had already sent the
+    prompt: counted, never refunded and parked."""
+    respx.post(DISPATCH).mock(return_value=httpx.Response(503, json=body))
+    with pytest.raises(ProviderOutcomeUnknown):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@respx.mock
+def test_the_typed_spawn_failure_parks_whatever_the_message(tmp_path: Path) -> None:
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(
+            503, json={"success": False, "error": "could not start", "code": "wrapper_spawn_failed"}
+        )
+    )
+    with pytest.raises(ProviderBusy) as busy:
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)
+    assert busy.value.code == "wrapper_unavailable" and busy.value.retry_after_s == 3600
