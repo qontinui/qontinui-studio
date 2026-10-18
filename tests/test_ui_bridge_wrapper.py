@@ -1121,3 +1121,16 @@ def test_the_typed_spawn_failure_parks_whatever_the_message(tmp_path: Path) -> N
     with pytest.raises(ProviderBusy) as busy:
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
     assert busy.value.code == "wrapper_unavailable" and busy.value.retry_after_s == 3600
+
+
+@pytest.mark.parametrize("code", [["wrapper_spawn_failed"], {"wrapper_spawn_failed": 1}, 5])
+@respx.mock
+def test_a_non_string_code_is_not_a_nothing_started_503(tmp_path: Path, code: object) -> None:
+    """Only a string code is matched: a list- or dict-valued ``code`` (which
+    would raise on a set lookup, or match by accident) is an untyped 503 —
+    counted, never refunded."""
+    respx.post(DISPATCH).mock(
+        return_value=httpx.Response(503, json={"success": False, "error": "x", "code": code})
+    )
+    with pytest.raises(ProviderOutcomeUnknown):
+        _adapter(tmp_path / "state").submit(_request(), tmp_path)

@@ -112,11 +112,13 @@ PRE_DISPATCH_ALLOWANCE_S = RUNNER_PRE_DISPATCH_CEILING_S
 # job comes back as soon as a paced run would (the wrapper's `paced` answer).
 RUNNER_BUSY_CODE = "wrapper_busy"
 RUNNER_BUSY_RETRY_AFTER_S = 30.0
-# The runner's typed "nothing reached the wrapper" 503s (qontinui-runner
-# dispatch.rs NOTHING_STARTED_CODES): it could not start the wrapper, it is
-# still booting, or (through a secondary runner) the request never reached the
-# primary. The runner answers every wrapper-originated 5xx as 502, so one of
-# these codes — not the status — is what says "nothing started".
+# The codes of the runner's typed "nothing reached the wrapper" 503
+# (qontinui-runner dispatch.rs NOTHING_STARTED_CODES): it could not start the
+# wrapper, it is still booting, or (through a secondary runner) the request
+# never reached the primary. The runner answers a wrapper-originated 5xx as
+# 502, but a 503 can still arrive without a code (an older runner, or anything
+# else on the port), so one of these codes — not the status — is what says
+# "nothing started".
 RUNNER_SPAWN_FAILED_CODE = "wrapper_spawn_failed"
 RUNNER_NOTHING_STARTED_CODES = frozenset(
     {RUNNER_SPAWN_FAILED_CODE, "wrappers_not_initialized", "primary_unreachable"}
@@ -388,7 +390,8 @@ class UIBridgeWrapperAdapter:
         failure's message prefix (a wrapper's error is always reported as
         ``wrapper '<id>' returned …``, so it cannot carry this prefix). Never
         echoed."""
-        if isinstance(envelope, dict) and envelope.get("code") in RUNNER_NOTHING_STARTED_CODES:
+        code = envelope.get("code") if isinstance(envelope, dict) else None
+        if isinstance(code, str) and code in RUNNER_NOTHING_STARTED_CODES:
             return True
         return isinstance(raw_error, str) and raw_error.startswith(LEGACY_SPAWN_FAILED_PREFIX)
 
