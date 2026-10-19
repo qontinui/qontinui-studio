@@ -56,24 +56,18 @@ reference leaves the machine, and paid work already done is not thrown away.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import ipaddress
-import json
-import math
 import os
 import sqlite3
-import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
-from urllib.parse import urlparse
 
 import httpx
 
 from qontinui_studio.adapters import AdapterSet
+from qontinui_studio.device_auth import DEVICE_JWT_FILE, Credential, DeviceCredentials
 from qontinui_studio.errors import ImageGenerationRefused
 from qontinui_studio.gateway import runner_url
 from qontinui_studio.providers import Provider, ProviderInventory, is_local_network
@@ -82,12 +76,6 @@ DOMAIN = "image_generation"
 MACHINE_SWITCH_ENV = "QONTINUI_IMAGEGEN"
 COORD_URL_ENV = "COORD_HTTP_URL"
 PRODUCTION_COORD = "https://coord.qontinui.io"
-DEVICE_JWT_ENV = "COORD_DEVICE_JWT"
-DEVICE_JWT_FILE = Path("~/.qontinui/coord-device-jwt")
-# Sent with the runner mint when set: a runner bound to several tenants answers
-# 409 ``tenant_required`` to a mint that names none.
-TENANT_ENV = "STUDIO_COORD_TENANT_ID"
-RUNNER_MINT_PATH = "/ui-bridge/invoke/get_coord_device_token"
 FLEET_POLICY_PATH = "/coord/fleet-policy"
 # How long one coord reading is reused before the dial is read again.
 POLL_INTERVAL_S = 60.0
@@ -123,53 +111,8 @@ class DialReader(Protocol):
     def __call__(self, repo: str | None) -> DialReading: ...
 
 
-@dataclass(frozen=True)
-class Credential:
-    source: str
-    token: str
-
-
-def jwt_claims(token: str) -> dict[str, object] | None:
-    """The payload of a three-part JWT, or None when it does not decode. Not
-    verified: coord verifies; studio only reads ``exp`` and ``tenant_id``."""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-    except (ValueError, binascii.Error):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def jwt_expired(token: str, now_epoch: float | None = None) -> bool:
-    """Whether ``token``'s ``exp`` claim has passed. An ``exp`` that is present
-    but not a finite number (a string, a bool, NaN, infinity) counts as
-    expired. A token whose payload does not decode, or that carries no
-    ``exp``, is not known to be expired: coord decides it."""
-    claims = jwt_claims(token)
-    if claims is None or "exp" not in claims:
-        return False
-    exp = claims["exp"]
-    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
-        return True
-    return exp <= (time.time() if now_epoch is None else now_epoch)
-
-
 def coord_base_url() -> str:
     return (os.environ.get(COORD_URL_ENV, "").strip() or PRODUCTION_COORD).rstrip("/")
-
-
-def _is_loopback_url(url: str) -> bool:
-    """A LITERAL loopback address, or exactly ``localhost``. A name that merely
-    starts with ``127.`` (``127.evil.example``) resolves anywhere."""
-    host = (urlparse(url).hostname or "").lower()
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 class CoordDialReader:
@@ -190,68 +133,15 @@ class CoordDialReader:
     # ---- the credential chain ------------------------------------------
 
     def credentials(self, skipped: list[str]) -> Iterator[Credential]:
-        """Each usable credential in order; why each other source was passed
-        over is appended to ``skipped``. The runner mint runs only when the
-        static sources are spent."""
-        env = os.environ.get(DEVICE_JWT_ENV, "").strip()
-        if not env:
-            skipped.append(f"${DEVICE_JWT_ENV} unset")
-        elif jwt_expired(env):
-            skipped.append(f"${DEVICE_JWT_ENV} expired")
-        else:
-            yield Credential(f"${DEVICE_JWT_ENV}", env)
-        try:
-            file_token = self.jwt_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            file_token = ""
-        if not file_token:
-            skipped.append(f"{self.jwt_file} absent or empty")
-        elif jwt_expired(file_token):
-            skipped.append(f"{self.jwt_file} expired")
-        else:
-            yield Credential(str(self.jwt_file), file_token)
-        minted = self._runner_mint()
-        if isinstance(minted, Credential):
-            yield minted
-        else:
-            skipped.append(minted)
-
-    def _runner_mint(self) -> Credential | str:
-        if self.base_url != PRODUCTION_COORD:
-            return (
-                f"runner mint not used: the runner mints for production coord and "
-                f"{self.base_url} is not it"
-            )
-        root = self.runner().rstrip("/")
-        if not _is_loopback_url(root):
-            return f"runner mint not used: runner URL {root} is not loopback"
-        tenant = os.environ.get(TENANT_ENV, "").strip()
-        args: dict[str, str] = {"tenantId": tenant} if tenant else {}
-        try:
-            resp = self.http.post(f"{root}{RUNNER_MINT_PATH}", json={"args": args})
-        except httpx.HTTPError as e:
-            return f"runner mint: {type(e).__name__}: {e}"
-        if resp.status_code != 200:
-            return f"runner mint answered HTTP {resp.status_code}"
-        try:
-            body = resp.json()
-        except ValueError:
-            return "runner mint: unreadable answer"
-        data = body.get("data") if isinstance(body, dict) else None
-        if not isinstance(data, str) or not data.strip() or " " in data.strip():
-            return "runner mint: the runner holds no device credential (no token in its answer)"
-        token = data.strip()
-        if jwt_expired(token):
-            return "runner mint: the minted token is expired"
-        if tenant:
-            claims = jwt_claims(token) or {}
-            claim = claims.get("tenant_id")
-            if not isinstance(claim, str) or claim.lower() != tenant.lower():
-                return (
-                    f"runner mint: the minted token's tenant_id claim {claim!r} is not "
-                    f"${TENANT_ENV} ({tenant}); discarded"
-                )
-        return Credential("runner mint", token)
+        """Each usable credential in order (:mod:`qontinui_studio.device_auth`);
+        the runner mint is offered to production coord only."""
+        refusal = (
+            None
+            if self.base_url == PRODUCTION_COORD
+            else f"the runner mints for production coord and {self.base_url} is not it"
+        )
+        chain = DeviceCredentials(self.http, refusal, jwt_file=self.jwt_file, runner=self.runner)
+        return chain.credentials(skipped)
 
     # ---- the read -------------------------------------------------------
 

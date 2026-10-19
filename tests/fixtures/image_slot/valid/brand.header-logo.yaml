@@ -1,0 +1,38 @@
+# An identity mark: supplied by a person, never generated, so the binding is not
+# ai_generated and records no generation inputs. A mark has no single subject to
+# protect from cropping, so its focal region is the whole frame.
+# content-sha256: 3b3a7822d70a4e5ebdac4560a4c056c8e91210c7fc7b502742637df9027d0e3f
+slot: brand.header-logo
+role: logo
+job: Identify the product in the page header.
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 1280]
+  themes: [dark]
+  dpr: [1, 2, 3]
+aspect:
+  preferred: 152/177
+  allowed: []
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0, y: 0, width: 1, height: 1}
+  must_survive_crop: false
+style:
+  imagery: domain_spec/visual-system#imagery
+content:
+  must:
+    - the Qontinui mark
+  must_not: []
+text_in_image:
+  kind: forbidden
+alt:
+  kind: text
+  text: Qontinui
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: e3aeef621a1da03d4f28badc9faee70316e83de4ddc6dcc574e0b8f0a110a553
+  spec_sha256: 3b3a7822d70a4e5ebdac4560a4c056c8e91210c7fc7b502742637df9027d0e3f
+  source: supplied
+  ai_generated: false

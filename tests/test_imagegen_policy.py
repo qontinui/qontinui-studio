@@ -32,7 +32,7 @@ import pytest
 import respx
 from click.testing import CliRunner
 
-from qontinui_studio import imagegen_policy
+from qontinui_studio import device_auth, imagegen_policy
 from qontinui_studio.adapters import AdapterSet, build_adapters
 from qontinui_studio.adapters.fake import FakeImageAdapter
 from qontinui_studio.briefs import load_brief
@@ -285,19 +285,19 @@ def test_a_minted_token_for_another_tenant_or_expired_is_discarded(
 
 
 def test_only_literal_loopback_or_localhost_counts_as_loopback() -> None:
-    loop = imagegen_policy._is_loopback_url
+    loop = device_auth.is_loopback_url
     assert loop("http://localhost:9876") and loop("http://127.0.0.2:9876")
     assert loop("http://[::1]:9876")
     assert not loop("http://127.evil.example:9876") and not loop("http://localhost.evil:1")
 
 
 def test_a_non_numeric_exp_counts_as_expired() -> None:
-    assert imagegen_policy.jwt_expired(_jwt(float("nan")))
-    assert imagegen_policy.jwt_expired(_jwt(float("inf")))
-    assert imagegen_policy.jwt_expired(_jwt("9999999999"))
-    assert imagegen_policy.jwt_expired(_jwt(True))
-    assert not imagegen_policy.jwt_expired(_jwt(time.time() + 60))
-    assert not imagegen_policy.jwt_expired("not-a-jwt")
+    assert device_auth.jwt_expired(_jwt(float("nan")))
+    assert device_auth.jwt_expired(_jwt(float("inf")))
+    assert device_auth.jwt_expired(_jwt("9999999999"))
+    assert device_auth.jwt_expired(_jwt(True))
+    assert not device_auth.jwt_expired(_jwt(time.time() + 60))
+    assert not device_auth.jwt_expired("not-a-jwt")
 
 
 @respx.mock

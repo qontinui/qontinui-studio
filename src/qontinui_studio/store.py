@@ -259,9 +259,21 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   Recovery and readopt re-send notices from these, never from whatever
 #   product yaml sits at ``product_path`` later. Launches published before v5
 #   keep NULL in both.
+#
+# Version 6 — the asset compile step (plan 2026-10-13 Phase 19):
+#
+# * ``batches.compile_target`` / ``compile_slot`` / ``compile_spec_sha256`` /
+#   ``compile_inputs_json``: set on a batch ``studio compile`` created for one
+#   image slot of one compile target — the target id, the spec's slot id, the
+#   spec's content hash and the input digests (recipe, imagery, exemplars,
+#   LoRA) it was generated against. A compile batch publishes only into the
+#   checkout a compile run names, so ``jobs run`` never drives it and
+#   ``publish``/``unpublish --batch`` refuse it; a later compile run resumes it
+#   while its spec and inputs are unchanged, and fails it once they are not.
+#   NULL on every other batch.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _BATCHES_V1 = """
 CREATE TABLE batches_v1 (
@@ -428,12 +440,22 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE launches ADD COLUMN public_url TEXT")
 
 
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    for column in ("compile_target", "compile_slot", "compile_spec_sha256", "compile_inputs_json"):
+        conn.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
+    conn.execute(
+        "CREATE INDEX batches_compile ON batches (compile_target, compile_slot, status) "
+        "WHERE compile_target IS NOT NULL"
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
     4: _migrate_v4_to_v5,
+    5: _migrate_v5_to_v6,
 }
 
 

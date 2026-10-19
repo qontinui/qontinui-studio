@@ -9,7 +9,7 @@ build reads to render the illustrative/AI label beside the image (D6).
 How a publish is made safe:
 
 * **Exclusive.** Every publish/unpublish holds an OS lock on each affected
-  site's publish dir AND preview dir (``locks.site_locks``) from the first
+  site's publish dir AND preview dir (``locks.file_locks``) from the first
   check to the notice.
 * **Never clobbers.** A slot path holding bytes that are not a live studio
   publication of that slot refuses the batch (gate ``foreign_file``) — checked
@@ -75,11 +75,11 @@ from qontinui_studio.gates import (
     http_manifest_fetch,
 )
 from qontinui_studio.library import AssetRecord, Library, VariantRecord
-from qontinui_studio.locks import site_locks
+from qontinui_studio.locks import file_locks, lock_path
 from qontinui_studio.marker import DIGITAL_SOURCE_TYPE
 from qontinui_studio.notify import Delivery, Notice, Notifier
 from qontinui_studio.postprocess import sha256_file
-from qontinui_studio.sites import Site
+from qontinui_studio.sites import SLOT_NAME, Site
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ MANIFEST = "studio-manifest.json"
 JOURNAL_PREFIX = ".studio-journal-"
 PUBLISHABLE_STATUSES = ("generated", "refused", "unpublished")
 PREVIEW_FILES_KEY = "studio_preview_files"
-SLOT_FILE_EXTS = ("webp", "avif", "png", "jpg")
+SLOT_FILE_EXTS = ("webp", "avif", "png", "jpg", "svg")
 
 
 class ForeignFile(StudioError):
@@ -202,6 +202,34 @@ def _manifest_entry(
     }
 
 
+def _manifest_shas(site: Site, slot: str | None = None) -> set[str]:
+    """sha256 of every file the site's own manifest records (for one slot, or
+    all) — read from ``publish_dir``, never from the preview."""
+    try:
+        slots = _read_manifest(site.publish_dir).get("slots", {})
+    except (OSError, ValueError):
+        return set()
+    out: set[str] = set()
+    for name, entry in slots.items() if isinstance(slots, dict) else ():
+        if slot is not None and name != slot:
+            continue
+        shas = entry.get("sha256") if isinstance(entry, dict) else None
+        if isinstance(shas, dict):
+            out |= {v for v in shas.values() if isinstance(v, str) and _SHA.fullmatch(v)}
+    return out
+
+
+def _owned_shas(conn: sqlite3.Connection, site: Site, slot: str | None = None) -> set[str]:
+    """The bytes the studio may move away from a slot path: a live studio
+    publication of the site (or slot), and — on a checkout site — any file the
+    checkout's own studio manifest records (a publication a PR landed, made by
+    any studio)."""
+    owned = _live_shas(conn, site.id, slot)
+    if site.checkout:
+        owned |= _manifest_shas(site, slot)
+    return owned
+
+
 def _live_shas(conn: sqlite3.Connection, site_id: str, slot: str | None = None) -> set[str]:
     """sha256 of every live studio publication on a site (or one slot of it)."""
     sql = (
@@ -296,9 +324,7 @@ class Journal:
 
         def slot_file(raw: object) -> Path:
             target = Path(str(raw))
-            m = re.fullmatch(
-                r"([a-z0-9][a-z0-9_-]*)\.(" + "|".join(SLOT_FILE_EXTS) + ")", target.name
-            )
+            m = re.fullmatch(rf"({SLOT_NAME})\.(" + "|".join(SLOT_FILE_EXTS) + ")", target.name)
             if m is None or m.group(1) not in site.slots:
                 raise bad(f"{target} is not a slot file of this site")
             if target.parent.resolve() != live or target != site.publish_dir / target.name:
@@ -515,7 +541,7 @@ def recover(
         if not site.publish_dir.is_dir():
             continue  # nothing published there, so nothing to recover
         try:
-            with site_locks([site.publish_dir]):
+            with file_locks([_publish_lock(site)]):
                 report.lines += _recover_locked(conn, [site], notifier, root)
         except Exception as e:
             conn.rollback()
@@ -530,7 +556,13 @@ def recover(
             continue
         try:
             dirs = [sites[s].publish_dir for s in targets if s in sites]
-            with site_locks([d for d in dirs if d.is_dir()]):
+            with file_locks(
+                [
+                    _publish_lock(sites[s])
+                    for s in targets
+                    if s in sites and sites[s].publish_dir.is_dir()
+                ]
+            ):
                 if any(_journal_path(d, row["id"]).exists() for d in dirs):
                     continue
                 cur = conn.execute(
@@ -566,7 +598,7 @@ def recover(
             }
             if site_ids & set(report.failed_sites):
                 continue
-            with site_locks([sites[s].publish_dir for s in site_ids if s in sites]):
+            with file_locks([_publish_lock(sites[s]) for s in site_ids if s in sites]):
                 again = conn.execute(
                     "SELECT status, notified_at FROM batches WHERE id = ?", (row["id"],)
                 ).fetchone()
@@ -632,23 +664,36 @@ def _record_gates(
     )
 
 
-def _select_slot_variants(
-    pairs: list[tuple[AssetRecord, VariantRecord]],
-) -> dict[tuple[str, str], list[tuple[AssetRecord, VariantRecord]]]:
-    """Per (site, slot), the formats of the first generated variant (lowest
-    variant index). Later variants stay in the library for the review page."""
+SlotKey = tuple[str, str]  # (site, slot)
+
+
+def lowest_index_pick(pairs: list[tuple[AssetRecord, VariantRecord]]) -> dict[SlotKey, str]:
+    """The launch kit's pick: per (site, slot), the asset of the first
+    generated variant (lowest variant index). Best-of-N (plan 2026-10-13
+    Phase 20) replaces it; until then ``studio compile`` records it as
+    ``pick: unjudged (Phase 20 not landed)``."""
 
     def order(p: tuple[AssetRecord, VariantRecord]) -> tuple[int, str]:
         job = p[0].job_id or ""  # only generated assets have variants to publish
         idx = job.rsplit("-v", 1)[-1]
         return (int(idx) if idx.isdigit() else 0, p[0].uid)
 
-    chosen_asset: dict[tuple[str, str], str] = {}
+    chosen: dict[SlotKey, str] = {}
     for asset, variant in sorted(pairs, key=order):
         if variant.site is None or variant.slot is None:
             continue
-        chosen_asset.setdefault((variant.site, variant.slot), asset.uid)
-    out: dict[tuple[str, str], list[tuple[AssetRecord, VariantRecord]]] = {}
+        chosen.setdefault((variant.site, variant.slot), asset.uid)
+    return chosen
+
+
+def select_slot_variants(
+    pairs: list[tuple[AssetRecord, VariantRecord]], pick: dict[SlotKey, str] | None = None
+) -> dict[SlotKey, list[tuple[AssetRecord, VariantRecord]]]:
+    """Per (site, slot), the formats of the picked asset: ``pick`` (slot ->
+    asset uid) when the caller made the choice, else :func:`lowest_index_pick`.
+    The other variants stay in the library for the review page."""
+    chosen_asset = lowest_index_pick(pairs) if pick is None else pick
+    out: dict[SlotKey, list[tuple[AssetRecord, VariantRecord]]] = {}
     for asset, variant in pairs:
         if variant.site is None or variant.slot is None:
             continue
@@ -686,10 +731,11 @@ class _SitePlan:
 
 
 def _plan(
-    selected: dict[tuple[str, str], list[tuple[AssetRecord, VariantRecord]]],
+    selected: dict[SlotKey, list[tuple[AssetRecord, VariantRecord]]],
     sites: dict[str, Site],
     batch_id: str,
     now_iso: str,
+    manifest_extra: dict[SlotKey, dict[str, Any]] | None = None,
 ) -> list[_SitePlan]:
     plans: dict[str, _SitePlan] = {}
     for (site_id, slot_name), items in sorted(selected.items()):
@@ -710,6 +756,9 @@ def _plan(
             batch_id,
             now_iso,
             {variant.format: Path(variant.path) for _, variant, _ in rows},
+        )
+        plan.manifest["slots"][slot_name].update(
+            (manifest_extra or {}).get((site_id, slot_name), {})
         )
     return list(plans.values())
 
@@ -810,10 +859,14 @@ class Waiter:
         return cls(sleep=sleep, monotonic=lambda: clock().timestamp())
 
 
-def _lock_dirs(sites: list[Site]) -> list[Path]:
-    dirs = [s.publish_dir for s in sites]
-    dirs += [s.preview_dir for s in sites if s.preview_dir is not None]
-    return dirs
+def _publish_lock(site: Site) -> Path:
+    return lock_path(site.publish_dir, in_checkout=site.checkout)
+
+
+def _lock_files(sites: list[Site]) -> list[Path]:
+    files = [_publish_lock(s) for s in sites]
+    files += [lock_path(s.preview_dir) for s in sites if s.preview_dir is not None]
+    return files
 
 
 # ---- publish -------------------------------------------------------------------
@@ -829,8 +882,16 @@ def publish_batch(
     fetch: ManifestFetch = http_manifest_fetch,
     root: Path | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    pick: dict[SlotKey, str] | None = None,
+    manifest_extra: dict[SlotKey, dict[str, Any]] | None = None,
 ) -> PublishResult:
     """Gate and publish one batch.
+
+    ``pick`` (slot -> asset uid) is the caller's choice among the batch's
+    candidates; without it the lowest-index asset is published. A pick that
+    names no asset of the batch for a target slot fails completeness.
+    ``manifest_extra`` adds fields to a slot's manifest entry (``studio
+    compile`` records the slot spec's hash and its binding there).
 
     Raises :class:`ConfigError` for an unknown batch, :class:`JournalError`
     for an invalid leftover journal in a target site, and
@@ -841,9 +902,9 @@ def publish_batch(
     if conn.execute("SELECT 1 FROM batches WHERE id = ?", (batch_id,)).fetchone() is None:
         raise ConfigError(f"no batch '{batch_id}'")
     library = Library(conn)
-    selected = _select_slot_variants(library.batch_variants(batch_id))
+    selected = select_slot_variants(library.batch_variants(batch_id), pick)
     locked = [sites[s] for s in sorted({s for s, _ in selected}) if s in sites]
-    with site_locks(_lock_dirs(locked)):
+    with file_locks(_lock_files(locked)):
         _recover_locked(conn, locked, notifier, root)
         batch = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
         if batch["status"] not in PUBLISHABLE_STATUSES:
@@ -871,6 +932,7 @@ def publish_batch(
             fetch,
             root,
             Waiter.of(clock, sleep),
+            manifest_extra or {},
         )
 
 
@@ -878,13 +940,14 @@ def _publish_locked(
     conn: sqlite3.Connection,
     sites: dict[str, Site],
     batch: sqlite3.Row,
-    selected: dict[tuple[str, str], list[tuple[AssetRecord, VariantRecord]]],
+    selected: dict[SlotKey, list[tuple[AssetRecord, VariantRecord]]],
     notifier: Notifier,
     now: datetime,
     bridge: BridgeFactory,
     fetch: ManifestFetch,
     root: Path | None,
     waiter: Waiter,
+    manifest_extra: dict[SlotKey, dict[str, Any]],
 ) -> PublishResult:
     batch_id = batch["id"]
     result = PublishResult(batch_id=batch_id, published=False)
@@ -925,7 +988,7 @@ def _publish_locked(
                 )
                 continue
             result.gate_results += _slot_gates(site, slot_name, items)
-            live = _live_shas(conn, site_id, slot_name)
+            live = _owned_shas(conn, site, slot_name)
             dests = {site.publish_dir / f"{slot_name}{Path(v.path).suffix}" for _, v in items}
             prev_paths = {
                 Path(r["published_path"])
@@ -950,7 +1013,7 @@ def _publish_locked(
         if result.failures:
             return _refuse(conn, notifier, result, now, "pre-publication gates failed")
 
-        plans = _plan(selected, sites, batch_id, now_iso)
+        plans = _plan(selected, sites, batch_id, now_iso, manifest_extra)
         # ---- D7 on a preview bound to this batch, before anything live ------
         for plan in plans:
             overlay = {
@@ -1035,7 +1098,7 @@ def _swap_live(
                 manifest_before=manifest_path.read_bytes() if manifest_path.is_file() else None,
                 manifest_after=plan.manifest_bytes,
             )
-            live_shas = _live_shas(conn, site.id)
+            live_shas = _owned_shas(conn, site)
             to_move: set[Path] = set()
             for slot_name, rows in plan.slots.items():
                 for _, variant, dest in rows:
@@ -1407,7 +1470,7 @@ def unpublish_batch(
         if r["site"] in sites
     }
     locked = [sites[s] for s in sorted(site_ids)]
-    with site_locks(_lock_dirs(locked)):
+    with file_locks(_lock_files(locked)):
         _recover_locked(conn, locked, notifier, root)
         status = conn.execute("SELECT status FROM batches WHERE id = ?", (batch_id,)).fetchone()[
             "status"

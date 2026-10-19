@@ -1,0 +1,40 @@
+# refused-by: rule provenance.alt_text
+# A current binding of an `alt: required` slot that records no alt_text.
+slot: sessions.empty-state
+role: empty_state
+job: "Reassure a first-time operator that nothing is broken; point at 'Start a session'."
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 768, 1280, 1920]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 4/3
+  allowed: [1/1]
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.05, y: 0.2, width: 0.45, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+  lora: null
+content:
+  must:
+    - abstract terminal motif
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: forbidden
+alt:
+  kind: required
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: 2db94faf3fd15c9aafcc9f4be3f967c90f32185fb72ed7f483da80b3f4f644a7
+  spec_sha256: 7d6e64cf7bb84f1a765accd3adbe19b4771adc45fb50883d0c6cd73e9cee3174
+  source: supplied
+  ai_generated: false
+  exemplars_sha256: 70258cfa680863e17853e0073f62080d7de54036a91ec1bc463e896814ee8b13

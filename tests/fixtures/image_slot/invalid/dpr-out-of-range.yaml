@@ -1,0 +1,34 @@
+# refused-by: schema contexts.dpr[1]
+# A device pixel ratio above 8.
+slot: sessions.empty-state
+role: empty_state
+job: "Reassure a first-time operator that nothing is broken; point at 'Start a session'."
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 768, 1280, 1920]
+  themes: [dark]
+  dpr: [1, 10]
+aspect:
+  preferred: 4/3
+  allowed: [1/1]
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.05, y: 0.2, width: 0.45, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+  lora: null
+content:
+  must:
+    - abstract terminal motif
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: forbidden
+alt:
+  kind: decorative
+thresholds:
+  kind: from_visual_system

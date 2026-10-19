@@ -12,8 +12,12 @@ from ``brief run``, ``jobs run``, and ``launch build``/``launch run`` unless
 ``--no-generate``; or the image-generation off-switch (coord's
 ``image_generation`` dial, or ``QONTINUI_IMAGEGEN=0``): ``image_generation_off``,
 or ``image_generation_local_only`` when none of a brief's providers is the
-fleet's own image host, from ``brief run`` and ``jobs run``. A refused batch
-stays ``generating`` and resumes once the switch allows it.
+fleet's own image host, from ``brief run``, ``jobs run`` and ``compile``. A
+refused batch stays ``generating`` and resumes once the switch allows it.
+``compile`` adds: 7 work for the calling session (an SVG to author or redraw,
+an alt text to write, an unknown lucide icon); 8 a slot's state is UNKNOWN (an
+input — the imagery treatment, a LoRA, a recipe hash — could not be read, or a
+lucide icon could not be verified), never reported as fresh.
 """
 
 from __future__ import annotations
@@ -31,6 +35,11 @@ from qontinui_studio import postprocess
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.adapters.ui_bridge_wrapper import HandoffLatch
 from qontinui_studio.briefs import load_brief, validate_brief
+from qontinui_studio.compiler.evidence import render_markdown, slot_evidence
+from qontinui_studio.compiler.image_store import HttpImageStore
+from qontinui_studio.compiler.inputs import IMAGEGEN_DIR_ENV, ImagegenManifest, ImageryReader
+from qontinui_studio.compiler.run import AltText, CompileOptions, Readers, compile_slots
+from qontinui_studio.compiler.target import CompileTarget, load_targets
 from qontinui_studio.errors import (
     GatewayRefusal,
     ImageGenerationRefused,
@@ -109,6 +118,23 @@ def _refuse_on_gateway(ctx: Context, hint: str | None = None) -> None:
         if hint:
             click.echo(hint, err=True)
         sys.exit(6)
+
+
+def _refuse_compile_batch(ctx: Context, batch_id: str) -> None:
+    """A ``studio compile`` batch lives in a repository checkout: it is
+    published by ``studio compile`` into the checkout a run names, and
+    reversed by reverting that checkout's PR."""
+    row = ctx.conn.execute(
+        "SELECT compile_target FROM batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+    if row is not None and row["compile_target"] is not None:
+        click.echo(
+            f"refused: batch {batch_id} belongs to compile target '{row['compile_target']}'; "
+            "it is published only by `studio compile` into a checkout, and reversed by "
+            "reverting that checkout's PR",
+            err=True,
+        )
+        sys.exit(2)
 
 
 def _echo_policy_refusal(refusal: ImageGenerationRefused) -> None:
@@ -241,6 +267,7 @@ def jobs_run(obj: Obj, no_publish: bool) -> None:
 def publish_cmd(obj: Obj, batch_id: str) -> None:
     """Run the D5/D6/D7 gates over a generated batch and publish it if they pass."""
     ctx = _context(obj.root)
+    _refuse_compile_batch(ctx, batch_id)
     try:
         result = publish_batch(
             ctx.conn,
@@ -271,6 +298,7 @@ def publish_cmd(obj: Obj, batch_id: str) -> None:
 def unpublish_cmd(obj: Obj, batch_id: str) -> None:
     """Remove a batch's published files and manifest entries (one step)."""
     ctx = _context(obj.root)
+    _refuse_compile_batch(ctx, batch_id)
     try:
         removed = unpublish_batch(
             ctx.conn,
@@ -1078,6 +1106,232 @@ def pulse_schedule(
             click.echo(f"factory-pulse: {ps.uninstall(scheduler)}")
     except ps.ScheduleError as e:
         click.echo(f"factory-pulse: {e}", err=True)
+        sys.exit(e.code)
+
+
+# ---- the asset compile step (plan 2026-10-13 Phase 19) ---------------------------
+
+
+def _compile_target(obj: Obj, target_id: str | None) -> CompileTarget:
+    targets = load_targets(Workspace(obj.root).targets_dir, obj.root)
+    if target_id is not None:
+        if target_id not in targets:
+            raise click.UsageError(
+                f"no compile target '{target_id}' under {Workspace(obj.root).targets_dir} "
+                f"(known: {', '.join(sorted(targets)) or 'none'})"
+            )
+        return targets[target_id]
+    if len(targets) != 1:
+        raise click.UsageError(
+            f"name the target with --target ({', '.join(sorted(targets)) or 'none defined'})"
+        )
+    return next(iter(targets.values()))
+
+
+def _alt_texts(path: Path | None) -> dict[str, AltText]:
+    if path is None:
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise click.UsageError(f"--alt-texts {path}: {e}") from e
+    out: dict[str, AltText] = {}
+    if not isinstance(raw, dict):
+        raise click.UsageError("--alt-texts: expected {slot id: {asset_sha256, text}}")
+    for slot_id, entry in raw.items():
+        sha = entry.get("asset_sha256") if isinstance(entry, dict) else None
+        text = entry.get("text") if isinstance(entry, dict) else None
+        if not isinstance(sha, str) or not isinstance(text, str) or not text.strip():
+            raise click.UsageError(f"--alt-texts: '{slot_id}' needs asset_sha256 and a text")
+        out[str(slot_id)] = AltText(asset_sha256=sha, text=text.strip())
+    return out
+
+
+@main.command("compile")
+@click.option(
+    "--slots",
+    "slots_dir",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="<checkout>/<the target's slots_dir>, e.g. <worktree>/frontend/image-slots/.",
+)
+@click.option("--target", "target_id", default=None, help="Compile target id (targets/*.yaml).")
+@click.option(
+    "--changed",
+    is_flag=True,
+    help="Overnight re-render: only bindings left stale by a spec, recipe, imagery, "
+    "exemplar or LoRA change, as a bulk job.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Report what would compile; no provider call, no write."
+)
+@click.option("--slot", "only", multiple=True, help="Only this slot id (repeatable).")
+@click.option(
+    "--alt-texts",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help='JSON {"<slot id>": {"asset_sha256": "...", "text": "..."}} for alt: required slots.',
+)
+@click.option(
+    "--evidence",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Also write the PR evidence (markdown) here; never inside the checkout.",
+)
+@click.option(
+    "--imagegen-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    envvar=IMAGEGEN_DIR_ENV,
+    default=None,
+    help="A qontinui checkout's docker/imagegen (recipe hashes, LoRA digests).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
+@click.pass_obj
+def compile_cmd(
+    obj: Obj,
+    slots_dir: Path,
+    target_id: str | None,
+    changed: bool,
+    dry_run: bool,
+    only: tuple[str, ...],
+    alt_texts: Path | None,
+    evidence: Path | None,
+    imagegen_dir: Path | None,
+    as_json: bool,
+) -> None:
+    """Compile a checkout's image slots: generate, choose and write each slot
+    with no chosen asset (or a stale one) through the publish gates, into the
+    checkout. Runs no git or gh: commit the checkout and open the PR yourself,
+    with the evidence this writes as its body."""
+    target = _compile_target(obj, target_id)
+    ctx = _context(obj.root, generate=not dry_run)
+    options = CompileOptions(
+        slots_dir=slots_dir,
+        target=target,
+        changed_only=changed,
+        dry_run=dry_run,
+        only=frozenset(only) if only else None,
+        alt_texts=_alt_texts(alt_texts),
+    )
+    readers = Readers(
+        imagery=ImageryReader(),
+        imagegen=ImagegenManifest(imagegen_dir),
+        store=HttpImageStore(),
+    )
+    try:
+        report = compile_slots(ctx, options, readers)
+    except StudioError as e:
+        raise click.ClickException(str(e)) from e
+    state = Workspace(obj.root).compile_dir(target.id)
+    state.mkdir(parents=True, exist_ok=True)
+    body = render_markdown(report)
+    data = report.as_json()
+    for row, rep in zip(data["slots"], report.slots, strict=True):
+        row["evidence"] = slot_evidence(rep)
+    atomic_write(state / "evidence.md", body.encode("utf-8"))
+    atomic_write(state / "report.json", (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+    if evidence is not None:
+        checkout = Path(report.checkout).resolve()
+        if evidence.resolve().is_relative_to(checkout):
+            raise click.UsageError(
+                f"--evidence {evidence} is inside the checkout; the repository carries only "
+                "the derivatives and the manifest"
+            )
+        atomic_write(evidence, body.encode("utf-8"))
+    if as_json:
+        click.echo(json.dumps(data, indent=2))
+    else:
+        click.echo(f"compile {target.id} ({target.repo}) into {report.publish_dir}")
+        if report.imagegen:
+            click.echo(f"  image generation: {report.imagegen}")
+        if report.refusal:
+            click.echo(f"  refused: {report.refusal['code']}: {report.refusal['detail']}")
+        for s in report.slots:
+            click.echo(f"  {s.slot_id:40} {s.route or '-':10} {s.status}")
+            for reason in s.reasons:
+                click.echo(f"      {reason}")
+        click.echo(f"  report: {state / 'report.json'}")
+        click.echo(f"  evidence (PR body): {evidence or state / 'evidence.md'}")
+    sys.exit(report.exit_code())
+
+
+@main.command("compile-schedule")
+@click.option("--target", "target_id", default=None, help="Compile target id (targets/*.yaml).")
+@click.option("--install", "verb", flag_value="install", help="Upsert the task by name.")
+@click.option("--check", "verb", flag_value="check", help="Report the task and any drift.")
+@click.option("--uninstall", "verb", flag_value="uninstall", help="Delete every task of the name.")
+@click.option(
+    "--dry-run", "verb", flag_value="dry-run", help="Print the request bodies; no network."
+)
+@click.option("--at", "at", default="02:30", show_default=True, help="Local time, HH:MM, nightly.")
+@click.option("--disabled", is_flag=True, help="Register the task disabled.")
+@click.option(
+    "--workdir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="The studio checkout the task runs in (default: this repository's primary checkout).",
+)
+@click.option(
+    "--workspace-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Holds the repository checkouts and qontinui-claude-config (default: the "
+    "studio checkout's parent).",
+)
+@click.option("--runner", envvar="QONTINUI_RUNNER_URL", default=None, help="Runner base URL.")
+@click.pass_obj
+def compile_schedule(
+    obj: Obj,
+    target_id: str | None,
+    verb: str | None,
+    at: str,
+    disabled: bool,
+    workdir: Path | None,
+    workspace_root: Path | None,
+    runner: str | None,
+) -> None:
+    """Register the overnight `studio compile --changed` for one target in the
+    Qontinui runner's own scheduler (never an OS cron). Exit 0 done, 1 absent
+    (--check), 2 UNKNOWN, 3 conflict, 4 usage."""
+    from qontinui_studio import pulse_schedule as ps
+    from qontinui_studio.compiler import schedule as cs
+
+    try:
+        if verb is None:
+            raise ps.ScheduleError(
+                ps.EXIT_USAGE, "pass --install, --check, --uninstall or --dry-run"
+            )
+        target = _compile_target(obj, target_id)
+        cwd = (workdir or _primary_checkout()).resolve()
+        ws = (workspace_root or cwd.parent).resolve()
+        if verb in ("install", "dry-run") and not cs.allocator_present(ws):
+            raise ps.ScheduleError(
+                ps.EXIT_USAGE,
+                f"{ws} holds no {cs.ALLOCATE}; pass --workspace-root (the task's session "
+                "allocates its worktree with it)",
+            )
+        intended = cs.CompileTask(
+            target=target,
+            working_directory=str(cwd),
+            studio_root=str(obj.root),
+            workspace_root=str(ws),
+            cron=cs.nightly_cron(at),
+            enabled=not disabled,
+        )
+        if verb == "dry-run":
+            click.echo(cs.dry_run(intended))
+            return
+        scheduler = ps.RunnerScheduler(runner or ps.DEFAULT_RUNNER, name=intended.name)
+        if verb == "install":
+            click.echo(f"{intended.name}: {ps.install(scheduler, intended)}")
+        elif verb == "check":
+            code, text = ps.check(scheduler, intended)
+            click.echo(f"{intended.name}: {text}")
+            sys.exit(code)
+        else:
+            click.echo(f"{intended.name}: {ps.uninstall(scheduler)}")
+    except ps.ScheduleError as e:
+        click.echo(f"compile-schedule: {e}", err=True)
         sys.exit(e.code)
 
 
