@@ -7,6 +7,7 @@ an unanswered door is UNKNOWN, never a success."""
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import textwrap
 import time
@@ -42,6 +43,8 @@ from .test_pulse_schedule import FakeRunner
 
 WEB = "https://web.test"
 COORD = "https://coord.test"
+REPO = "qontinui/qontinui-web"
+OWNER = f"{COORD}/pr-merge/qontinui%2Fqontinui-web/0/author-session"
 
 
 def _jwt(exp: float) -> str:
@@ -74,8 +77,9 @@ def _png(tmp_path: Path, name: str = "c.png") -> Path:
 def test_an_upload_is_confirmed_only_by_an_answer_naming_its_hash(tmp_path: Path) -> None:
     img = _png(tmp_path)
     sha = sha256_file(img)
+    respx.get(OWNER).mock(return_value=httpx.Response(200, json={}))
     route = respx.post(f"{WEB}/api/v1/image-assets")
-    store = HttpImageStore(WEB, jwt_file=tmp_path / "none")
+    store = HttpImageStore(REPO, WEB, COORD, jwt_file=tmp_path / "none")
     route.mock(return_value=httpx.Response(201, json={"sha256": sha, "kind": "candidate"}))
     out = store.upload(img, "candidate", {"provider": {"id": "fake"}})
     assert (out.status, out.confirmed) == ("stored", True)
@@ -104,37 +108,99 @@ def test_an_upload_is_confirmed_only_by_an_answer_naming_its_hash(tmp_path: Path
     assert store.upload(img, "candidate", None).status == "unknown"
 
 
+def _tenant_jwt(tenant: str) -> str:
+    def part(d: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+
+    return f"{part({'alg': 'none'})}.{part({'exp': time.time() + 600, 'tenant_id': tenant})}.sig"
+
+
 @respx.mock
-def test_a_refused_credential_falls_through_and_none_left_is_unknown(
+def test_writes_go_only_to_the_tenant_proven_to_own_the_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     img = _png(tmp_path)
+    other, owner = _tenant_jwt("other-tenant"), _tenant_jwt("owner-tenant")
+    monkeypatch.setenv("COORD_DEVICE_JWT", other)
     jwt_file = tmp_path / "jwt"
-    live = _jwt(time.time() + 600)
-    jwt_file.write_text(live)
-    seen: list[str] = []
+    jwt_file.write_text(owner)
+    probed: list[str] = []
 
-    def answer(request: httpx.Request) -> httpx.Response:
-        seen.append(request.headers["Authorization"])
-        if request.headers["Authorization"] == f"Bearer {TOKEN}":
-            return httpx.Response(401)
-        return httpx.Response(201, json={"sha256": sha256_file(img)})
+    def probe(request: httpx.Request) -> httpx.Response:
+        probed.append(request.headers["Authorization"])
+        return httpx.Response(200 if request.headers["Authorization"] == f"Bearer {owner}" else 404)
 
-    respx.post(f"{WEB}/api/v1/image-assets").mock(side_effect=answer)
-    store = HttpImageStore(WEB, jwt_file=jwt_file)
+    respx.get(OWNER).mock(side_effect=probe)
+    upload = respx.post(f"{WEB}/api/v1/image-assets").mock(
+        return_value=httpx.Response(201, json={"sha256": sha256_file(img)})
+    )
+    store = HttpImageStore(REPO, WEB, COORD, jwt_file=jwt_file)
     assert store.upload(img, "candidate", None).status == "stored"
-    assert seen == [f"Bearer {TOKEN}", f"Bearer {live}"]
+    assert store.upload(img, "candidate", None).status == "stored"
+    # The other tenant was refuted by the probe and never wrote; the proof ran once.
+    assert probed == [f"Bearer {other}", f"Bearer {owner}"]
+    assert {c.request.headers["Authorization"] for c in upload.calls} == {f"Bearer {owner}"}
+    # The proven credential is the only one a write may use: refused there is
+    # UNKNOWN, never a fall-through to an unproven credential.
+    upload.mock(return_value=httpx.Response(401))
+    assert store.upload(img, "candidate", None).status == "unknown"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("answer", "why"),
+    [
+        (httpx.Response(404), "no credential is proven"),
+        (httpx.Response(500), "UNKNOWN"),
+        (httpx.ConnectError("refused"), "UNKNOWN"),
+    ],
+)
+def test_an_unproven_owner_gets_no_write(answer: object, why: str, tmp_path: Path) -> None:
+    img = _png(tmp_path)
+    route = respx.get(OWNER)
+    if isinstance(answer, Exception):
+        route.mock(side_effect=answer)
+    else:
+        route.mock(return_value=answer)
+    upload = respx.post(f"{WEB}/api/v1/image-assets")
+    store = HttpImageStore(REPO, WEB, COORD, jwt_file=tmp_path / "none")
+    out = store.upload(img, "candidate", None)
+    assert out.status == "refused" and why in out.detail
+    out = store.propose(
+        repo=REPO, slot_id="a", asset_sha256="1" * 64, status="chosen", recipe_hash=None, judge={}
+    )
+    assert out.status == "refused" and upload.call_count == 0
+
+
+@respx.mock
+def test_no_token_goes_to_a_door_that_is_neither_https_nor_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    img = _png(tmp_path)
+    probe = respx.get(url__regex=r".*author-session").mock(return_value=httpx.Response(200))
+    monkeypatch.setenv("STUDIO_WEB_URL", "http://web.example")
+    out = HttpImageStore(REPO, coord_url=COORD, jwt_file=tmp_path / "none").upload(
+        img, "candidate", None
+    )
+    assert out.status == "refused" and "neither https nor loopback" in out.detail
+    out = HttpImageStore(REPO, WEB, "http://coord.example", jwt_file=tmp_path / "none").upload(
+        img, "candidate", None
+    )
+    assert out.status == "refused" and "neither https nor loopback" in out.detail
+    assert probe.call_count == 0
     monkeypatch.delenv("COORD_DEVICE_JWT")
-    jwt_file.unlink()
-    out = HttpImageStore(WEB, jwt_file=jwt_file).upload(img, "candidate", None)
-    # The runner mint is offered to the production web API only.
-    assert out.status == "unknown" and "not the production web API" in out.detail
+    out = HttpImageStore(REPO, WEB, COORD, jwt_file=tmp_path / "none").upload(
+        img, "candidate", None
+    )
+    # The runner mint is offered to production only.
+    assert out.status == "refused" and "not the production web API" in out.detail
 
 
 @respx.mock
 def test_a_proposal_is_confirmed_by_its_read_back(tmp_path: Path) -> None:
+    respx.get(OWNER).mock(return_value=httpx.Response(200, json={}))
     route = respx.put(f"{WEB}/api/v1/image-assets/slot-candidates")
-    store = HttpImageStore(WEB, jwt_file=tmp_path / "none")
+    store = HttpImageStore(REPO, WEB, COORD, jwt_file=tmp_path / "none")
     kw: dict[str, object] = {
         "repo": "qontinui/qontinui-web",
         "slot_id": "a.b",
@@ -251,6 +317,19 @@ def test_the_imagery_digest_is_the_named_sections_sha256(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     ("response", "why"),
     [
+        (httpx.Response(200, json={"body": BODY, "unedited_seed": True}), "unedited skeleton"),
+        (
+            httpx.Response(
+                200, json={"body": BODY, "default_source": "seed", "current_version": 1}
+            ),
+            "unedited skeleton",
+        ),
+        (
+            httpx.Response(
+                200, json={"body": BODY, "default_source": "seed", "current_version": 2}
+            ),
+            "UNKNOWN",
+        ),
         (httpx.Response(404), "no such document"),
         (httpx.Response(500), "HTTP 500"),
         (httpx.Response(200, json={"body": BODY, "withdrawn": True}), "withdrawn"),
@@ -329,12 +408,10 @@ def test_a_lora_digest_is_its_one_weights_file(tmp_path: Path) -> None:
     assert "not in the image licence manifest" in m.lora("absent").source
 
 
-def test_an_exemplar_set_digest_follows_its_membership(tmp_path: Path) -> None:
+def test_an_unseen_exemplar_set_is_unknown_not_empty(tmp_path: Path) -> None:
     conn = connect(tmp_path / "s.db")
-    lib = Library(conn)
-    empty = exemplar_digest(lib, "console-empty-states")
-    assert empty.value is not None and "0 member" in empty.source
-    assert exemplar_digest(lib, "console-empty-states") == empty  # deterministic
+    unseen = exemplar_digest(Library(conn), "console-empty-states")
+    assert unseen.value is None and "no member" in unseen.source
 
 
 # ---- the overnight task ----------------------------------------------------------
@@ -362,11 +439,22 @@ def test_the_task_runs_changed_in_an_allocated_worktree_and_studio_runs_no_git(
     prompt = body["task"]["prompt"]
     assert "/work/qontinui-claude-config/scripts/allocate-worktree.sh" in prompt
     assert "--repo qontinui-web" in prompt
-    assert "compile --target web --slots <W>/frontend/image-slots --changed --json" in prompt
+    assert (
+        "compile --target web --slots <W>/frontend/image-slots --changed "
+        "--imagegen-dir <Q>/docker/imagegen --json" in prompt
+    )
+    # The recipe and LoRA axes are read from a qontinui worktree at origin/main,
+    # allocated beside W and handed back at the end.
+    assert "--repo qontinui " in prompt and "--done --path <Q> --abandon" in prompt
     assert "gh pr create" in prompt and "--body-file" in prompt
     assert "Never merge" in prompt and "--done --path <W> --abandon" in prompt
     assert body["schedule"] == {"type": "Cron", "value": "30 2 * * *"}
     assert cs.nightly_cron("01:05") == "5 1 * * *"
+    # A pinned manifest allocates nothing for it.
+    pinned = dataclasses.replace(task, imagegen_dir="/pinned/docker/imagegen").prompt()
+    assert "--imagegen-dir /pinned/docker/imagegen --json" in pinned
+    assert "--repo qontinui-web" in pinned and "--repo qontinui " not in pinned
+    assert "<Q>" not in pinned
 
 
 def test_the_task_installs_by_name_and_reports_drift(tmp_path: Path) -> None:
@@ -456,11 +544,26 @@ def test_a_trace_is_marked_in_its_metadata_and_only_there(tmp_path: Path) -> Non
         marker.mark_svg("<html/>")
 
 
-def test_a_checkout_lock_lives_outside_the_checkout(tmp_path: Path) -> None:
+def test_a_checkout_lock_lives_in_a_per_user_dir_outside_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import stat
+    import tempfile
+
+    runtime = tmp_path / "run-user"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     assert lock_path(tmp_path) == tmp_path / LOCK_NAME
     outside = lock_path(tmp_path, in_checkout=True)
-    assert not outside.is_relative_to(tmp_path)
+    assert outside.parent == runtime / "qontinui-studio-locks"
+    assert stat.S_IMODE(os.stat(outside.parent).st_mode) == 0o700
     assert lock_path(tmp_path, in_checkout=True) == outside  # stable per directory
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    fallback = lock_path(tmp_path / "x", in_checkout=True)
+    assert fallback.is_relative_to(tmp_path / "home" / ".cache")
+    assert not fallback.is_relative_to(Path(tempfile.gettempdir()) / "qontinui-studio-locks")
 
 
 def test_the_shipped_targets_load() -> None:

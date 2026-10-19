@@ -19,7 +19,7 @@ from qontinui_studio import marker
 from qontinui_studio.adapters.fake import FakeImageAdapter
 from qontinui_studio.compiler.evidence import render_markdown
 from qontinui_studio.compiler.inputs import Digest
-from qontinui_studio.compiler.run import PICK_UNJUDGED, AltText
+from qontinui_studio.compiler.run import PICK_UNJUDGED, AltText, lucide_selection_sha256
 from qontinui_studio.compiler.specs import load_spec
 from qontinui_studio.errors import ConfigError, ProviderDeferred
 from qontinui_studio.imagegen_policy import DialReading, ImagegenPolicy
@@ -67,17 +67,17 @@ def test_a_missing_slot_compiles_into_the_checkout(env: CompileEnv) -> None:
     assert slot.status == "compiled", slot.reasons
     assert report.exit_code() == 0 and report.files_written
 
-    # Derivatives: AVIF + WebP + a PNG fallback, every
+    # Derivatives: AVIF + WebP + a JPEG fallback (a photographic role), every
     # one carrying the IPTC trainedAlgorithmicMedia marker.
     files = {p.name for p in env.publish_dir.iterdir()}
-    assert {f"{HERO_FILE}.avif", f"{HERO_FILE}.webp", f"{HERO_FILE}.png"} <= files
-    for ext in ("avif", "webp", "png"):
+    assert {f"{HERO_FILE}.avif", f"{HERO_FILE}.webp", f"{HERO_FILE}.jpg"} <= files
+    for ext in ("avif", "webp", "jpg"):
         assert marker.is_marked(env.publish_dir / f"{HERO_FILE}.{ext}"), ext
     # The checkout carries nothing else: no lock, journal or staging debris.
     assert files == {
         f"{HERO_FILE}.avif",
         f"{HERO_FILE}.webp",
-        f"{HERO_FILE}.png",
+        f"{HERO_FILE}.jpg",
         "studio-manifest.json",
     }
     assert not (env.publish_dir / LOCK_NAME).exists()
@@ -90,7 +90,7 @@ def test_a_missing_slot_compiles_into_the_checkout(env: CompileEnv) -> None:
     assert entry["slot_id"] == HERO and entry["slot_spec_sha256"] == spec.sha256
     assert entry["ai_generated"] is True
     assert entry["digital_source_type"] == marker.DIGITAL_SOURCE_TYPE
-    assert set(entry["provenance"]) == {"avif", "webp", "png"}
+    assert set(entry["provenance"]) == {"avif", "webp", "jpeg"}
     binding = entry["binding"]
     assert binding["spec_sha256"] == spec.sha256
     assert binding["source"] == "generated" and binding["ai_generated"] is True
@@ -309,10 +309,8 @@ def test_a_traced_slot_lands_as_a_marked_svg(env: CompileEnv) -> None:
     assert (root.get("width"), root.get("height")) == ("320", "240")
     assert {p.name for p in env.publish_dir.iterdir()} == {
         "sessions.empty-state.svg",
-        "sessions.empty-state.png",
         "studio-manifest.json",
     }
-    assert marker.is_marked(env.publish_dir / "sessions.empty-state.png")
 
 
 def test_an_og_card_is_one_png_checked_by_fetch(env: CompileEnv) -> None:
@@ -344,7 +342,30 @@ def test_a_lucide_slot_names_its_component_and_writes_nothing(env: CompileEnv) -
         "component": "CircleUser",
         "detail": "lucide-react 0.562.0",
     }
-    assert not env.publish_dir.exists() and batches(env.context()) == []
+    assert batches(env.context()) == []
+    # The manifest-only entry the web <SlotImage> renders the component from:
+    # no image file, a binding that addresses the selection.
+    manifest = json.loads((env.publish_dir / "studio-manifest.json").read_text())
+    entry = manifest["slots"]["sessions.avatar"]
+    assert entry == {
+        "route": "lucide",
+        "slot_id": "sessions.avatar",
+        "slot_spec_sha256": slot.spec_sha256,
+        "lucide": {"package": "lucide-react", "icon": "circle-user", "component": "CircleUser"},
+        "files": {},
+        "sha256": {},
+        "ai_generated": False,
+        "binding": {
+            "asset_sha256": lucide_selection_sha256("circle-user"),
+            "spec_sha256": slot.spec_sha256,
+            "source": "selected",
+            "ai_generated": False,
+        },
+    }
+    assert {p.name for p in env.publish_dir.iterdir()} == {"studio-manifest.json"}
+    assert report.files_written and slot.manifest_written
+    again = env.run()
+    assert again.slots[0].status == "selected" and not again.files_written  # current: no rewrite
     env.write_target("slots:\n  sessions.avatar: {icon: no-such-icon}\n")
     assert [s.status for s in env.run().slots] == ["icon_unknown"]
 
@@ -451,6 +472,38 @@ def test_a_batch_published_into_another_checkout_is_rehomed_not_regenerated(
     assert second.slots[0].batch_id == first.slots[0].batch_id
     assert submitted(env.context()) == calls
     assert (other / "frontend" / "public" / "image-slots" / f"{HERO_FILE}.avif").is_file()
+    # The first checkout keeps its files: publishing into one never touches another.
+    assert (env.publish_dir / f"{HERO_FILE}.avif").is_file()
+
+
+def _snapshot(publish_dir: Path) -> dict[str, str]:
+    return {p.name: sha256_file(p) for p in sorted(publish_dir.iterdir())}
+
+
+def test_compiling_into_one_worktree_never_touches_another(env: CompileEnv, tmp_path: Path) -> None:
+    """Two worktrees of one repository share the target's site id: a compile
+    into B must not move, delete or supersede what A holds."""
+    env.write_spec(HERO)
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    before = _snapshot(env.publish_dir)
+    other = make_checkout(tmp_path / "checkout2")
+    (other / "frontend" / "image-slots" / f"{HERO}.yaml").write_text(
+        (env.slots_dir / f"{HERO}.yaml").read_text().replace("calm automation", "quiet automation")
+    )
+    second = env.run(checkout=other)
+    assert [s.status for s in second.slots] == ["compiled"]
+    assert _snapshot(env.publish_dir) == before  # A untouched, byte for byte
+    assert (other / "frontend" / "public" / "image-slots" / f"{HERO_FILE}.avif").is_file()
+    live = {
+        Path(r["published_path"]).parent
+        for r in env.context().conn.execute(
+            "SELECT published_path FROM publications WHERE unpublished_at IS NULL"
+        )
+    }
+    # A's publications stay live (A still holds them), beside B's.
+    assert live == {env.publish_dir, other / "frontend" / "public" / "image-slots"}
+    # And A, compiled again, is still fresh.
+    assert [s.status for s in env.run().slots] == ["fresh"]
 
 
 def test_a_slot_another_studio_published_is_replaced_but_a_hand_placed_file_is_not(
@@ -476,11 +529,20 @@ def test_a_slot_another_studio_published_is_replaced_but_a_hand_placed_file_is_n
 # ---- configuration -----------------------------------------------------------------
 
 
-def test_compile_writes_only_into_a_checkout(env: CompileEnv, tmp_path: Path) -> None:
+def test_compile_writes_only_into_a_linked_worktree(env: CompileEnv, tmp_path: Path) -> None:
     env.write_spec(HERO)
     (env.checkout / ".git").unlink()
-    with pytest.raises(ConfigError, match="not a git checkout"):
+    with pytest.raises(ConfigError, match="not a linked git worktree"):
         env.run()
+    # A primary checkout (its .git a directory) is shared: refused.
+    (env.checkout / ".git").mkdir()
+    with pytest.raises(ConfigError, match="primary checkout"):
+        env.run()
+    (env.checkout / ".git").rmdir()
+    (env.checkout / ".git").write_text("gitdir: /somewhere/.git\n")  # not a worktree's git dir
+    with pytest.raises(ConfigError, match="not a linked git worktree"):
+        env.run()
+    assert not env.publish_dir.exists()
 
 
 def test_the_slots_path_must_end_with_the_targets_slots_dir(
@@ -534,7 +596,7 @@ def test_the_cli_writes_report_and_evidence_and_refuses_publish_of_a_compile_bat
         return ctx
 
     monkeypatch.setattr(cli, "_context", context)
-    monkeypatch.setattr(cli, "HttpImageStore", lambda: env.store)
+    monkeypatch.setattr(cli, "HttpImageStore", lambda repo: env.store)
     monkeypatch.setattr(cli, "ImageryReader", lambda: env.imagery_reader)
     out = tmp_path / "evidence.md"
     result = CliRunner().invoke(
@@ -735,7 +797,8 @@ def test_a_site_file_may_not_claim_to_be_a_checkout(studio_root: Path) -> None:
 
 # ---- the consumer's reader: qontinui-web <SlotImage> (Phase 14) -------------------
 
-WEB_FORMATS = ("png", "jpg", "webp", "avif")  # frontend/src/lib/image-slots/manifest.ts
+# The formats qontinui-web's <SlotImage> serves (frontend/src/lib/image-slots/manifest.ts).
+WEB_FORMATS = ("png", "jpeg", "webp", "avif", "svg")
 
 
 def web_resolve(manifest: dict[str, object], slot: str) -> list[str]:
@@ -766,17 +829,207 @@ def test_the_web_slot_reader_serves_what_compile_writes(env: CompileEnv) -> None
     assert manifest["generated_by"] == "qontinui-studio"
     entry = manifest["slots"]["runs.active.idle"]
     assert entry["ai_generated"] is True
-    assert entry["files"] == {"png": "runs.active.idle.png", "svg": "runs.active.idle.svg"}
-    assert web_resolve(manifest, "runs.active.idle") == ["runs.active.idle.png"]
+    assert entry["files"] == {"svg": "runs.active.idle.svg"}
+    assert web_resolve(manifest, "runs.active.idle") == ["runs.active.idle.svg"]
     for name in entry["files"].values():
         assert (env.publish_dir / name).is_file()
         assert marker.is_marked(env.publish_dir / name)
-    # A diffusion slot: every published format but the SVG trace is servable.
+    # A diffusion slot: every published format is servable.
     env.write_spec("runs.active.hero", "hero")
     env.run(only={"runs.active.hero"})
     manifest = json.loads((env.publish_dir / "studio-manifest.json").read_text())
     assert web_resolve(manifest, "runs.active.hero") == [
-        "runs.active.hero.png",
+        "runs.active.hero.jpg",
         "runs.active.hero.webp",
         "runs.active.hero.avif",
     ]
+
+
+# ---- review round 2: input axes, orphans, unreadable bindings, file bytes ----------
+
+
+def test_an_exemplar_set_change_makes_the_binding_stale(env: CompileEnv) -> None:
+    from datetime import date
+
+    from qontinui_studio.library import Library
+
+    # The set needs a member here before any slot naming it can be bound.
+    env.write_spec("marketing.home.closing")
+    env.run()
+    lib = Library(env.context().conn)
+    first, second = lib.assets()[:2]
+    lib.tag(first.uid, "hero-set", "operator", date(2026, 10, 19))
+    env.write_spec(HERO, exemplars="hero-set")
+    report = env.run(only={HERO})
+    assert [s.status for s in report.slots] == ["compiled"], report.slots[0].reasons
+    assert env.run(dry_run=True, only={HERO}).slots[0].status == "fresh"
+    lib.tag(second.uid, "hero-set", "operator", date(2026, 10, 19))
+    plan = env.run(dry_run=True, only={HERO})
+    assert plan.slots[0].status == "planned"
+    assert any(r.startswith("exemplar set changed") for r in plan.slots[0].reasons)
+
+
+def test_an_unseen_exemplar_set_generates_nothing(env: CompileEnv) -> None:
+    env.write_spec(HERO, exemplars="never-seen")
+    report = env.run()
+    assert [s.status for s in report.slots] == ["unknown"]
+    assert any("exemplars: UNKNOWN" in r for r in report.slots[0].reasons)
+    assert batches(env.context()) == []
+
+
+def test_an_orphan_entry_and_its_files_go_in_the_same_compile(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.write_spec("marketing.home.closing")
+    env.run()
+    (env.slots_dir / "marketing.home.closing.yaml").unlink()
+    hand = env.publish_dir / "notes.txt"
+    hand.write_text("someone's own file")
+    plan = env.run(dry_run=True)
+    assert plan.orphans == ["marketing.home.closing"] and plan.retired == []
+    report = env.run()
+    assert report.orphans == ["marketing.home.closing"] and report.files_written
+    manifest = json.loads((env.publish_dir / "studio-manifest.json").read_text())
+    assert set(manifest["slots"]) == {HERO_FILE}
+    assert not any(p.name.startswith("marketing.home.closing") for p in env.publish_dir.iterdir())
+    assert hand.is_file()  # never a file the manifest did not name
+    assert env.run().orphans == []
+
+
+def test_an_orphan_file_with_other_bytes_is_kept(env: CompileEnv) -> None:
+    env.write_spec("marketing.home.closing")
+    env.write_spec(HERO)
+    env.run()
+    (env.slots_dir / "marketing.home.closing.yaml").unlink()
+    edited = env.publish_dir / "marketing.home.closing.webp"
+    edited.write_bytes(b"hand-edited")
+    report = env.run()
+    assert edited.read_bytes() == b"hand-edited"
+    assert any("marketing.home.closing.webp" in k for k in report.kept)
+
+
+def test_a_lucide_selection_replaces_a_slots_files(env: CompileEnv) -> None:
+    env.write_spec("sessions.avatar", "avatar_fallback", aspect="1/1")
+    env.write_target("slots:\n  sessions.avatar: {route: diffusion}\n")
+    env.run()
+    assert (env.publish_dir / "sessions.avatar.webp").is_file()
+    icons = env.checkout / "frontend" / "node_modules" / "lucide-react" / "dist" / "esm" / "icons"
+    icons.mkdir(parents=True)
+    (icons.parent.parent.parent / "package.json").write_text('{"version": "0.562.0"}')
+    (icons / "circle-user.js").write_text("export {}")
+    env.write_target("slots:\n  sessions.avatar: {icon: circle-user}\n")
+    report = env.run()
+    assert report.slots[0].status == "selected" and report.files_written
+    assert {p.name for p in env.publish_dir.iterdir()} == {"studio-manifest.json"}
+
+
+def test_an_unreadable_binding_is_unknown_not_rerendered(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.run()
+    path = env.publish_dir / "studio-manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["slots"][HERO_FILE]["binding"] = {"asset_sha256": "short"}
+    path.write_text(json.dumps(manifest))
+    count = len(batches(env.context()))
+    report = env.run()
+    assert [s.status for s in report.slots] == ["unknown"] and report.exit_code() == 8
+    assert len(batches(env.context())) == count
+
+
+def test_a_file_that_is_not_the_manifests_bytes_is_never_overwritten(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.run()
+    # A file gone: the slot is missing and compiled again.
+    (env.publish_dir / f"{HERO_FILE}.webp").unlink()
+    plan = env.run(dry_run=True)
+    assert plan.slots[0].status == "planned"
+    assert any("absent or not the bytes" in r for r in plan.slots[0].reasons)
+    # A file holding other bytes: recompiled, but the foreign bytes stay.
+    (env.publish_dir / f"{HERO_FILE}.webp").write_bytes(b"other bytes")
+    report = env.run()
+    assert report.slots[0].status == "refused"
+    assert (env.publish_dir / f"{HERO_FILE}.webp").read_bytes() == b"other bytes"
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_lora_change_makes_the_binding_stale(env: CompileEnv, imagegen_dir: Path) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    _facade(env, weights=[LORA, "9" * 64])
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO, lora="qontinui-house-v1")
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    assert env.run(dry_run=True).slots[0].status == "fresh"
+    manifest = imagegen_dir / "manifest.yaml"
+    manifest.write_text(manifest.read_text().replace(LORA, "e" * 64))
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    plan = env.run(dry_run=True)
+    assert plan.slots[0].status == "planned"
+    assert any(r.startswith("LoRA changed") for r in plan.slots[0].reasons)
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_an_unknown_recipe_alone_is_unknown_never_fresh(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    _facade(env, weights=["9" * 64])
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)  # no LoRA, no exemplar set: the recipe is the only facade axis
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    env.imagegen = ImagegenManifest(Path("/nonexistent"))
+    report = env.run(dry_run=True)
+    [slot] = report.slots
+    assert slot.status == "unknown" and report.exit_code() == 8
+    assert [r for r in slot.reasons if "UNKNOWN" in r] == [
+        r for r in slot.reasons if r.startswith("recipe: UNKNOWN")
+    ]
+
+
+# ---- the authored-SVG validator: nothing hides in <metadata> ----------------------
+
+BYPASSES = {
+    "a drawing inside metadata": '<metadata>{x}<path d="M0 0" fill="#ff0000"/></metadata>',
+    "a foreign element inside the packet": "<metadata>{xs}</metadata>",
+    "a second metadata": "<metadata>{x}</metadata><metadata>{x}</metadata>",
+    "metadata off the root": "<g><metadata>{x}</metadata></g><metadata>{x}</metadata>",
+    "text inside metadata": "<metadata>loose text{x}</metadata>",
+    "an attribute on the packet's description": "<metadata>{xa}</metadata>",
+}
+
+
+@pytest.mark.parametrize("name", sorted(BYPASSES))
+def test_a_metadata_bypass_is_refused(env: CompileEnv, name: str) -> None:
+    from qontinui_studio.compiler.selected import _xmpmeta
+
+    env.write_spec("onboarding.connect", "onboarding", aspect="4/3")
+    env.write_target("slots:\n  onboarding.connect: {route: svg}\n")
+    spec_hash = env.run().slots[0].spec_sha256
+    x = _xmpmeta()
+    payload = BYPASSES[name].format(
+        x=x,
+        xs=x.replace(
+            "</rdf:RDF>",
+            '<rdf:Description rdf:about=""><foreignObject/></rdf:Description></rdf:RDF>',
+        ),
+        xa=x.replace('rdf:about=""', 'rdf:about="" onload="x"'),
+    )
+    svg = SVG_OK.format(h=spec_hash, x=x).replace(f"<metadata>{x}</metadata>", payload)
+    (env.slots_dir / "onboarding.connect.svg").write_text(svg)
+    assert env.run().slots[0].status == "authored_invalid", name
+
+
+def test_a_processing_instruction_is_refused(env: CompileEnv) -> None:
+    from qontinui_studio.compiler.selected import _xmpmeta
+
+    env.write_spec("onboarding.connect", "onboarding", aspect="4/3")
+    env.write_target("slots:\n  onboarding.connect: {route: svg}\n")
+    spec_hash = env.run().slots[0].spec_sha256
+    ok = SVG_OK.format(h=spec_hash, x=_xmpmeta())
+    path = env.slots_dir / "onboarding.connect.svg"
+    path.write_text('<?xml version="1.0"?>\n' + ok)  # a declaration is not a PI
+    assert env.run().slots[0].status == "authored"
+    path.write_text('<?xml-stylesheet href="s.css"?>\n' + ok)
+    bad = env.run().slots[0]
+    assert bad.status == "authored_invalid"
+    assert any("processing instruction" in r for r in bad.reasons)

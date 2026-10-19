@@ -242,3 +242,40 @@ def test_strings_keys_and_structure() -> None:
 def test_what_rfc_8785_cannot_carry_is_refused(bad: object) -> None:
     with pytest.raises(CanonicalizationError):
         canonicalize({"v": bad})
+
+
+def test_duplicate_and_merge_keys_are_refused(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid" / "sessions.empty-state.yaml").read_text()
+    dup = tmp_path / "sessions.empty-state.yaml"
+    dup.write_text(text + "role: hero\n")  # PyYAML alone keeps the last silently
+    with pytest.raises(ConfigError, match="given twice"):
+        load_spec(dup)
+    merged = tmp_path / "m" / "sessions.empty-state.yaml"
+    merged.parent.mkdir()
+    merged.write_text(
+        text.replace("focal:\n", "base: &b {must_survive_crop: true}\nfocal:\n  <<: *b\n", 1)
+    )
+    with pytest.raises(ConfigError, match="merge key"):
+        load_spec(merged)
+
+
+def test_content_keys_trim_as_rust_does() -> None:
+    from qontinui_studio.compiler.specs import rust_trim
+
+    assert rust_trim("\u3000 a \u2028") == "a"
+    # U+001F is whitespace to Python's str.strip(), not to Rust's str::trim.
+    assert rust_trim("\x1fa\x1f") == "\x1fa\x1f" and "\x1fa\x1f".strip() == "a"
+
+
+def test_breakpoints_and_dprs_must_ascend(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid" / "sessions.empty-state.yaml").read_text()
+    for field, before, after, why in (
+        ("bp", "[360, 768, 1280, 1920]", "[360, 1280, 768, 1920]", "contexts.breakpoints"),
+        ("bp-eq", "[360, 768, 1280, 1920]", "[360, 768, 768, 1920]", "contexts.breakpoints"),
+        ("dpr", "dpr: [1, 2]", "dpr: [2, 1]", "contexts.dpr"),
+    ):
+        path = tmp_path / field / "sessions.empty-state.yaml"
+        path.parent.mkdir()
+        path.write_text(text.replace(before, after, 1))
+        with pytest.raises(ConfigError, match=f"{why}: not strictly ascending"):
+            load_spec(path)

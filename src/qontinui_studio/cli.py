@@ -1216,7 +1216,7 @@ def compile_cmd(
     readers = Readers(
         imagery=ImageryReader(),
         imagegen=ImagegenManifest(imagegen_dir),
-        store=HttpImageStore(),
+        store=HttpImageStore(target.repo),
     )
     try:
         report = compile_slots(ctx, options, readers)
@@ -1278,6 +1278,13 @@ def compile_cmd(
     help="Holds the repository checkouts and qontinui-claude-config (default: the "
     "studio checkout's parent).",
 )
+@click.option(
+    "--imagegen-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Pin the image licence manifest (a qontinui checkout's docker/imagegen). Default: the "
+    "task's session allocates a qontinui worktree at origin/main each run.",
+)
 @click.option("--runner", envvar="QONTINUI_RUNNER_URL", default=None, help="Runner base URL.")
 @click.pass_obj
 def compile_schedule(
@@ -1288,6 +1295,7 @@ def compile_schedule(
     disabled: bool,
     workdir: Path | None,
     workspace_root: Path | None,
+    imagegen_dir: Path | None,
     runner: str | None,
 ) -> None:
     """Register the overnight `studio compile --changed` for one target in the
@@ -1317,7 +1325,12 @@ def compile_schedule(
             workspace_root=str(ws),
             cron=cs.nightly_cron(at),
             enabled=not disabled,
+            imagegen_dir=str(imagegen_dir.resolve()) if imagegen_dir is not None else None,
         )
+        if imagegen_dir is not None and not (imagegen_dir / "manifest.yaml").is_file():
+            raise ps.ScheduleError(
+                ps.EXIT_USAGE, f"--imagegen-dir {imagegen_dir} holds no manifest.yaml"
+            )
         if verb == "dry-run":
             click.echo(cs.dry_run(intended))
             return

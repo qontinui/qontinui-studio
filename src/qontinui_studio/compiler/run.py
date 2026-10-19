@@ -52,6 +52,7 @@ from qontinui_studio.briefs import load_brief, validate_brief
 from qontinui_studio.compiler import selected
 from qontinui_studio.compiler.image_store import CandidateStatus, ImageStore, StoreOutcome
 from qontinui_studio.compiler.inputs import Digest, ImagegenManifest, exemplar_digest
+from qontinui_studio.compiler.jcs import canonical_sha256
 from qontinui_studio.compiler.recipe import FACADE_ADAPTER, compile_recipe_sha256, prompt_for
 from qontinui_studio.compiler.specs import LoadedSpec, binding_problems, brief_slug, load_specs
 from qontinui_studio.compiler.target import (
@@ -64,10 +65,12 @@ from qontinui_studio.library import AssetRecord, Library, VariantRecord
 from qontinui_studio.notify import Delivery, FileNotifier, Notice
 from qontinui_studio.pipeline import Context, drive_batch, new_batch, policy_adapters
 from qontinui_studio.postprocess import sha256_file
-from qontinui_studio.publish import MANIFEST, lowest_index_pick, publish_batch
+from qontinui_studio.publish import MANIFEST, lowest_index_pick, publish_batch, update_entries
 from qontinui_studio.sites import Site, Slot, check_cross_site
 
 PICK_UNJUDGED = "unjudged (Phase 20 not landed)"
+# The site slot of a spec no image file is published for: a manifest key only.
+MANIFEST_ONLY_SLOT = Slot(width=1, height=1, category="decorative", formats=["png"], rendered=False)
 RESUMABLE = ("generating", "generated", "refused")
 
 SlotStatus = Literal[
@@ -125,6 +128,8 @@ class SlotReport:
     inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     lucide: dict[str, str] | None = None
     authoring: dict[str, Any] | None = None
+    # True when this run wrote the slot's manifest-only entry (a lucide pick).
+    manifest_written: bool = False
     # The spec's render contexts (breakpoints x themes x dpr): the cells the
     # PR evidence's before/after covers.
     contexts: dict[str, list[Any]] = field(default_factory=dict)
@@ -148,10 +153,15 @@ class CompileReport:
     # Manifest entries (site slot names) no spec declares any more: their files
     # stay until a session removes them with the spec's removal.
     orphans: list[str] = field(default_factory=list)
+    # What this run removed for them: the entries and the files.
+    retired: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)
 
     @property
     def files_written(self) -> bool:
-        return any(s.status == "compiled" for s in self.slots)
+        return any(s.status == "compiled" or s.manifest_written for s in self.slots) or bool(
+            self.retired
+        )
 
     def exit_code(self) -> int:
         statuses = {s.status for s in self.slots}
@@ -181,6 +191,8 @@ class CompileReport:
             "refusal": self.refusal,
             "notices": self.notices,
             "orphans": self.orphans,
+            "retired": self.retired,
+            "kept": self.kept,
             "slots": [s.as_json() for s in self.slots],
         }
 
@@ -220,9 +232,10 @@ class Readers:
 
 def checkout_of(slots_dir: Path, target: CompileTarget) -> Path:
     """The checkout root ``slots_dir`` belongs to: ``slots_dir`` must END with
-    the target's ``slots_dir``, and the root must be a git checkout (a
-    worktree's ``.git`` file or a clone's directory) — studio writes only into a
-    checkout a session allocated, never into an arbitrary directory."""
+    the target's ``slots_dir``, and the root must be a LINKED worktree (its
+    ``.git`` a file naming ``<common dir>/worktrees/<name>``) — studio writes only
+    into a worktree a session allocated, never into a shared primary checkout or
+    an arbitrary directory."""
     resolved = slots_dir.resolve()
     tail = PurePosixPath(target.slots_dir.as_posix()).parts
     if tuple(resolved.parts[-len(tail) :]) != tail:
@@ -231,10 +244,22 @@ def checkout_of(slots_dir: Path, target: CompileTarget) -> Path:
             f"'{target.slots_dir}'; pass <checkout>/{target.slots_dir}"
         )
     root = Path(*resolved.parts[: -len(tail)])
-    if not (root / ".git").exists():
+    dot_git = root / ".git"
+    if dot_git.is_dir():
         raise ConfigError(
-            f"{root} is not a git checkout; studio compile writes only into a checkout the "
-            "calling session allocated (allocate-worktree.sh)"
+            f"{root} is a primary checkout (its .git is a directory), shared with other "
+            "sessions; studio compile writes only into a linked worktree the calling session "
+            "allocated (allocate-worktree.sh)"
+        )
+    try:
+        pointer = dot_git.read_text(encoding="utf-8").strip()
+    except OSError:
+        pointer = ""
+    gitdir = pointer.removeprefix("gitdir:").strip() if pointer.startswith("gitdir:") else ""
+    if not gitdir or "worktrees" not in Path(gitdir).parts[:-1]:
+        raise ConfigError(
+            f"{root} is not a linked git worktree; studio compile writes only into a worktree "
+            "the calling session allocated (allocate-worktree.sh)"
         )
     return root
 
@@ -364,7 +389,14 @@ def _staleness(
     try:
         binding = ImageSlotProvenance.model_validate(raw)
     except ValueError:
-        return "missing", ["the manifest entry carries no readable binding"], None
+        return (
+            "unknown",
+            [
+                "the manifest entry carries no readable binding: what it binds is UNKNOWN, so it "
+                "is neither re-rendered nor called fresh"
+            ],
+            None,
+        )
     raw_files, raw_shas = entry.get("files"), entry.get("sha256")
     files: dict[str, Any] = raw_files if isinstance(raw_files, dict) else {}
     shas: dict[str, Any] = raw_shas if isinstance(raw_shas, dict) else {}
@@ -505,18 +537,14 @@ def _existing_batch(
     return keep
 
 
-def _rehome(conn: sqlite3.Connection, batch_id: str, site_id: str, now: datetime) -> None:
-    """A batch published into ANOTHER checkout, which this one does not hold:
-    its rows say live, but not here. Mark them unpublished so the batch can be
-    published into this checkout without regenerating it."""
-    conn.execute(
-        "UPDATE publications SET unpublished_at = ? WHERE batch_id = ? AND site = ? "
-        "AND unpublished_at IS NULL",
-        (now.isoformat(), batch_id, site_id),
-    )
+def _rehome(conn: sqlite3.Connection, batch_id: str) -> None:
+    """A batch published into ANOTHER checkout, which this one does not hold.
+    Its publication rows stay live — that checkout still holds the files —
+    and the batch is made publishable again so it can be published into this
+    checkout without regenerating it."""
     conn.execute(
         "UPDATE batches SET status = 'unpublished', reason = ? WHERE id = ? AND status = 'published'",
-        ("published into another checkout; publishing it into this one", batch_id),
+        ("published into another checkout; publishing it into this one too", batch_id),
     )
     conn.commit()
 
@@ -669,13 +697,17 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
     library = Library(ctx.conn)
     manifest = _read_manifest(publish_dir)
 
-    # Every asset-route spec is a slot of the Site, filtered by --slot or not:
-    # the journal then recognises every slot file the checkout holds.
+    # Every spec is a slot of the Site, filtered by --slot or not: the journal
+    # then recognises every slot file the checkout holds. A slot no file is
+    # published for (lucide, an authored SVG, a role never compiled) is a
+    # meta-only placeholder: it names a manifest key, never a file.
     site_slots: dict[str, Slot] = {}
     for spec in all_specs:
         route, _ = route_for(target, spec)
         if route == "diffusion" or route == "traced":
             site_slots[spec.site_slot] = target.slot_for(spec, route)
+        else:
+            site_slots[spec.site_slot] = MANIFEST_ONLY_SLOT
     report.orphans = sorted(set(manifest) - {s.site_slot for s in all_specs})
     routed: list[tuple[LoadedSpec, SlotReport, Route | None]] = []
     for spec in specs:
@@ -706,11 +738,20 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
             raise ConfigError(f"target '{target.id}': {e}") from e
 
     to_compile: list[tuple[LoadedSpec, SlotReport, Route, Slot, SlotInputs]] = []
+    entries: dict[str, dict[str, Any] | None] = {}
     for spec, rep, route in routed:
         if route is None:
             rep.status, rep.reasons = "not_compiled", [rep.route_source]
         elif route == "lucide":
-            _lucide(target, spec, rep, checkout, options.slots_dir)
+            entry = _lucide(target, spec, rep, checkout, options.slots_dir, options.alt_texts)
+            current = manifest.get(spec.site_slot)
+            if entry is not None and entry != current:
+                if options.dry_run:
+                    rep.reasons.append("its manifest entry would be written")
+                else:
+                    entries[spec.site_slot] = entry
+                    rep.manifest_written = True
+                    rep.reasons.append("its manifest entry is written")
         elif route == "svg":
             _authored(spec, rep, options.slots_dir)
         else:
@@ -754,15 +795,48 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
                 elif not options.dry_run:
                     to_compile.append((spec, rep, route, slot, inputs))
 
+    notifier = _CompileNotifier(FileNotifier(ctx.workspace.notices_dir), checkout, report)
+    if not options.dry_run:
+        # Studio owns the manifest: an entry no spec declares any more goes,
+        # with the files it names, in this same compile.
+        entries.update(dict.fromkeys(report.orphans))
+    if entries:
+        assert site is not None
+        update = update_entries(
+            ctx.conn, site, entries, notifier, ctx.clock, root=ctx.workspace.root
+        )
+        report.retired = [n for n in update.written if n in report.orphans] + [
+            str(p) for p in update.removed_files
+        ]
+        report.kept = update.kept
     if to_compile:
         assert site is not None
-        _generate_and_publish(ctx, options, readers, report, site, to_compile, checkout)
+        _generate_and_publish(ctx, options, readers, report, site, to_compile, checkout, notifier)
     return report
 
 
+LUCIDE_PACKAGE = "lucide-react"
+
+
+def lucide_selection_sha256(icon: str) -> str:
+    """The content address of a lucide selection: sha256 of the RFC 8785
+    canonical JSON ``{"icon": <name>, "package": "lucide-react"}``. An icon is
+    selected, not made, so its binding addresses the SELECTION, the same in
+    every lucide-react version."""
+    return canonical_sha256({"icon": icon, "package": LUCIDE_PACKAGE})
+
+
 def _lucide(
-    target: CompileTarget, spec: LoadedSpec, rep: SlotReport, checkout: Path, slots_dir: Path
-) -> None:
+    target: CompileTarget,
+    spec: LoadedSpec,
+    rep: SlotReport,
+    checkout: Path,
+    slots_dir: Path,
+    alt_texts: dict[str, AltText],
+) -> dict[str, Any] | None:
+    """Check a lucide slot and return the manifest entry it should have, or
+    None when no entry may be written (no icon named, the icon unverified or
+    unknown, an alt text owed)."""
     icon = target.override(spec.slot_id).icon
     if icon is None:
         rep.status = "icon_unknown"
@@ -770,14 +844,50 @@ def _lucide(
             f"a lucide slot names its icon: add `icon:` for '{spec.slot_id}' in target "
             f"'{target.id}' (icons are selected, never generated)"
         ]
-        return
+        return None
     found = selected.check_lucide(icon, checkout, slots_dir)
     rep.status = found.status
     rep.lucide = {"icon": found.icon, "component": found.component, "detail": found.detail}
     rep.reasons = [
-        f"render lucide-react's <{found.component} /> in this slot; studio writes no file "
-        f"({found.detail})"
+        f"render lucide-react's <{found.component} /> in this slot; studio publishes no image "
+        f"file ({found.detail})"
     ]
+    if found.status != "selected":
+        return None
+    asset = lucide_selection_sha256(icon)
+    alt: AltText | None = None
+    if spec.spec.alt.root.kind == "required":
+        alt = alt_texts.get(spec.slot_id)
+        if alt is None or alt.asset_sha256 != asset:
+            rep.status = "awaiting_alt_text"
+            rep.reasons.append(
+                f'the slot is alt: required: run again with --alt-texts ({{"{spec.slot_id}": '
+                f'{{"asset_sha256": "{asset}", "text": "..."}}}})'
+            )
+            return None
+    binding = ImageSlotProvenance(
+        asset_sha256=asset,
+        spec_sha256=spec.sha256,
+        source=ImageSlotAssetSource.selected,
+        ai_generated=False,
+        alt_text=alt.text if alt else None,
+    )
+    problems = binding_problems(spec.spec, binding, spec.sha256)
+    if problems:
+        rep.status, rep.reasons = "refused", [*rep.reasons, *problems]
+        return None
+    binding_json = binding.model_dump(mode="json", exclude_none=True)
+    rep.binding = binding_json
+    return {
+        "route": "lucide",
+        "slot_id": spec.slot_id,
+        "slot_spec_sha256": spec.sha256,
+        "lucide": {"package": LUCIDE_PACKAGE, "icon": icon, "component": found.component},
+        "files": {},
+        "sha256": {},
+        "ai_generated": False,
+        "binding": binding_json,
+    }
 
 
 def _authored(spec: LoadedSpec, rep: SlotReport, slots_dir: Path) -> None:
@@ -802,6 +912,7 @@ def _generate_and_publish(
     site: Site,
     work: list[tuple[LoadedSpec, SlotReport, Route, Slot, SlotInputs]],
     checkout: Path,
+    notifier: _CompileNotifier,
 ) -> None:
     target = options.target
     ctx.sites = {**ctx.sites, site.id: site}
@@ -823,7 +934,6 @@ def _generate_and_publish(
             rep.status, rep.reasons = "generation_refused", [f"{e.code}: {e}"]
         return
     priority = "bulk" if options.changed_only else "interactive"
-    notifier = _CompileNotifier(FileNotifier(ctx.workspace.notices_dir), checkout, report)
     for spec, rep, route, slot, inputs in work:
         try:
             _compile_one(
@@ -993,7 +1103,7 @@ def _publish_pick(
         rep.status, rep.reasons = "refused", [*rep.reasons, *problems]
         return pick
     if published_before:
-        _rehome(ctx.conn, batch_id, site.id, ctx.clock())
+        _rehome(ctx.conn, batch_id)
         rep.reasons.append("its earlier publication went to another checkout; re-homed here")
     key = (site.id, spec.site_slot)
     binding_json = binding.model_dump(mode="json", exclude_none=True)

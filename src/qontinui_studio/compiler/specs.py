@@ -62,8 +62,23 @@ def _reduce(w: int, h: int) -> tuple[int, int]:
     return (w // math.gcd(w, h), h // math.gcd(w, h))
 
 
+# Rust's `str::trim` removes exactly the Unicode White_Space characters, which
+# is not Python's `str.isspace` (that also counts U+001C..U+001F).
+_RUST_WHITE_SPACE = (
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def rust_trim(text: str) -> str:
+    """``str::trim`` as Rust defines it."""
+    return text.strip(_RUST_WHITE_SPACE)
+
+
 def _content_key(entry: str) -> str:
-    return entry.strip().lower()
+    # content_key in image_slot.rs: entry.trim().to_lowercase()
+    return rust_trim(entry).lower()
 
 
 def _rect_problem(x: float, y: float, w: float, h: float) -> bool:
@@ -194,11 +209,36 @@ def _strict(raw: Any, path: Path) -> ImageSlotSpec:
         raise ConfigError(f"{path}: not a valid ImageSlotSpec: {problems}") from e
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """PyYAML's safe loader, refusing what serde_yaml would not read the same
+    way: a key given twice (PyYAML keeps the last silently) and a ``<<`` merge
+    key (YAML 1.1 only; YAML 1.2 has none)."""
+
+
+def _strict_mapping(loader: _StrictLoader, node: yaml.MappingNode, deep: bool = False) -> Any:
+    seen: list[object] = []
+    for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            raise yaml.constructor.ConstructorError(
+                None, None, "a '<<' merge key is refused", key_node.start_mark
+            )
+        key = loader.construct_object(key_node, deep=True)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                None, None, f"the key {key!r} is given twice", key_node.start_mark
+            )
+        seen.append(key)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_mapping)
+
+
 def read_spec(path: Path) -> LoadedSpec:
     """Read and validate one spec file — the contract alone, whatever the file
     is called. :func:`load_spec` adds the naming rule."""
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_StrictLoader)  # noqa: S506
     except (OSError, yaml.YAMLError) as e:
         raise ConfigError(f"cannot read {path}: {e}") from e
     if not isinstance(raw, dict):

@@ -26,11 +26,10 @@ Step 2 — select before generating. Each spec is routed (:func:`route_for`):
                    validates it (:mod:`~qontinui_studio.compiler.authored`)
                    and writes nothing.
 ``diffusion``      rich illustration, photography, texture, scenes: N
-                   candidates through the provider, AVIF + WebP + a PNG
-                   fallback.
+                   candidates through the provider, AVIF + WebP + a JPEG
+                   (photographic roles) or PNG fallback.
 ``traced``         flat raster art traced to SVG by vtracer (an ``svg``
-                   derivative of a generated raster), with a PNG of the same
-                   crop beside it.
+                   derivative of a generated raster).
 =================  =========================================================
 
 ``logo`` and ``screenshot`` slots are never compiled: a logo is an identity
@@ -110,6 +109,8 @@ ROLE_CSS_WIDTH: dict[str, int] = {
 }
 OG_CARD_WIDTH = 1200  # an og:image is fetched by crawlers at its own pixel size
 MAX_WIDTH_PX = 4096
+# Photographic roles fall back to JPEG; the rest (flat art, cards) to PNG.
+PHOTO_ROLES = frozenset({"hero", "background", "scene"})
 
 LUCIDE_NAME = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 # A spec slot id (qontinui-schemas SLUG_PATTERN).
@@ -223,15 +224,12 @@ class CompileTarget(BaseModel):
         r = spec.spec.focal.region
         formats: list[ExportFormat]
         if route == "traced":
-            # The trace, and a PNG of the same crop for a consumer that renders
-            # only raster slots (qontinui-web's <SlotImage> reads png/jpg/webp/avif).
-            formats = ["svg", "png"]
+            formats = ["svg"]
         elif role == "og_card":
             formats = ["png"]
         else:
-            # PNG is the fallback every consumer decodes; studio's format key for
-            # JPEG ("jpeg") is not one qontinui-web's slot reader accepts.
-            formats = ["avif", "webp", "png"]
+            # Formats qontinui-web's <SlotImage> serves: png, jpeg, webp, avif, svg.
+            formats = ["avif", "webp", "jpeg" if role in PHOTO_ROLES else "png"]
         category: SlotCategory = "illustration" if route == "traced" else "decorative"
         return Slot(
             width=width,

@@ -9,9 +9,14 @@ its bulk window (a typed ``deferred``; the batch resumes on the next run). The
 task fires nightly and spawns an agent session (a ``RemoteAgent`` task, the
 same shape as the weekly pulse's) that:
 
-1. allocates a worktree of the target's repository (``allocate-worktree.sh``);
-2. runs ``studio compile --changed`` against it, which writes derivatives and
-   the manifest there and the PR evidence beside the studio's state;
+1. allocates a worktree of the target's repository (``allocate-worktree.sh``),
+   and one of qontinui at origin/main for the image licence manifest and
+   recipes (``docker/imagegen``) — unless the task pins a manifest directory —
+   so the recipe and LoRA axes are read, not UNKNOWN, and a recipe or house
+   LoRA change re-renders what it touched;
+2. runs ``studio compile --changed --imagegen-dir <that docker/imagegen>``
+   against the target's worktree, which writes derivatives and the manifest
+   there and the PR evidence beside the studio's state;
 3. when anything was written, commits ONLY the publish dir, pushes and opens
    the PR with the evidence as its body — the merge train lands it like any
    other PR; when nothing was written, hands the worktree back.
@@ -44,6 +49,8 @@ DEFAULT_CRON = "30 2 * * *"
 MAX_TURNS = 80
 TIMEOUT_SECONDS = 4 * 3600
 ALLOCATE = "qontinui-claude-config/scripts/allocate-worktree.sh"
+# The repository holding the image licence manifest and recipes (docker/imagegen).
+QONTINUI_REPO = "qontinui"
 
 
 def task_name(target: CompileTarget) -> str:
@@ -71,6 +78,10 @@ class CompileTask:
     workspace_root: str
     cron: str = DEFAULT_CRON
     enabled: bool = True
+    # A pinned image licence manifest directory (a qontinui checkout's
+    # docker/imagegen). None: the session allocates a qontinui worktree at
+    # origin/main each run and reads it there.
+    imagegen_dir: str | None = None
 
     @property
     def name(self) -> str:
@@ -86,11 +97,9 @@ class CompileTask:
             "drift and --install reverts it."
         )
 
-    def prompt(self) -> str:
-        t = self.target
-        repo_name = t.repo.split("/", 1)[1]
+    def _allocate(self, repo_name: str) -> str:
         ws = self.workspace_root
-        allocate = shlex.join(
+        return shlex.join(
             [
                 "bash",
                 f"{ws}/{ALLOCATE}",
@@ -99,23 +108,49 @@ class CompileTask:
                 "--repo",
                 repo_name,
                 "--intent",
-                f"studio compile --changed: overnight image-slot re-render for {t.repo}",
+                f"studio compile --changed: overnight image-slot re-render for {self.target.repo}",
             ]
         )
+
+    def prompt(self) -> str:
+        t = self.target
+        repo_name = t.repo.split("/", 1)[1]
+        ws = self.workspace_root
         report = f"{self.studio_root}/.studio/compile/{t.id}/report.json"
         evidence = f"{self.studio_root}/.studio/compile/{t.id}/evidence.md"
+        if self.imagegen_dir is not None:
+            imagegen = shlex.quote(self.imagegen_dir)
+            manifest_step = (
+                f"Step 1b: the image licence manifest is pinned at {self.imagegen_dir}; "
+                "allocate nothing for it."
+            )
+            hand_back_q = ""
+        else:
+            imagegen = "<Q>/docker/imagegen"
+            manifest_step = (
+                f"Step 1b: run exactly once: {self._allocate(QONTINUI_REPO)} . Q is the path "
+                f"on its line for {QONTINUI_REPO} (origin/main: the image licence manifest and "
+                "recipes the recipe and LoRA axes are read from). If it refuses, hand W back "
+                "(step 3's command) and stop: without the manifest those axes are UNKNOWN."
+            )
+            hand_back_q = (
+                f" Whatever happens after step 1b, hand Q back at the end with: bash "
+                f"{ws}/{ALLOCATE} --done --path <Q> --abandon (you never change it)."
+            )
         compile_cmd = (
             f"poetry run --quiet studio --root {shlex.quote(self.studio_root)} compile "
-            f"--target {t.id} --slots <W>/{t.slots_dir.as_posix()} --changed --json"
+            f"--target {t.id} --slots <W>/{t.slots_dir.as_posix()} --changed "
+            f"--imagegen-dir {imagegen} --json"
         )
         return " ".join(
             [
                 f"You re-render stale image slots of {t.repo} (studio compile target '{t.id}').",
-                f"Step 1: run exactly once: {allocate} . It prints '<repo> <path> <branch>' "
-                "lines; W is the path and B the branch on the line for "
+                f"Step 1: run exactly once: {self._allocate(repo_name)} . It prints '<repo> "
+                f"<path> <branch>' lines; W is the path and B the branch on the line for "
                 f"{repo_name}. If it refuses, stop and report its message.",
-                f"Step 2: from this working directory run: {compile_cmd} (with <W> replaced). "
-                f"It writes {report} and {evidence}. Read the report's exit_code and "
+                manifest_step,
+                f"Step 2: from this working directory run: {compile_cmd} (with "
+                f"{'<W> and <Q>' if self.imagegen_dir is None else '<W>'} replaced). It writes {report} and {evidence}. Read the report's exit_code and "
                 "files_written. Exit 6 = image generation is switched off or refused: stop. "
                 "Exit 3 = generation deferred or failed (a host outside its bulk window, or "
                 "busy): the batch resumes on the next run; continue to step 4 only if "
@@ -134,7 +169,7 @@ class CompileTask:
                 f"stale image slots (studio compile --changed)', push B with git push -u "
                 f"origin B, and open the PR with gh pr create --base main --head B --title "
                 f"'feat(images): re-render stale image slots for {t.id}' --body-file {evidence} . "
-                "Report the PR URL.",
+                "Report the PR URL." + hand_back_q,
                 "Never merge the PR, never force-push, never touch a file outside W except the "
                 "alt-text JSON, and never run studio compile without --changed.",
             ]

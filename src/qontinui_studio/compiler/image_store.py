@@ -11,8 +11,14 @@ as ``studio compile`` writes to it (Phase 19 step 3).
   is moved to ``chosen``.
 
 Auth is the fleet's device-JWT chain (:mod:`qontinui_studio.device_auth`); the
-tenant is the credential's, never sent. The runner's minted token is offered to
-the PRODUCTION web API only.
+tenant is the credential's, never sent. Every call is keyed by ONE repository,
+the compile target's, so before the first write the store proves which
+credential acts for the tenant that OWNS that repository (``prove_owner``,
+served ``coordination`` ``repo-writes-go-to-the-owning-tenant``) and then uses
+that credential alone; a repository whose owner is refuted or UNKNOWN gets no
+write at all (``refused``). The runner's minted token is offered only when both
+the web API and coord are production, and no token goes to a door that is
+neither https nor loopback (``$STUDIO_WEB_URL``).
 
 Every call answers a :class:`StoreOutcome`. Anything but an answer that names
 the bytes' own hash is ``unknown`` — a store that did not confirm the upload
@@ -30,8 +36,15 @@ from typing import Any, Literal, Protocol
 
 import httpx
 
-from qontinui_studio.device_auth import DeviceCredentials
+from qontinui_studio.device_auth import (
+    Credential,
+    DeviceCredentials,
+    OwnerProof,
+    https_or_loopback,
+    prove_owner,
+)
 from qontinui_studio.gateway import runner_url
+from qontinui_studio.imagegen_policy import PRODUCTION_COORD, coord_base_url
 from qontinui_studio.postprocess import sha256_file
 
 WEB_URL_ENV = "STUDIO_WEB_URL"
@@ -125,38 +138,54 @@ def _refusal_code(resp: httpx.Response) -> str:
 class HttpImageStore:
     def __init__(
         self,
+        repo: str,
         base_url: str | None = None,
+        coord_url: str | None = None,
         http: httpx.Client | None = None,
         jwt_file: Path | None = None,
         runner: Callable[[], str] = runner_url,
     ) -> None:
+        self.repo = repo
         self.base_url = (base_url or web_base_url()).rstrip("/")
+        self.coord_url = (coord_url or coord_base_url()).rstrip("/")
         self.http = http or httpx.Client(timeout=TIMEOUT_S)
-        refusal = (
-            None
-            if self.base_url == PRODUCTION_WEB
-            else f"the runner mints for production and {self.base_url} is not the production web API"
-        )
+        refusal = None
+        if self.base_url != PRODUCTION_WEB or self.coord_url != PRODUCTION_COORD:
+            refusal = (
+                f"the runner mints for production, and {self.base_url} / {self.coord_url} "
+                "is not the production web API and coord"
+            )
         self.credentials = DeviceCredentials(self.http, refusal, jwt_file=jwt_file, runner=runner)
+        self._proof: OwnerProof | None = None
+
+    def _owner(self) -> Credential | StoreOutcome:
+        if not https_or_loopback(self.base_url):
+            return StoreOutcome(
+                "refused", f"{self.base_url} is neither https nor loopback; no token is sent"
+            )
+        if self._proof is None:
+            self._proof = prove_owner(self.http, self.coord_url, self.repo, self.credentials)
+        if self._proof.credential is None:
+            return StoreOutcome("refused", f"no write: {self._proof.note}")
+        return self._proof.credential
 
     def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response | StoreOutcome:
+        cred = self._owner()
+        if isinstance(cred, StoreOutcome):
+            return cred
         url = f"{self.base_url}{path}"
-        skipped: list[str] = []
-        refused: list[str] = []
-        for cred in self.credentials.credentials(skipped):
-            try:
-                resp = self.http.request(
-                    method, url, headers={"Authorization": f"Bearer {cred.token}"}, **kwargs
-                )
-            except httpx.HTTPError as e:
-                return StoreOutcome("unknown", f"{method} {url}: {type(e).__name__}")
-            if resp.status_code in (401, 403):
-                refused.append(f"HTTP {resp.status_code} to {cred.source}")
-                continue
-            return resp
-        return StoreOutcome(
-            "unknown", "no usable device credential (" + "; ".join([*skipped, *refused]) + ")"
-        )
+        try:
+            resp = self.http.request(
+                method, url, headers={"Authorization": f"Bearer {cred.token}"}, **kwargs
+            )
+        except httpx.HTTPError as e:
+            return StoreOutcome("unknown", f"{method} {url}: {type(e).__name__}")
+        if resp.status_code in (401, 403):
+            # The proven owner's credential is the only one a write may use.
+            return StoreOutcome(
+                "unknown", f"{method} {url} answered HTTP {resp.status_code} to {cred.source}"
+            )
+        return resp
 
     def upload(
         self, path: Path, kind: AssetKind, provenance: dict[str, Any] | None

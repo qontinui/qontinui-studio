@@ -224,23 +224,37 @@ def _owned_shas(conn: sqlite3.Connection, site: Site, slot: str | None = None) -
     publication of the site (or slot), and — on a checkout site — any file the
     checkout's own studio manifest records (a publication a PR landed, made by
     any studio)."""
-    owned = _live_shas(conn, site.id, slot)
+    owned = {r["sha256"] for r in _live_rows(conn, site, slot)}
     if site.checkout:
         owned |= _manifest_shas(site, slot)
     return owned
 
 
-def _live_shas(conn: sqlite3.Connection, site_id: str, slot: str | None = None) -> set[str]:
-    """sha256 of every live studio publication on a site (or one slot of it)."""
+def inside_publish_dir(site: Site, path: Path) -> bool:
+    """Whether ``path`` names a file DIRECTLY inside ``site``'s publish dir."""
+    return path.name not in ("", ".", "..") and path.parent.resolve() == site.publish_dir.resolve()
+
+
+def _live_rows(conn: sqlite3.Connection, site: Site, slot: str | None = None) -> list[sqlite3.Row]:
+    """Every live publication row of a site (or one slot of it): id,
+    published path and the bytes' sha256.
+
+    A checkout site (``studio compile``) has one id in every checkout of its
+    repository, so its rows span checkouts: only the rows whose file is inside
+    THIS checkout's publish dir are this site's. Another checkout's
+    publications are never moved, deleted or superseded from here."""
     sql = (
-        "SELECT v.sha256 FROM publications p JOIN variants v ON v.id = p.variant_id "
-        "WHERE p.site = ? AND p.unpublished_at IS NULL"
+        "SELECT p.id, p.published_path, v.sha256 FROM publications p "
+        "JOIN variants v ON v.id = p.variant_id WHERE p.site = ? AND p.unpublished_at IS NULL"
     )
-    args: tuple[str, ...] = (site_id,)
+    args: tuple[str, ...] = (site.id,)
     if slot is not None:
         sql += " AND p.slot = ?"
-        args = (site_id, slot)
-    return {r["sha256"] for r in conn.execute(sql, args)}
+        args = (site.id, slot)
+    rows = conn.execute(sql, args).fetchall()
+    if not site.checkout:
+        return list(rows)
+    return [r for r in rows if inside_publish_dir(site, Path(r["published_path"]))]
 
 
 # ---- the journal ---------------------------------------------------------------
@@ -970,9 +984,15 @@ def _publish_locked(
                     "completeness", f"batch {batch_id}", "fail", "brief targets no site slot"
                 )
             )
-        if conn.execute(
-            "SELECT 1 FROM publications WHERE batch_id = ? AND unpublished_at IS NULL", (batch_id,)
-        ).fetchone():
+        if any(
+            not (row["site"] in sites and sites[row["site"]].checkout)
+            or inside_publish_dir(sites[row["site"]], Path(row["published_path"]))
+            for row in conn.execute(
+                "SELECT site, published_path FROM publications "
+                "WHERE batch_id = ? AND unpublished_at IS NULL",
+                (batch_id,),
+            )
+        ):
             result.gate_results.append(
                 GateResult("already_live", f"batch {batch_id}", "fail", "batch is already live")
             )
@@ -990,14 +1010,7 @@ def _publish_locked(
             result.gate_results += _slot_gates(site, slot_name, items)
             live = _owned_shas(conn, site, slot_name)
             dests = {site.publish_dir / f"{slot_name}{Path(v.path).suffix}" for _, v in items}
-            prev_paths = {
-                Path(r["published_path"])
-                for r in conn.execute(
-                    "SELECT published_path FROM publications "
-                    "WHERE site = ? AND slot = ? AND unpublished_at IS NULL",
-                    (site_id, slot_name),
-                )
-            }
+            prev_paths = {Path(r["published_path"]) for r in _live_rows(conn, site, slot_name)}
             for path in sorted(dests | prev_paths):
                 sha = _file_sha(path)
                 if sha is not None and sha not in live:
@@ -1031,11 +1044,7 @@ def _publish_locked(
             drop = {
                 Path(r["published_path"]).name
                 for slot in plan.slots
-                for r in conn.execute(
-                    "SELECT published_path FROM publications "
-                    "WHERE site = ? AND slot = ? AND unpublished_at IS NULL",
-                    (plan.site.id, slot),
-                )
+                for r in _live_rows(conn, plan.site, slot)
             } - set(overlay)
             result.gate_results += _d7(
                 plan.site, batch_id, overlay, drop, plan.manifest, slot_files, bridge, fetch, waiter
@@ -1110,13 +1119,14 @@ def _swap_live(
                         raise OSError(f"staged copy of {variant.path} does not match its sha256")
                     journal.placed.append((staged, dest, sha))
                     to_move.add(dest)
-                for prev in conn.execute(
-                    "SELECT published_path FROM publications "
-                    "WHERE site = ? AND slot = ? AND unpublished_at IS NULL",
-                    (site.id, slot_name),
-                ).fetchall():
+                for prev in _live_rows(conn, site, slot_name):
                     to_move.add(Path(prev["published_path"]))
             for original in sorted(to_move):
+                if not inside_publish_dir(site, original):
+                    # Never move a file the site's own publish dir does not hold.
+                    raise ForeignFile(
+                        original, f"is outside {site.publish_dir}; refusing to move it"
+                    )
                 sha_now = _file_sha(original)
                 if sha_now is None:
                     continue
@@ -1144,11 +1154,12 @@ def _swap_live(
         conn.execute("BEGIN IMMEDIATE")
         for plan in plans:
             for slot_name, rows in plan.slots.items():
-                conn.execute(
-                    "UPDATE publications SET unpublished_at = ?, superseded_by = ? "
-                    "WHERE site = ? AND slot = ? AND unpublished_at IS NULL",
-                    (now_iso, batch_id, plan.site.id, slot_name),
-                )
+                for prev in _live_rows(conn, plan.site, slot_name):
+                    conn.execute(
+                        "UPDATE publications SET unpublished_at = ?, superseded_by = ? "
+                        "WHERE id = ? AND unpublished_at IS NULL",
+                        (now_iso, batch_id, prev["id"]),
+                    )
                 for _, variant, dest in rows:
                     conn.execute(
                         "INSERT INTO publications (batch_id, variant_id, site, slot, "
@@ -1211,6 +1222,90 @@ def _refuse(
     return result
 
 
+# ---- manifest-only entries of a checkout site -----------------------------------
+
+
+@dataclass
+class EntryUpdate:
+    written: list[str] = field(default_factory=list)  # slot names set or removed
+    removed_files: list[Path] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)  # files left, and why
+
+
+def update_entries(
+    conn: sqlite3.Connection,
+    site: Site,
+    entries: dict[str, dict[str, Any] | None],
+    notifier: Notifier,
+    clock: Callable[[], datetime],
+    root: Path | None = None,
+) -> EntryUpdate:
+    """Set (or, with None, remove) slot entries of a CHECKOUT site's manifest
+    that no publication of their own writes: a lucide selection, or an orphan
+    whose spec the checkout no longer declares (``studio compile``).
+
+    Under the site's lock, after replaying any leftover journal. The manifest
+    is written FIRST, so it never names a file that is gone. Then each file the
+    replaced or removed entry named — and the new entry does not — is deleted
+    when it holds the bytes the manifest recorded for it; any other file is
+    kept and reported, never deleted. Live publication rows of a removed or
+    replaced slot in THIS checkout are marked unpublished."""
+    if not site.checkout:
+        raise ConfigError(f"site '{site.id}' is not a checkout site")
+    out = EntryUpdate()
+    with file_locks([_publish_lock(site)]):
+        _recover_locked(conn, [site], notifier, root)
+        manifest = _read_manifest(site.publish_dir)
+        before = manifest_bytes(manifest)
+        doomed: list[tuple[Path, str]] = []
+        retired_slots: list[str] = []
+        for name, entry in sorted(entries.items()):
+            old = manifest["slots"].get(name)
+            if old == entry or (old is None and entry is None):
+                continue
+            keep = set((entry or {}).get("files", {}).values())
+            if isinstance(old, dict):
+                raw_files, raw_shas = old.get("files"), old.get("sha256")
+                files: dict[str, Any] = raw_files if isinstance(raw_files, dict) else {}
+                shas: dict[str, Any] = raw_shas if isinstance(raw_shas, dict) else {}
+                for fmt, fname in files.items():
+                    if fname in keep:
+                        continue
+                    path = site.publish_dir / str(fname)
+                    if not _safe_name(fname) or not inside_publish_dir(site, path):
+                        out.kept.append(f"{fname}: not a file name inside {site.publish_dir}")
+                    elif isinstance(shas.get(fmt), str):
+                        doomed.append((path, shas[fmt]))
+                retired_slots.append(name)
+            if entry is None:
+                manifest["slots"].pop(name, None)
+            else:
+                manifest["slots"][name] = entry
+            out.written.append(name)
+        if manifest_bytes(manifest) != before:
+            site.publish_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write(site.publish_dir / MANIFEST, manifest_bytes(manifest))
+        for path, sha in doomed:
+            current = _file_sha(path)
+            if current is None:
+                continue
+            if current != sha:
+                out.kept.append(f"{path.name}: holds bytes the manifest did not record; kept")
+                continue
+            path.unlink()
+            out.removed_files.append(path)
+        now = clock().isoformat()
+        for name in retired_slots:
+            for row in _live_rows(conn, site, name):
+                conn.execute(
+                    "UPDATE publications SET unpublished_at = ? WHERE id = ? "
+                    "AND unpublished_at IS NULL",
+                    (now, row["id"]),
+                )
+        conn.commit()
+    return out
+
+
 # ---- unpublish -----------------------------------------------------------------
 
 
@@ -1236,11 +1331,17 @@ def _unpublish_locked(
     out = UnpublishResult()
     now_iso = now.isoformat()
     library = Library(conn)
-    rows = conn.execute(
-        "SELECT p.id, p.site, p.slot, p.published_path, v.sha256 FROM publications p "
-        "JOIN variants v ON v.id = p.variant_id WHERE p.batch_id = ? AND p.unpublished_at IS NULL",
-        (batch_id,),
-    ).fetchall()
+    rows = [
+        r
+        for r in conn.execute(
+            "SELECT p.id, p.site, p.slot, p.published_path, v.sha256 FROM publications p "
+            "JOIN variants v ON v.id = p.variant_id "
+            "WHERE p.batch_id = ? AND p.unpublished_at IS NULL",
+            (batch_id,),
+        ).fetchall()
+        if not (r["site"] in sites and sites[r["site"]].checkout)
+        or inside_publish_dir(sites[r["site"]], Path(r["published_path"]))
+    ]
     by_site: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         by_site.setdefault(row["site"], []).append(row)

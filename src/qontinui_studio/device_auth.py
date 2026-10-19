@@ -14,7 +14,16 @@ another tenant is discarded (a device bound to several tenants writes only as
 the tenant that owns the repo).
 
 Tokens are never printed or logged; a skipped source is described by where it
-came from, never by its value.
+came from, never by its value, and a token is only ever sent to an https or a
+loopback door (:func:`https_or_loopback`).
+
+A WRITE keyed by a repository goes only to the tenant PROVEN to own it
+(served policy ``coordination`` ``repo-writes-go-to-the-owning-tenant``;
+the fleet's ``ctc_owner_tenant``). :func:`prove_owner` is that proof: under a
+token whose ``tenant_id`` claim is T, coord's ``GET /pr-merge/<owner%2Fname>/0/
+author-session`` answers 200 only when T owns the repo and 404 when it does not
+(or there is no such repo); any other answer proves nothing, and the walk stops
+UNKNOWN.
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -41,6 +50,7 @@ DEVICE_JWT_FILE = Path("~/.qontinui/coord-device-jwt")
 # 409 ``tenant_required`` to a mint that names none.
 TENANT_ENV = "STUDIO_COORD_TENANT_ID"
 RUNNER_MINT_PATH = "/ui-bridge/invoke/get_coord_device_token"
+OWNER_PROBE_PATH = "/pr-merge/{repo}/0/author-session"
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,63 @@ def is_loopback_url(url: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def https_or_loopback(url: str) -> bool:
+    """Whether a bearer token may be sent to ``url``: https, or a literal
+    loopback / ``localhost`` http door."""
+    scheme = urlparse(url).scheme.lower()
+    return scheme == "https" or (scheme == "http" and is_loopback_url(url))
+
+
+@dataclass(frozen=True)
+class OwnerProof:
+    """The credential PROVEN to act for the tenant that owns a repo, or None
+    with why not (refuted for every credential, or UNKNOWN)."""
+
+    credential: Credential | None
+    note: str
+
+
+def prove_owner(
+    http: httpx.Client, coord_base: str, repo: str, chain: DeviceCredentials
+) -> OwnerProof:
+    """Walk ``chain`` until a credential's tenant is proven to own ``repo``
+    (``owner/name``, exact spelling). A credential coord refuses, or whose
+    tenant it refutes, is passed over; any other answer stops the walk
+    UNKNOWN — never "not the owner", never "the owner"."""
+    base = coord_base.rstrip("/")
+    if "/" not in repo:
+        return OwnerProof(None, f"'{repo}' is not an owner/name slug; no tenant can own it")
+    if not https_or_loopback(base):
+        return OwnerProof(None, f"coord {base} is neither https nor loopback; no token is sent")
+    url = base + OWNER_PROBE_PATH.format(repo=quote(repo, safe=""))
+    skipped: list[str] = []
+    passed: list[str] = []
+    for cred in chain.credentials(skipped):
+        try:
+            resp = http.get(url, headers={"Authorization": f"Bearer {cred.token}"})
+        except httpx.HTTPError as e:
+            return OwnerProof(None, f"the owner probe did not answer ({type(e).__name__}): UNKNOWN")
+        claims = jwt_claims(cred.token) or {}
+        tenant = claims.get("tenant_id")
+        if resp.status_code == 200:
+            return OwnerProof(cred, f"{cred.source} (tenant {tenant}) is proven to own {repo}")
+        if resp.status_code == 404:
+            passed.append(f"{cred.source}: tenant {tenant} does not own {repo}")
+            continue
+        if resp.status_code in (401, 403):
+            passed.append(f"{cred.source}: coord answered HTTP {resp.status_code}")
+            continue
+        return OwnerProof(
+            None, f"the owner probe answered HTTP {resp.status_code}; the owner is UNKNOWN"
+        )
+    return OwnerProof(
+        None,
+        f"no credential is proven to act for the tenant that owns {repo} ("
+        + "; ".join([*skipped, *passed])
+        + ")",
+    )
 
 
 class DeviceCredentials:

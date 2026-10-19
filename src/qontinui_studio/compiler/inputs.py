@@ -8,8 +8,8 @@
   whole body when the reference names no section).
 * **exemplars** — the exemplar set a slot's ``style.exemplars`` names: the
   studio library's set of that tag (``studio library tag``), with each member's
-  approval state. Its digest identifies the membership in force, the empty set
-  included. Plan Phase 22 owns versioned exemplar sets in qontinui-web; until
+  approval state. Its digest identifies the membership in force; a set with no
+  member here is UNKNOWN, never a known empty set. Plan Phase 22 owns versioned exemplar sets in qontinui-web; until
   it lands, the library tag is the set studio can read.
 * **LoRA** and **engine recipes** — the image licence manifest and recipes
   (qontinui ``docker/imagegen``, plan Phase 2), from a checkout named by
@@ -35,7 +35,7 @@ import httpx
 import yaml
 
 from qontinui_studio.compiler.jcs import canonical_sha256
-from qontinui_studio.device_auth import DeviceCredentials
+from qontinui_studio.device_auth import DeviceCredentials, https_or_loopback
 from qontinui_studio.gateway import runner_url
 from qontinui_studio.imagegen_policy import PRODUCTION_COORD, coord_base_url
 from qontinui_studio.library import Library
@@ -122,6 +122,10 @@ class ImageryReader:
         return self._cache[ref]
 
     def _read(self, ref: str) -> Digest:
+        if not https_or_loopback(self.base_url):
+            return Digest(
+                None, f"coord {self.base_url} is neither https nor loopback; no token is sent"
+            )
         m = _IMAGERY_REF.fullmatch(ref)
         if m is None:
             return Digest(None, f"imagery reference '{ref}' is not <kind>/<name>[#section]")
@@ -155,6 +159,19 @@ def _imagery_digest(doc: object, kind: str, name: str, fragment: str | None) -> 
     if doc.get("withdrawn") is True:
         return Digest(None, f"{kind}/{name} is withdrawn")
     version = doc.get("current_version")
+    seed = doc.get("unedited_seed")
+    if seed is True:
+        return Digest(None, f"{kind}/{name} is an unedited skeleton, not an authored treatment")
+    if seed is None and doc.get("default_source") is not None and version == 1:
+        # A coord serving no `unedited_seed`: a seeded document still at v1 is
+        # the skeleton; past v1 the body alone could tell, so it is UNKNOWN.
+        return Digest(None, f"{kind}/{name} may be an unedited skeleton (seeded, v1)")
+    if seed is None and doc.get("default_source") is not None:
+        return Digest(
+            None,
+            f"{kind}/{name}: coord serves no unedited_seed and the document was seeded; "
+            "authored or skeleton is UNKNOWN",
+        )
     where = f"{kind}/{name}@v{version}" if isinstance(version, int) else f"{kind}/{name}"
     body: str = doc["body"]
     if fragment is None:
@@ -172,6 +189,14 @@ def _imagery_digest(doc: object, kind: str, name: str, fragment: str | None) -> 
 def exemplar_digest(library: Library, set_id: str) -> Digest:
     """The membership of library set ``set_id`` (its tag), as a digest."""
     pairs = sorted((a.sha256, a.approval_status) for a in library.tagged(set_id))
+    if not pairs:
+        # A set this machine never saw is not a known EMPTY set: its version is
+        # UNKNOWN until a member is in the library here (Phase 22 owns sets).
+        return Digest(
+            None,
+            f"exemplar set '{set_id}' has no member in this studio's library (tag assets with "
+            "`studio library tag`)",
+        )
     members = [{"asset_sha256": sha, "approval": approval} for sha, approval in pairs]
     digest = canonical_sha256(
         {"schema": "qontinui-studio/exemplar-set/v1", "set": set_id, "members": members}
