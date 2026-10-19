@@ -448,12 +448,16 @@ def test_the_task_runs_changed_in_an_allocated_worktree_and_studio_runs_no_git(
     assert "--repo qontinui " in prompt and "--done --path <Q> --abandon" in prompt
     # Every stop path ends with the hand-back step, exit 6 included.
     assert "never stop without it" in prompt
-    assert "route on files_written FIRST" in prompt
-    assert "files_written true goes to step 4" in prompt
+    # Alt texts are written BEFORE routing; routing reads W against its HEAD.
+    alt = prompt.index("FIRST, if the report's exit_code is 7")
+    route = prompt.index("git status --porcelain -- frontend/public/image-slots")
+    assert alt < route
     assert (
-        "Exit 6 (image generation switched off or refused) with files_written false: "
-        "go to the final step" in prompt
+        "If it prints nothing, W's publish dir is the same as its HEAD: go to the final step"
+        in prompt
     )
+    assert "it does not decide what you do next" in prompt
+    assert "files_written" not in prompt
     final = prompt[prompt.index("FINAL step") :]
     assert "--done --path <W> --abandon" in final and "--done --path <Q> --abandon" in final
     assert "gh pr create" in prompt and "--body-file" in prompt
@@ -602,3 +606,83 @@ def test_a_lock_dir_must_be_this_users_and_closed(
     monkeypatch.setattr(os, "getuid", lambda: os.stat(base).st_uid + 1)
     with pytest.raises(OSError, match="not owned by this user"):
         user_lock_dir()
+
+
+@respx.mock
+def test_the_facade_probe_reads_a_served_recipe_map_or_says_none() -> None:
+    from qontinui_studio.compiler.facade import HttpFacadeProbe
+    from qontinui_studio.providers import Provider
+
+    provider = Provider.model_validate(
+        {
+            "id": "local-gpu",
+            "provider": "facade",
+            "plan": "t",
+            "api_available": {"value": "yes", "source": "https://f.test/a"},
+            "automation_allowed": {"value": "yes", "source": "https://f.test/t"},
+            "commercial_use": {"value": "yes", "source": "https://f.test/c"},
+            "watermark": "IPTC",
+            "adapter": "openai_compatible_images",
+            "model": "z-image-turbo",
+            "base_url": "http://127.0.0.1:8100/v1",
+            "capacity": "unmetered",
+            "tos_reviewed": "2026-10-15",
+            "domains": ["f.test"],
+        }
+    )
+    upstream = respx.get("http://127.0.0.1:8100/upstream/z-image-turbo/qontinui/status")
+    direct = respx.get("http://127.0.0.1:8100/qontinui/status")
+    probe = HttpFacadeProbe()
+    upstream.mock(
+        return_value=httpx.Response(200, json={"recipes": {"hero": "d" * 64, "x": "bad"}})
+    )
+    assert probe(provider) == {"hero": "d" * 64}
+    upstream.mock(return_value=httpx.Response(200, json={"engine": "diffusers"}))
+    assert probe(provider) is None  # an older facade: no map
+    upstream.mock(return_value=httpx.Response(404))
+    direct.mock(return_value=httpx.Response(200, json={"recipes": {"hero": "e" * 64}}))
+    assert probe(provider) == {"hero": "e" * 64}  # straight at the facade
+    upstream.mock(return_value=httpx.Response(503))
+    assert probe(provider) is None
+    upstream.mock(side_effect=httpx.ConnectError("refused"))
+    assert probe(provider) is None
+
+
+def test_a_record_in_the_facades_landed_shape_is_complete() -> None:
+    """The shape qontinui's facade writes (docker/imagegen/qontinui_imagegen/
+    provenance.py, schema qontinui.imagegen.provenance/1): studio reads
+    recipe.hash and licence.spdx from it, and nothing it requires is absent."""
+    from qontinui_studio import provenance
+
+    record = {
+        "schema": "qontinui.imagegen.provenance/1",
+        "job_id": "j1",
+        "created_at": "2026-10-20T01:00:00Z",
+        "recipe": {"id": "hero", "version": 1, "hash": "d" * 64},
+        "models": [
+            {
+                "id": "qwen-image-2512",
+                "role": "generator",
+                "source": {"type": "huggingface"},
+                "spdx": "Apache-2.0",
+                "weights": [{"path": "transformer.safetensors", "sha256": "a" * 64}],
+            },
+            {
+                "id": "real-esrgan-x2plus",
+                "role": "upscaler",
+                "source": {"type": "github"},
+                "spdx": "BSD-3-Clause",
+                "weights": [{"path": "x2.pth", "sha256": "b" * 64}],
+            },
+        ],
+        "licence": {"spdx": "Apache-2.0 AND BSD-3-Clause", "code": {}, "decision_record": {}},
+        "seed": 7,
+        "candidate_index": 0,
+        "prompt": "p",
+        "references": [],
+        "parent_asset": None,
+        "engine": {"facade": "0.1.0"},
+        "marker": {"iptc_digital_source_type": "x"},
+    }
+    assert provenance.facade_missing(record) == []
+    assert provenance.facade_recipe_hash(record) == "d" * 64

@@ -10,14 +10,18 @@ must carry — the SPDX licence, the recipe hash, the weight sha256s and the
 seed — and :func:`missing` is the completeness check every sidecar passes
 before it is written.
 
-The facade record's shape (the Phase 10 contract this adapter reads)::
+The facade record's shape — the Phase 10 contract as landed (qontinui
+``docker/imagegen/qontinui_imagegen/provenance.py``, schema
+``qontinui.imagegen.provenance/1``); the fields this module reads::
 
-    {"recipe": {"id": "hero", "version": 3, "sha256": "<64 hex>"},
-     "models": [{"id": "z-image-turbo",
+    {"recipe": {"id": "hero", "version": 3, "hash": "<64 hex>"},
+     "models": [{"id": "z-image-turbo", "spdx": "Apache-2.0",
                  "weights": [{"path": "...", "sha256": "<64 hex>"}]}],
-     "seed": 1234, "spdx": "Apache-2.0", "prompt": "...",
-     "reference_digests": [], "parent_asset": null,
-     "engine_versions": {"diffusers": "...", "torch": "..."}}
+     "licence": {"spdx": "Apache-2.0"},   # an AND of the models' licences
+     "seed": 1234, ...}
+
+``recipe.hash`` is ``recipe_hash(recipe, manifest)``, the same value the
+facade's ``GET /qontinui/status`` serves under ``recipes``.
 """
 
 from __future__ import annotations
@@ -56,20 +60,43 @@ def _is_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_SHA256.fullmatch(value))
 
 
+def spdx_terms(expression: str) -> list[str]:
+    """The licence ids of an SPDX expression the facade writes: an AND of
+    ids, an id with a space parenthesised. Any other operator (OR, WITH) is
+    returned as itself, so it is never read as admitted."""
+    out: list[str] = []
+    for part in expression.split(" AND "):
+        term = part.strip()
+        if term.startswith("(") and term.endswith(")"):
+            term = term[1:-1].strip()
+        out.append(term)
+    return out
+
+
+def facade_recipe_hash(record: object) -> str | None:
+    """The recipe hash a facade result was made under (``recipe.hash``)."""
+    recipe = record.get("recipe") if isinstance(record, Mapping) else None
+    value = recipe.get("hash") if isinstance(recipe, Mapping) else None
+    return value if _is_sha(value) else None
+
+
 def facade_missing(record: object) -> list[str]:
     """What the facade's ``qontinui_provenance`` lacks of the set a5ec7670
     requires: SPDX licence (admitted), recipe hash, weight sha256s, seed."""
     if not isinstance(record, Mapping):
         return ["qontinui_provenance (absent or not an object)"]
     problems: list[str] = []
-    spdx = record.get("spdx")
+    licence = record.get("licence")
+    spdx = licence.get("spdx") if isinstance(licence, Mapping) else None
     if not isinstance(spdx, str) or not spdx:
-        problems.append("spdx")
-    elif spdx not in ADMITTED_SPDX:
-        problems.append(f"spdx '{spdx}' is not an admitted licence")
+        problems.append("licence.spdx")
+    else:
+        refused = [term for term in spdx_terms(spdx) if term not in ADMITTED_SPDX]
+        if refused:
+            problems.append(f"licence.spdx '{spdx}' names a licence not admitted: {refused}")
     recipe = record.get("recipe")
-    if not isinstance(recipe, Mapping) or not _is_sha(recipe.get("sha256")):
-        problems.append("recipe.sha256")
+    if not isinstance(recipe, Mapping) or not _is_sha(recipe.get("hash")):
+        problems.append("recipe.hash")
     models = record.get("models")
     weights: list[object] = []
     for m in models if isinstance(models, list) else []:

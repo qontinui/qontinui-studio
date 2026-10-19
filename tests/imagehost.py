@@ -27,7 +27,7 @@ RECIPE_SHA = "b" * 64
 
 def facade_provenance(seed: int = 1234, **overrides: Any) -> dict[str, Any]:
     record: dict[str, Any] = {
-        "recipe": {"id": "hero", "version": 1, "sha256": RECIPE_SHA},
+        "recipe": {"id": "hero", "version": 1, "hash": RECIPE_SHA},
         "models": [
             {
                 "id": "z-image-turbo",
@@ -35,7 +35,7 @@ def facade_provenance(seed: int = 1234, **overrides: Any) -> dict[str, Any]:
             }
         ],
         "seed": seed,
-        "spdx": "Apache-2.0",
+        "licence": {"spdx": "Apache-2.0"},
         "prompt": "an empty cafe",
         "reference_digests": [],
         "parent_asset": None,

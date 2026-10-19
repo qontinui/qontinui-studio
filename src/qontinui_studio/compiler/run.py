@@ -51,6 +51,7 @@ from qontinui_schemas.generated.per_type.image_slot_spec import (
 from qontinui_studio import marker, provenance
 from qontinui_studio.briefs import load_brief, validate_brief
 from qontinui_studio.compiler import selected
+from qontinui_studio.compiler.facade import FacadeProbe, HttpFacadeProbe
 from qontinui_studio.compiler.image_store import CandidateStatus, ImageStore, StoreOutcome
 from qontinui_studio.compiler.inputs import Digest, ImagegenManifest, exemplar_digest
 from qontinui_studio.compiler.jcs import canonical_sha256
@@ -76,7 +77,13 @@ from qontinui_studio.publish import (
 from qontinui_studio.sites import SLOT_PATTERN, Site, Slot, check_cross_site
 
 PICK_UNJUDGED = "unjudged (Phase 20 not landed)"
-LAGGING_RECIPE = "the facade has not applied the current recipe"
+# Why-nots that depend on what the facade served, not on the candidate: a
+# batch whose every candidate fails on one of them can never be bound.
+RECIPE_MISMATCH = "recipe mismatch"
+LORA_NOT_APPLIED = "LoRA not applied"
+FACADE_DEPENDENT = (RECIPE_MISMATCH, LORA_NOT_APPLIED)
+# The reason a batch failed for a facade-dependent cause starts with this.
+FACADE_FAILED = "facade output unbindable"
 # The site slot of a spec no image file is published for: a manifest key only.
 MANIFEST_ONLY_SLOT = Slot(width=1, height=1, category="decorative", formats=["png"], rendered=False)
 RESUMABLE = ("generating", "generated", "refused")
@@ -101,6 +108,7 @@ SlotStatus = Literal[
     "refused",
     "awaiting_alt_text",
     "generation_refused",
+    "deferred",
 ]
 # What the checkout holds for an asset-route slot.
 BindingState = Literal["missing", "fresh", "stale", "unknown", "bound_elsewhere"]
@@ -179,7 +187,7 @@ class CompileReport:
             return 6
         if "refused" in statuses:
             return 2
-        if statuses & {"generating", "failed"}:
+        if statuses & {"generating", "failed", "deferred"}:
             return 3
         if statuses & SESSION_WORK:
             return 7
@@ -233,6 +241,8 @@ class Readers:
     imagery: Callable[[str], Digest]
     imagegen: ImagegenManifest
     store: ImageStore
+    # The recipe map a facade provider serves (None: none served, or UNKNOWN).
+    facade: FacadeProbe = field(default_factory=HttpFacadeProbe)
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +517,12 @@ def _signature(
 
 
 def _write_brief(
-    ctx: Context, target: CompileTarget, spec: LoadedSpec, route: Route, priority: str
+    ctx: Context,
+    target: CompileTarget,
+    spec: LoadedSpec,
+    route: Route,
+    priority: str,
+    variants: int,
 ) -> Path:
     prompt, negative = prompt_for(spec, route)
     w, h = (int(v) for v in spec.spec.aspect.preferred.split("/"))
@@ -519,7 +534,7 @@ def _write_brief(
         "aspect_ratio": f"{w}:{h}",
         "prompt": prompt,
         "provider_preference": list(target.providers),
-        "variants": target.candidates,
+        "variants": variants,
         "priority": priority,
     }
     if negative:
@@ -531,7 +546,7 @@ def _write_brief(
         brief["recipe"] = recipe_id
     directory = ctx.workspace.state_dir / "compile" / target.id / "briefs"
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{brief_slug(spec.slot_id)}-{spec.sha256[:16]}-{priority}.yaml"
+    path = directory / f"{brief_slug(spec.slot_id)}-{spec.sha256[:16]}-{priority}-n{variants}.yaml"
     text = yaml.safe_dump(brief, sort_keys=True, allow_unicode=True)
     if not path.is_file() or path.read_text(encoding="utf-8") != text:
         path.write_text(text, encoding="utf-8")
@@ -579,6 +594,59 @@ def _existing_batch(
     return keep
 
 
+def _served_mismatch(
+    ctx: Context, target: CompileTarget, spec: LoadedSpec, route: Route, readers: Readers
+) -> str | None:
+    """Why no batch may be generated now, or None. Only when EVERY provider
+    the target names is the fleet's facade, and each serves a recipe map
+    whose hash for this slot's recipe differs from the one the licence
+    manifest names; a facade with no map (older), an unreadable manifest or a
+    non-facade provider leaves the decision to the candidates themselves."""
+    recipe_id = target.recipe_for(spec, route)
+    if recipe_id is None:
+        return None
+    named = readers.imagegen.recipe(recipe_id)
+    if not named.known:
+        return None
+    reasons: list[str] = []
+    for pid in target.providers:
+        try:
+            provider = ctx.inventory.get(pid)
+        except ConfigError:
+            return None
+        if provider.adapter != FACADE_ADAPTER:
+            return None
+        served = readers.facade(provider)
+        if served is None:
+            return None  # no map: the candidates' provenance decides
+        hash_ = served.get(recipe_id)
+        if hash_ == named.value:
+            return None
+        reasons.append(
+            f"{pid}: the facade serves recipe '{recipe_id}' as "
+            f"{(hash_ or 'nothing')[:12]}; the manifest names {str(named.value)[:12]}"
+        )
+    return "; ".join(reasons) or None
+
+
+def _cooling(
+    conn: sqlite3.Connection, target: CompileTarget, spec: LoadedSpec, signature: str
+) -> bool:
+    """Whether the newest batch for these exact inputs failed because what the
+    facade served could not be bound."""
+    row = conn.execute(
+        "SELECT status, reason FROM batches WHERE compile_target = ? AND compile_slot = ? "
+        "AND compile_spec_sha256 = ? AND compile_inputs_json = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (target.id, spec.slot_id, spec.sha256, signature),
+    ).fetchone()
+    return bool(
+        row is not None
+        and row["status"] == "failed"
+        and str(row["reason"] or "").startswith(FACADE_FAILED)
+    )
+
+
 def _republish(conn: sqlite3.Connection, site: Site, batch_id: str, now: datetime) -> int:
     """Make a published batch publishable again into THIS checkout, whose slot
     is missing or stale although the batch's inputs are unchanged: its rows
@@ -616,10 +684,10 @@ def _index(asset: AssetRecord) -> int:
 
 
 def _engine_recipe(raw_sidecar: dict[str, Any] | None) -> str | None:
-    facade = raw_sidecar.get("qontinui_provenance") if raw_sidecar else None
-    recipe = facade.get("recipe") if isinstance(facade, dict) else None
-    value = recipe.get("sha256") if isinstance(recipe, dict) else None
-    return value if isinstance(value, str) else None
+    """The facade recipe hash a candidate was made under."""
+    return provenance.facade_recipe_hash(
+        raw_sidecar.get("qontinui_provenance") if raw_sidecar else None
+    )
 
 
 def _applied_weights(raw_sidecar: dict[str, Any] | None) -> set[str]:
@@ -675,18 +743,23 @@ def _candidates(
             why_not = "the facade reported no recipe hash in qontinui_provenance"
         if inputs.lora is not None and inputs.lora.value not in _applied_weights(sidecar):
             why_not = (
-                f"the slot names LoRA '{spec.spec.style.lora}', and this candidate's "
-                "provenance does not show those weights applied"
+                f"{LORA_NOT_APPLIED}: the slot names LoRA '{spec.spec.style.lora}', and this "
+                "candidate's provenance does not show those weights applied"
             )
         current = _current_recipe(
             ctx, target, spec, route, slot, asset.provider, inputs.look_sha256, readers
         )
         if why_not is None and current.known and current.value != recipe:
-            # A binding made from it would be stale the moment it is written
-            # (a facade still serving the recipe the manifest has moved past).
+            # A binding made from it would be stale the moment it is written:
+            # the facade served one recipe and the manifest names another.
+            recipe_id = target.recipe_for(spec, route)
+            named = readers.imagegen.recipe(recipe_id).value if recipe_id else None
             why_not = (
-                f"{LAGGING_RECIPE}: the candidate was made under recipe {recipe[:12]}, the "
-                f"current one is {str(current.value)[:12]}"
+                f"{RECIPE_MISMATCH}: the facade served {(engine or '?')[:12]}; the manifest "
+                f"names {(named or '?')[:12]}"
+                if engine is not None and named is not None and engine != named
+                else f"{RECIPE_MISMATCH}: the candidate's compile recipe is {recipe[:12]}; "
+                f"the current one is {str(current.value)[:12]}"
             )
         out.append(_Candidate(asset, sidecar, recipe, why_not is None, why_not))
     return out
@@ -1071,8 +1144,23 @@ def _compile_one(
     depth = len(PurePosixPath(target.publish_dir.as_posix()).parts)
     checkout = str(site.publish_dir.resolve().parents[depth - 1])
     batch = _existing_batch(ctx.conn, target, spec, signature, checkout, now)
+    variants = target.candidates
     if batch is None:
-        brief_path = _write_brief(ctx, target, spec, route, priority)
+        served = _served_mismatch(ctx, target, spec, route, readers)
+        if served is not None:
+            rep.status = "deferred"
+            rep.reasons.append(f"{served}; no generation until they agree")
+            return
+        if _cooling(ctx.conn, target, spec, signature):
+            # The last batch for these inputs could not be bound because of what
+            # the facade served, and no recipe map says whether that changed:
+            # re-probe with one candidate, not N.
+            variants = 1
+            rep.reasons.append(
+                "a one-candidate probe: the previous batch for these inputs could not be "
+                "bound (the facade's output did not match)"
+            )
+        brief_path = _write_brief(ctx, target, spec, route, priority, variants)
         loaded = load_brief(brief_path, root=ctx.workspace.root)
         problems = validate_brief(loaded.brief, ctx.sites, ctx.inventory)
         if problems:
@@ -1166,13 +1254,13 @@ def _publish_pick(
     if not usable:
         rep.status = "refused"
         rep.reasons += ["no usable candidate: " + "; ".join(c.why_not or "" for c in candidates)]
-        if all(LAGGING_RECIPE in (c.why_not or "") for c in candidates):
-            # Its bytes can never be bound: a later run must generate afresh
-            # once the facade serves the current recipe, not resume this batch.
+        if any(c.why_not and c.why_not.startswith(FACADE_DEPENDENT) for c in candidates):
+            # Nothing in it can be bound, and why depends on what the facade
+            # served: never resume it; a later run probes afresh (cool-down).
             ctx.conn.execute(
                 "UPDATE batches SET status = 'failed', reason = ? WHERE id = ? "
                 "AND status IN ('generated', 'refused', 'unpublished', 'published')",
-                (f"{LAGGING_RECIPE}; generate again once it has", batch_id),
+                (f"{FACADE_FAILED}: no candidate can be bound", batch_id),
             )
             ctx.conn.commit()
         return None
@@ -1342,6 +1430,22 @@ def _upload_candidates(
     returns the sha256 of every upload the store confirmed."""
     confirmed: set[str] = set()
     for c in candidates:
+        if c.why_not and c.why_not.startswith(RECIPE_MISMATCH):
+            # Made under a recipe the manifest does not name: the store never
+            # holds it, and no slot is offered it.
+            rep.candidates.append(
+                {
+                    "index": _index(c.asset),
+                    "asset_sha256": c.asset.sha256,
+                    "provider": c.asset.provider,
+                    "model": c.asset.model,
+                    "recipe_sha256": c.recipe_sha256,
+                    "usable": False,
+                    "why_not": c.why_not,
+                    "store": {"status": "skipped", "detail": "not uploaded: recipe mismatch"},
+                }
+            )
+            continue
         up = store.upload(Path(c.asset.raw_path), "candidate", c.sidecar)
         if up.confirmed:
             confirmed.add(c.asset.sha256)

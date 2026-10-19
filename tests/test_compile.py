@@ -668,12 +668,18 @@ LORA = "c" * 64
 
 
 def _facade(
-    env: CompileEnv, weights: list[str], recipe: list[str] | None = None
+    env: CompileEnv,
+    weights: list[str],
+    recipe: list[str] | None = None,
+    status_map: dict[str, str] | None = None,
+    per_call: Callable[[int], tuple[list[str], str]] | None = None,
 ) -> list[dict[str, object]]:
     """Point the target at the local facade and answer its requests (respx).
     ``recipe[0]`` is the recipe hash the facade reports running: a facade
     serves the manifest it was deployed with, so a test moving the manifest
-    moves it too."""
+    moves it too. ``status_map`` is the ``recipes`` map its ``/qontinui/status``
+    serves (None: an older facade that serves none). ``per_call(n)`` gives the
+    n-th answer's (weights, recipe hash) instead."""
     served = recipe if recipe is not None else ["d" * 64]
     import base64
     import io
@@ -696,13 +702,14 @@ def _facade(
         sent.append(body)
         buf = io.BytesIO()
         Image.new("RGB", (64, 36), (len(sent) * 40, 90, 120)).save(buf, "PNG")
+        w_now, r_now = per_call(len(sent)) if per_call else (weights, served[0])
         record = {
-            "recipe": {"id": body.get("recipe"), "version": 1, "sha256": served[0]},
+            "recipe": {"id": body.get("recipe"), "version": 1, "hash": r_now},
             "models": [
-                {"id": "z-image-turbo", "weights": [{"path": "w", "sha256": w} for w in weights]}
+                {"id": "z-image-turbo", "weights": [{"path": "w", "sha256": w} for w in w_now]}
             ],
             "seed": 1000 + len(sent),
-            "spdx": "Apache-2.0",
+            "licence": {"spdx": "Apache-2.0"},
         }
         return httpx.Response(
             200,
@@ -717,6 +724,16 @@ def _facade(
         )
 
     respx.post("http://127.0.0.1:8100/v1/images/generations").mock(side_effect=answer)
+
+    def status(request: httpx.Request) -> httpx.Response:
+        body: dict[str, object] = {"engine": "fake"}
+        if status_map is not None:
+            body["recipes"] = dict(status_map)  # read now: a test may move it
+        return httpx.Response(200, json=body)
+
+    respx.get("http://127.0.0.1:8100/upstream/z-image-turbo/qontinui/status").mock(
+        side_effect=status
+    )
     # The fixture context wraps every adapter in a fake; the facade's own
     # adapter (its wire mocked above) is the one under test here.
     from qontinui_studio.adapters import build_adapter
@@ -1205,12 +1222,16 @@ def test_a_facade_lagging_behind_the_manifest_is_never_bound(
     manifest_py.write_text(manifest_py.read_text().replace("d" * 64, "f" * 64))
     env.imagegen = ImagegenManifest(imagegen_dir)
     before = _snapshot(env.publish_dir)
-    # The facade still runs the old recipe (not redeployed yet).
+    # The facade still runs the old recipe (not redeployed yet), and serves no
+    # recipe map (an older facade): the candidates' provenance decides.
     for _ in range(2):
         report = env.run(changed=True)
         [slot] = report.slots
         assert slot.status == "refused" and report.exit_code() == 2
-        assert any("the facade has not applied the current recipe" in r for r in slot.reasons)
+        assert any(
+            f"recipe mismatch: the facade served {'d' * 12}; the manifest names {'f' * 12}" in r
+            for r in slot.reasons
+        )
         assert not report.files_written and _snapshot(env.publish_dir) == before
         assert not any("republished" in r for r in slot.reasons)
         lagging = (
@@ -1300,3 +1321,135 @@ def test_republishing_in_one_checkout_keeps_the_others_publication(
     assert live == {env.publish_dir, other_publish}
     assert [s.status for s in env.run(checkout=other).slots] == ["fresh"]
     assert [s.status for s in env.run().slots] == ["fresh"]
+
+
+# ---- review round 5: a recipe mismatch costs no generation it can avoid ------------
+
+
+def _move_manifest(imagegen_dir: Path, old: str, new: str) -> None:
+    manifest_py = imagegen_dir / "qontinui_imagegen" / "manifest.py"
+    manifest_py.write_text(manifest_py.read_text().replace(old, new))
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_served_recipe_map_that_disagrees_defers_without_generating(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    status = {"hero": "d" * 64}
+    served = ["d" * 64]
+    sent = _facade(env, weights=["9" * 64], recipe=served, status_map=status)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    assert [s.status for s in env.run().slots] == ["compiled"]  # the map agrees
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    calls, uploads, count = len(sent), len(env.store.uploads), len(batches(env.context()))
+    for _ in range(3):
+        report = env.run(changed=True)
+        [slot] = report.slots
+        assert slot.status == "deferred" and report.exit_code() == 3
+        assert any(
+            f"the facade serves recipe 'hero' as {'d' * 12}; the manifest names {'f' * 12}" in r
+            for r in slot.reasons
+        )
+        assert not report.files_written
+    assert len(sent) == calls and len(env.store.uploads) == uploads
+    assert len(batches(env.context())) == count  # no batch at all
+    # The facade is redeployed: its map agrees, and the slot compiles.
+    status["hero"] = served[0] = "f" * 64
+    report = env.run(changed=True)
+    assert [s.status for s in report.slots] == ["compiled"] and len(sent) > calls
+    assert [s.status for s in env.run(dry_run=True).slots] == ["fresh"]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_facade_without_a_recipe_map_falls_back_to_the_candidates(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    sent = _facade(env, weights=["9" * 64])  # no map served
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    calls = len(sent)
+    report = env.run(changed=True)
+    assert report.slots[0].status == "refused" and len(sent) - calls == 2  # generated, checked
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_mismatched_candidates_are_never_uploaded_or_proposed(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    _facade(env, weights=["9" * 64])
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    env.run()
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    uploads, proposals = len(env.store.uploads), len(env.store.proposals)
+    report = env.run(changed=True)
+    [slot] = report.slots
+    assert slot.status == "refused"
+    assert len(env.store.uploads) == uploads and len(env.store.proposals) == proposals
+    assert all(c["store"]["status"] == "skipped" for c in slot.candidates)
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_after_a_mismatch_each_run_probes_with_one_candidate(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    served = ["d" * 64]
+    sent = _facade(env, weights=["9" * 64], recipe=served)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    env.run()
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    nights = []
+    for _ in range(3):
+        before = len(sent)
+        report = env.run(changed=True)
+        nights.append((report.slots[0].status, len(sent) - before))
+    # The first night generates N (2); after it, one candidate per run.
+    assert nights == [("refused", 2), ("refused", 1), ("refused", 1)]
+    served[0] = "f" * 64  # redeployed
+    before = len(sent)
+    report = env.run(changed=True)
+    assert report.slots[0].status == "compiled" and len(sent) - before == 1
+    assert report.slots[0].pick is not None and report.slots[0].pick["of"] == 1
+    assert [s.status for s in env.run(dry_run=True).slots] == ["fresh"]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_mixed_facade_failures_fail_the_batch(env: CompileEnv, imagegen_dir: Path) -> None:
+    """One candidate lacks the LoRA, the other was made under a stale recipe:
+    nothing can be bound, and the batch is never resumed."""
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    def answers(n: int) -> tuple[list[str], str]:
+        return ([LORA], "d" * 64) if n == 1 else (["9" * 64], "f" * 64)
+
+    _facade(env, weights=[], per_call=answers)
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO, lora="qontinui-house-v1")
+    report = env.run()
+    [slot] = report.slots
+    assert slot.status == "refused"
+    reasons = " ".join(c.get("why_not", "") for c in slot.candidates)
+    assert "recipe mismatch" in reasons and "LoRA not applied" in reasons
+    status = (
+        env.context()
+        .conn.execute("SELECT status FROM batches WHERE id = ?", (slot.batch_id,))
+        .fetchone()[0]
+    )
+    assert status == "failed"

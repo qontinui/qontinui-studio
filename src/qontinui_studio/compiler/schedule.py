@@ -153,20 +153,21 @@ class CompileTask:
                 f"{repo_name}. If it refuses, stop and report its message (nothing to hand back).",
                 manifest_step,
                 f"Step 2: from this working directory run: {compile_cmd} (with {replaced} "
-                f"replaced). It writes {report} and {evidence}. Read the report's exit_code and "
-                "files_written, and route on files_written FIRST: whatever the exit code, "
-                "files_written true goes to step 4 (a refusal can come after slots were "
-                "written). Exit 6 (image generation switched off or refused) with "
-                "files_written false: go to the final step. Exit 3 = generation deferred or "
-                "failed (a host outside its bulk window, or busy): the batch resumes on the "
-                "next run; go to step 3. Exit 7 with slots in status awaiting_alt_text: open "
-                "each such slot's derivative files listed in the report, write one factual "
-                "alt text per slot describing exactly that image, save them as JSON "
+                f"replaced). It writes {report} and {evidence}. FIRST, if the report's "
+                "exit_code is 7 and some slot is in status awaiting_alt_text: open each such "
+                "slot's derivative files listed in the report, write one factual alt text per "
+                "slot describing exactly that image, save them as JSON "
                 '{"<slot id>": {"asset_sha256": "<the slot pick asset_sha256>", "text": '
                 '"<alt text>"}} in a file outside W, and run the step 2 command once more '
                 "with --alt-texts <that file>. Leave every other status for an interactive "
-                "session; do not author SVGs or change icons.",
-                "Step 3: if files_written is false, go to the final step.",
+                "session; do not author SVGs or change icons. The exit code says why nothing "
+                "more happened (6 = image generation switched off or refused; 3 = deferred, "
+                "busy or failed, resumed on a later run), but it does not decide what you do "
+                "next: step 3 does.",
+                f"Step 3: in W, run git status --porcelain -- {t.publish_dir.as_posix()} . "
+                "If it prints nothing, W's publish dir is the same as its HEAD: go to the final "
+                "step. Otherwise go to step 4 (whatever the exit code: a refusal can come after "
+                "slots were written).",
                 f"Step 4: in W, run git status: only files under {t.publish_dir.as_posix()} "
                 "may have changed; if anything else changed, report it and go to the final "
                 f"step. Stage only {t.publish_dir.as_posix()}, commit with the message "
