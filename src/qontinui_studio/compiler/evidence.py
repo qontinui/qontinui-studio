@@ -157,6 +157,11 @@ def render_markdown(report: CompileReport) -> str:
         + ".",
         f"Mode: {'overnight re-render (`--changed`, bulk)' if report.changed_only else 'interactive'}.",
     ]
+    if report.runs > 1 and report.head:
+        lines.append(
+            f"Covers {report.runs} runs on checkout HEAD `{report.head[:12]}`: a slot an earlier "
+            "run compiled keeps that run's evidence."
+        )
     if report.imagegen:
         lines.append(f"Image generation: {report.imagegen}.")
     if report.refusal:

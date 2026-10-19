@@ -189,5 +189,15 @@ def make_checkout(path: Path) -> Path:
     gitdir = path.parent / f".git-common-{path.name}" / "worktrees" / path.name
     gitdir.mkdir(parents=True)
     (gitdir / "commondir").write_text("../..\n")
+    (gitdir / "HEAD").write_text(f"ref: refs/heads/agent/{path.name}\n")
+    set_head(path, "a" * 40)
     (path / ".git").write_text(f"gitdir: {gitdir}\n")
     return path
+
+
+def set_head(checkout: Path, sha: str) -> None:
+    """Point the checkout's branch at ``sha`` (a commit, as git would)."""
+    common = checkout.parent / f".git-common-{checkout.name}"
+    ref = common / "refs" / "heads" / "agent" / checkout.name
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text(sha + "\n")

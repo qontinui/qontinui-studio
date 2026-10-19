@@ -36,6 +36,7 @@ from qontinui_studio.compiler.target import load_target
 from qontinui_studio.library import Library
 from qontinui_studio.locks import LOCK_NAME, lock_path
 from qontinui_studio.postprocess import sha256_file, trace_svg
+from qontinui_studio.providers import Provider
 from qontinui_studio.store import connect
 
 from .compile_support import TARGET
@@ -608,12 +609,8 @@ def test_a_lock_dir_must_be_this_users_and_closed(
         user_lock_dir()
 
 
-@respx.mock
-def test_the_facade_probe_reads_a_served_recipe_map_or_says_none() -> None:
-    from qontinui_studio.compiler.facade import HttpFacadeProbe
-    from qontinui_studio.providers import Provider
-
-    provider = Provider.model_validate(
+def _facade_provider() -> Provider:
+    return Provider.model_validate(
         {
             "id": "local-gpu",
             "provider": "facade",
@@ -630,22 +627,113 @@ def test_the_facade_probe_reads_a_served_recipe_map_or_says_none() -> None:
             "domains": ["f.test"],
         }
     )
-    upstream = respx.get("http://127.0.0.1:8100/upstream/z-image-turbo/qontinui/status")
-    direct = respx.get("http://127.0.0.1:8100/qontinui/status")
-    probe = HttpFacadeProbe()
-    upstream.mock(
+
+
+SWAP = "http://127.0.0.1:8100"
+FACADE_MODELS = {
+    "data": [
+        {
+            "id": "qontinui-imagegen",
+            "meta": {"llamaswap": {"qontinui_capability": "image_generation"}},
+        },
+        {"id": "gemma-4-31b", "meta": {"llamaswap": {"qontinui_capability": "text"}}},
+    ]
+}
+
+
+def _running(*models: str) -> httpx.Response:
+    return httpx.Response(200, json={"running": [{"model": m, "state": "ready"} for m in models]})
+
+
+@respx.mock
+def test_the_facade_probe_asks_only_a_resident_facade() -> None:
+    """Behind llama-swap, ``/upstream/<model>/...`` loads the model it names
+    and evicts the resident one. So the probe reads ``/running`` (loads
+    nothing) first and reaches the facade's status only when its entry is
+    already resident; otherwise it says UNKNOWN without asking."""
+    from qontinui_studio.compiler.facade import HttpFacadeProbe
+
+    provider = _facade_provider()
+    running = respx.get(f"{SWAP}/running").mock(return_value=_running("gemma-4-31b"))
+    respx.get(f"{SWAP}/v1/models").mock(return_value=httpx.Response(200, json=FACADE_MODELS))
+    upstream = respx.get(url__regex=r".*/upstream/.*").mock(
         return_value=httpx.Response(200, json={"recipes": {"hero": "d" * 64, "x": "bad"}})
     )
-    assert probe(provider) == {"hero": "d" * 64}
-    upstream.mock(return_value=httpx.Response(200, json={"engine": "diffusers"}))
-    assert probe(provider) is None  # an older facade: no map
-    upstream.mock(return_value=httpx.Response(404))
-    direct.mock(return_value=httpx.Response(200, json={"recipes": {"hero": "e" * 64}}))
-    assert probe(provider) == {"hero": "e" * 64}  # straight at the facade
-    upstream.mock(return_value=httpx.Response(503))
-    assert probe(provider) is None
-    upstream.mock(side_effect=httpx.ConnectError("refused"))
-    assert probe(provider) is None
+
+    asleep = HttpFacadeProbe()(provider, wake=False)
+    assert asleep.state == "unknown" and "not resident" in asleep.detail
+    assert upstream.call_count == 0  # the gemma model stayed resident
+
+    running.mock(return_value=_running("gemma-4-31b", "qontinui-imagegen"))
+    probe = HttpFacadeProbe()
+    served = probe(provider, wake=False)
+    assert served.state == "map" and served.recipes == {"hero": "d" * 64}
+    assert upstream.calls.last.request.url.path == "/upstream/qontinui-imagegen/qontinui/status"
+    assert upstream.calls.last.request.extensions["timeout"]["read"] == 15.0
+
+
+@respx.mock
+def test_the_facade_probe_wakes_the_facade_only_when_asked_to() -> None:
+    """``wake``: a generation is about to load the facade anyway, so the probe
+    may load it now — with the longer timeout a cold start needs."""
+    from qontinui_studio.compiler.facade import WAKE_TIMEOUT_S, HttpFacadeProbe
+
+    provider = _facade_provider()
+    respx.get(f"{SWAP}/running").mock(return_value=_running("gemma-4-31b"))
+    respx.get(f"{SWAP}/v1/models").mock(return_value=httpx.Response(200, json=FACADE_MODELS))
+    upstream = respx.get(f"{SWAP}/upstream/qontinui-imagegen/qontinui/status").mock(
+        return_value=httpx.Response(200, json={"engine": "diffusers"})
+    )
+    served = HttpFacadeProbe()(provider, wake=True)
+    assert served.state == "absent"  # an older facade: no map
+    assert upstream.call_count == 1
+    assert upstream.calls.last.request.extensions["timeout"]["read"] == WAKE_TIMEOUT_S
+
+
+@respx.mock
+def test_the_facade_probe_answers_each_provider_once_per_run() -> None:
+    from qontinui_studio.compiler.facade import HttpFacadeProbe
+
+    provider = _facade_provider()
+    running = respx.get(f"{SWAP}/running").mock(return_value=_running("qontinui-imagegen"))
+    respx.get(f"{SWAP}/v1/models").mock(return_value=httpx.Response(200, json=FACADE_MODELS))
+    upstream = respx.get(url__regex=r".*/upstream/.*").mock(
+        return_value=httpx.Response(200, json={"recipes": {"hero": "d" * 64}})
+    )
+    probe = HttpFacadeProbe()
+    for _ in range(4):
+        assert probe(provider, wake=True).recipes == {"hero": "d" * 64}
+    assert (running.call_count, upstream.call_count) == (1, 1)
+
+    # An UNKNOWN that was not allowed to wake the facade is asked again by a
+    # caller that may (a generation is about to run); a woken answer is final.
+    running.mock(return_value=_running("gemma-4-31b"))
+    cold = HttpFacadeProbe()
+    assert cold(provider, wake=False).state == "unknown"
+    assert cold(provider, wake=False).state == "unknown"
+    assert upstream.call_count == 1
+    assert cold(provider, wake=True).state == "map"
+    assert cold(provider, wake=True).state == "map"
+    assert upstream.call_count == 2
+
+
+@respx.mock
+def test_the_facade_probe_without_llama_swap_asks_the_facade_and_unreadable_is_unknown() -> None:
+    from qontinui_studio.compiler.facade import HttpFacadeProbe
+
+    provider = _facade_provider()
+    running = respx.get(f"{SWAP}/running").mock(return_value=httpx.Response(404))
+    direct = respx.get(f"{SWAP}/qontinui/status").mock(
+        return_value=httpx.Response(200, json={"recipes": {"hero": "e" * 64}})
+    )
+    assert HttpFacadeProbe()(provider, wake=False).recipes == {"hero": "e" * 64}
+    direct.mock(return_value=httpx.Response(503))
+    assert HttpFacadeProbe()(provider, wake=False).state == "unknown"
+    running.mock(side_effect=httpx.ConnectError("refused"))
+    assert HttpFacadeProbe()(provider, wake=True).state == "unknown"
+    running.mock(return_value=httpx.Response(200, json={"nope": 1}))
+    assert HttpFacadeProbe()(provider, wake=True).state == "unknown"
+    assert direct.call_count == 2
 
 
 def test_a_record_in_the_facades_landed_shape_is_complete() -> None:

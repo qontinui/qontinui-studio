@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from qontinui_studio.marker import DIGITAL_SOURCE_TYPE
+from qontinui_studio.spdx import SpdxError, spdx_blockers
 
 SCHEMA = "qontinui-studio/provenance/v1"
 SIDECAR_SUFFIX = ".provenance.json"
@@ -42,10 +43,6 @@ SIDECAR_SUFFIX = ".provenance.json"
 LOCAL_ADAPTER = "openai_compatible_images"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-# The SPDX ids decision record a5ec7670 admits (Apache-2.0, MIT, BSD family).
-ADMITTED_SPDX = frozenset(
-    {"Apache-2.0", "MIT", "MIT-0", "MIT-CMU", "BSD-2-Clause", "BSD-3-Clause", "0BSD"}
-)
 C2PA_ABSENT = {
     "signed": False,
     "reason": "no C2PA signing credential is configured; the IPTC marker is the mandatory part",
@@ -58,19 +55,6 @@ def sidecar_path(path: Path) -> Path:
 
 def _is_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_SHA256.fullmatch(value))
-
-
-def spdx_terms(expression: str) -> list[str]:
-    """The licence ids of an SPDX expression the facade writes: an AND of
-    ids, an id with a space parenthesised. Any other operator (OR, WITH) is
-    returned as itself, so it is never read as admitted."""
-    out: list[str] = []
-    for part in expression.split(" AND "):
-        term = part.strip()
-        if term.startswith("(") and term.endswith(")"):
-            term = term[1:-1].strip()
-        out.append(term)
-    return out
 
 
 def facade_recipe_hash(record: object) -> str | None:
@@ -91,9 +75,12 @@ def facade_missing(record: object) -> list[str]:
     if not isinstance(spdx, str) or not spdx:
         problems.append("licence.spdx")
     else:
-        refused = [term for term in spdx_terms(spdx) if term not in ADMITTED_SPDX]
+        try:
+            refused = spdx_blockers(spdx)
+        except SpdxError as e:
+            refused = [f"unparseable ({e})"]
         if refused:
-            problems.append(f"licence.spdx '{spdx}' names a licence not admitted: {refused}")
+            problems.append(f"licence.spdx '{spdx}' is not admitted: {refused}")
     recipe = record.get("recipe")
     if not isinstance(recipe, Mapping) or not _is_sha(recipe.get("hash")):
         problems.append("recipe.hash")

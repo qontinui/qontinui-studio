@@ -27,7 +27,7 @@ from qontinui_studio.locks import LOCK_NAME
 from qontinui_studio.pipeline import Context, resume_all
 from qontinui_studio.postprocess import sha256_file
 
-from .compile_support import IMAGERY, IMAGERY_2, CompileEnv, make_checkout
+from .compile_support import IMAGERY, IMAGERY_2, CompileEnv, make_checkout, set_head
 from .conftest import FakeClock
 
 HERO = "marketing.home.hero"
@@ -646,6 +646,122 @@ def test_the_cli_writes_report_and_evidence_and_refuses_publish_of_a_compile_bat
         assert r.exit_code == 2 and "compile target 'web'" in r.output
 
 
+def _cli_compile(
+    env: CompileEnv,
+    studio_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *args: str,
+) -> dict[str, object]:
+    from qontinui_studio import cli
+
+    real_context = cli._context
+
+    def context(root: Path, generate: bool = False) -> Context:
+        ctx = real_context(root, generate)
+        made = env.make_context()
+        ctx.bridge, ctx.fetch, ctx.clock, ctx.sleep = (
+            made.bridge,
+            made.fetch,
+            made.clock,
+            made.sleep,
+        )
+        ctx.adapters = made.adapters
+        return ctx
+
+    monkeypatch.setattr(cli, "_context", context)
+    monkeypatch.setattr(cli, "HttpImageStore", lambda repo: env.store)
+    monkeypatch.setattr(cli, "ImageryReader", lambda: env.imagery_reader)
+    result = CliRunner().invoke(
+        cli.main,
+        ["--root", str(studio_root), "compile", "--slots", str(env.slots_dir), "--json", *args],
+    )
+    assert result.exit_code in (0, 7), result.output
+    data = json.loads(result.stdout)
+    assert isinstance(data, dict)
+    return data
+
+
+def test_a_rerun_on_the_same_head_merges_into_the_evidence(
+    env: CompileEnv, studio_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The overnight task writes alt texts and reruns compile on the same
+    checkout and HEAD: the PR body must still carry the first run's compiled
+    slots, which the rerun finds fresh."""
+    env.write_spec(HERO)
+    closing = "marketing.home.closing"
+    env.write_spec(closing, alt="kind: required", job="Close the page on a quiet workshop scene.")
+    state = studio_root / ".studio" / "compile" / "web"
+    first = _cli_compile(env, studio_root, monkeypatch)
+    assert {s["slot_id"]: s["status"] for s in first["slots"]} == {  # type: ignore[union-attr,index]
+        HERO: "compiled",
+        closing: "awaiting_alt_text",
+    }
+    [waiting] = [s for s in first["slots"] if s["slot_id"] == closing]  # type: ignore[union-attr,index]
+    alt = tmp_path / "alt.json"
+    alt.write_text(
+        json.dumps({closing: {"asset_sha256": waiting["pick"]["asset_sha256"], "text": "A desk."}})
+    )
+    second = _cli_compile(env, studio_root, monkeypatch, "--alt-texts", str(alt))
+    assert second["exit_code"] == 0 and second["runs"] == 2
+    assert {s["slot_id"]: s["status"] for s in second["slots"]} == {  # type: ignore[union-attr,index]
+        HERO: "compiled",
+        closing: "compiled",
+    }
+    evidence = (state / "evidence.md").read_text()
+    assert f"### `{HERO}` — compiled" in evidence and f"### `{closing}` — compiled" in evidence
+    assert "Covers 2 runs on checkout HEAD" in evidence
+    assert json.loads((state / "report.json").read_text())["runs"] == 2
+
+    # A new HEAD (the first PR's commit landed): a fresh report, not a merge.
+    set_head(env.checkout, "b" * 40)
+    third = _cli_compile(env, studio_root, monkeypatch)
+    assert third["runs"] == 1 and third["head"] == "b" * 40
+    assert {s["status"] for s in third["slots"]} == {"fresh"}  # type: ignore[union-attr]
+    assert "— compiled" not in (state / "evidence.md").read_text()
+
+
+def test_merge_reports_keeps_only_the_same_checkout_and_head(env: CompileEnv) -> None:
+    from qontinui_studio.compiler.run import merge_reports
+
+    env.write_spec(HERO)
+    first = env.run()
+    assert first.head == "a" * 40
+    previous = first.as_json()
+    again = env.run()
+    assert [s.status for s in again.slots] == ["fresh"]
+    merged = merge_reports(previous, again)
+    assert merged is not None and [s.status for s in merged.slots] == ["compiled"]
+    assert merged.slots[0].batch_id == first.slots[0].batch_id
+    assert merged.files_written  # the first run wrote them
+    assert merge_reports({**previous, "head": "c" * 40}, again) is None
+    assert merge_reports({**previous, "checkout": "/elsewhere"}, again) is None
+    assert merge_reports({**previous, "slots": [{"slot_id": HERO, "nope": 1}]}, again) is None
+    unread = env.run()
+    unread.head = None  # HEAD unreadable: never merged
+    assert merge_reports(previous, unread) is None
+
+
+def test_checkout_head_reads_git_files(tmp_path: Path) -> None:
+    from qontinui_studio.compiler.run import checkout_head
+
+    checkout = make_checkout(tmp_path / "wt")
+    assert checkout_head(checkout) == "a" * 40
+    common = tmp_path / ".git-common-wt"
+    ref = common / "refs" / "heads" / "agent" / "wt"
+    ref.unlink()
+    (common / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{'e' * 40} refs/heads/agent/wt\n"
+    )
+    assert checkout_head(checkout) == "e" * 40
+    gitdir = common / "worktrees" / "wt"
+    (gitdir / "HEAD").write_text("f" * 40 + "\n")  # detached
+    assert checkout_head(checkout) == "f" * 40
+    (gitdir / "HEAD").write_text("ref: refs/heads/gone\n")
+    assert checkout_head(checkout) is None
+    (checkout / ".git").unlink()
+    assert checkout_head(checkout) is None
+
+
 # ---- the fleet's own facade: engine recipe hashes and LoRA weights ---------------------
 
 LOCAL_ROW = """
@@ -673,13 +789,23 @@ def _facade(
     recipe: list[str] | None = None,
     status_map: dict[str, str] | None = None,
     per_call: Callable[[int], tuple[list[str], str]] | None = None,
+    resident: list[bool] | None = None,
+    probes: list[str] | None = None,
+    serve_map: list[bool] | None = None,
 ) -> list[dict[str, object]]:
     """Point the target at the local facade and answer its requests (respx).
     ``recipe[0]`` is the recipe hash the facade reports running: a facade
     serves the manifest it was deployed with, so a test moving the manifest
     moves it too. ``status_map`` is the ``recipes`` map its ``/qontinui/status``
     serves (None: an older facade that serves none). ``per_call(n)`` gives the
-    n-th answer's (weights, recipe hash) instead."""
+    n-th answer's (weights, recipe hash) instead.
+
+    The facade sits behind llama-swap as the entry ``qontinui-imagegen``:
+    ``resident[0]`` says whether ``/running`` lists it ready (default: yes;
+    a test may flip it), and ``probes`` collects every ``/upstream/<model>/
+    qontinui/status`` call — each of which, on a real host, makes llama-swap
+    load the facade. ``serve_map[0]`` (default: whether ``status_map`` was
+    given) turns the map on and off, as a redeploy would."""
     served = recipe if recipe is not None else ["d" * 64]
     import base64
     import io
@@ -725,15 +851,37 @@ def _facade(
 
     respx.post("http://127.0.0.1:8100/v1/images/generations").mock(side_effect=answer)
 
+    up = resident if resident is not None else [True]
+    with_map = serve_map if serve_map is not None else [status_map is not None]
+
     def status(request: httpx.Request) -> httpx.Response:
+        if probes is not None:
+            probes.append(request.url.path)
+        up[0] = True  # llama-swap swapped the facade in to answer
         body: dict[str, object] = {"engine": "fake"}
-        if status_map is not None:
-            body["recipes"] = dict(status_map)  # read now: a test may move it
+        if with_map[0]:
+            body["recipes"] = dict(status_map or {})  # read now: a test may move it
         return httpx.Response(200, json=body)
 
-    respx.get("http://127.0.0.1:8100/upstream/z-image-turbo/qontinui/status").mock(
+    def running(request: httpx.Request) -> httpx.Response:
+        rows = [{"model": "qontinui-imagegen" if up[0] else "gemma-4-31b", "state": "ready"}]
+        return httpx.Response(200, json={"running": rows})
+
+    models = {
+        "object": "list",
+        "data": [
+            {
+                "id": "qontinui-imagegen",
+                "meta": {"llamaswap": {"qontinui_capability": "image_generation"}},
+            },
+            {"id": "gemma-4-31b", "meta": {"llamaswap": {"qontinui_capability": "text"}}},
+        ],
+    }
+    respx.get(url__regex=r"^http://127\.0\.0\.1:8100/upstream/[^/]+/qontinui/status$").mock(
         side_effect=status
     )
+    respx.get("http://127.0.0.1:8100/running").mock(side_effect=running)
+    respx.get("http://127.0.0.1:8100/v1/models").mock(return_value=httpx.Response(200, json=models))
     # The fixture context wraps every adapter in a fake; the facade's own
     # adapter (its wire mocked above) is the one under test here.
     from qontinui_studio.adapters import build_adapter
@@ -1424,9 +1572,165 @@ def test_after_a_mismatch_each_run_probes_with_one_candidate(
     served[0] = "f" * 64  # redeployed
     before = len(sent)
     report = env.run(changed=True)
-    assert report.slots[0].status == "compiled" and len(sent) - before == 1
-    assert report.slots[0].pick is not None and report.slots[0].pick["of"] == 1
+    [slot] = report.slots
+    # The passing probe is a probe, not the pick: the full N follows it.
+    assert slot.status == "compiled" and len(sent) - before == 1 + 2
+    assert slot.pick is not None and slot.pick["of"] == 2
+    assert any("the probe passed; generating the full N" in r for r in slot.reasons)
+    conn = env.context().conn
+    rows = conn.execute(
+        "SELECT id, status, reason FROM batches WHERE compile_slot = ? ORDER BY created_at, rowid",
+        (HERO,),
+    ).fetchall()
+    probe = rows[-2]
+    assert probe["status"] == "failed" and probe["reason"].startswith("probe passed")
+    assert rows[-1]["id"] == slot.batch_id and rows[-1]["status"] == "published"
+    assert not conn.execute(
+        "SELECT 1 FROM publications WHERE batch_id = ?", (probe["id"],)
+    ).fetchone()
     assert [s.status for s in env.run(dry_run=True).slots] == ["fresh"]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_map_that_agrees_gets_the_full_n_even_while_cooling_down(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    """The cool-down is for a facade whose served recipes are UNKNOWN. A
+    redeployed facade whose map agrees is known good: no one-candidate probe."""
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    served = ["d" * 64]
+    status = {"hero": "d" * 64}
+    with_map = [False]  # an older facade first
+    sent = _facade(env, weights=["9" * 64], recipe=served, status_map=status, serve_map=with_map)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    env.run()
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    assert env.run(changed=True).slots[0].status == "refused"  # cooling from here
+    before = len(sent)
+    assert env.run(changed=True).slots[0].status == "refused" and len(sent) - before == 1
+    # Redeployed with a recipe map that agrees with the manifest.
+    served[0] = status["hero"] = "f" * 64
+    with_map[0] = True
+    before = len(sent)
+    report = env.run(changed=True)
+    [slot] = report.slots
+    assert slot.status == "compiled" and len(sent) - before == 2
+    assert slot.pick is not None and slot.pick["of"] == 2
+    assert not any("probe" in r for r in slot.reasons)
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_one_candidate_probe_is_never_resumed_as_the_n_batch(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    """The candidate count is part of a batch's signature: a probe left
+    generating (the facade deferred it) is resumed as a probe, and the N batch
+    that follows it is a batch of its own."""
+    from qontinui_studio.compiler.run import _base_of, _with_variants
+
+    base = json.dumps({"slot": HERO, "inputs": {}}, sort_keys=True)
+    one, n = _with_variants(base, 1), _with_variants(base, 2)
+    assert one != n and _base_of(one) == _base_of(n) == base
+
+
+# ---- review round 6: the preflight never makes llama-swap swap a model in -------------
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_bulk_run_never_wakes_the_facade_to_ask_what_it_serves(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    """llama-swap holds one model; reaching the facade's status through
+    ``/upstream/...`` loads it and evicts the resident one. A bulk run (the
+    facade's bulk window may defer it) never asks a facade that is not
+    resident: the candidates' own provenance decides instead."""
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    status = {"hero": "d" * 64}
+    up = [True]
+    probes: list[str] = []
+    sent = _facade(env, weights=["9" * 64], status_map=status, resident=up, probes=probes)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    assert probes == ["/upstream/qontinui-imagegen/qontinui/status"]  # it was resident
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    up[0] = False  # the gemma emitter swapped in overnight
+    before = len(sent)
+    report = env.run(changed=True)
+    [slot] = report.slots
+    assert probes == ["/upstream/qontinui-imagegen/qontinui/status"]  # not asked again
+    assert slot.status == "refused" and len(sent) - before == 2  # provenance decided
+    assert any("not resident" in r for r in slot.reasons)
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_an_interactive_run_wakes_the_facade_it_is_about_to_use_anyway(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    status = {"hero": "d" * 64}
+    up = [False]
+    probes: list[str] = []
+    sent = _facade(env, weights=["9" * 64], status_map=status, resident=up, probes=probes)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    report = env.run()
+    assert [s.status for s in report.slots] == ["deferred"] and sent == []
+    assert probes == ["/upstream/qontinui-imagegen/qontinui/status"]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_provider_holding_work_off_is_never_woken_for_a_probe(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    """A facade whose newest answer was ``busy`` (or ``deferred``) and whose
+    retry time has not come would defer the generation: it is not woken."""
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    status = {"hero": "d" * 64}
+    up = [True]
+    probes: list[str] = []
+    _facade(env, weights=["9" * 64], status_map=status, resident=up, probes=probes)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    conn = env.context().conn
+    job = conn.execute("SELECT id FROM jobs ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+    conn.execute(
+        "INSERT INTO job_attempts (job_id, provider, outcome, detail, retry_after_s, at) "
+        "VALUES (?, 'local-gpu', 'busy', 'busy: generating', 3600, ?)",
+        (job, env.context().clock().isoformat()),
+    )
+    conn.commit()
+    up[0] = False
+    probes.clear()
+    env.write_spec(HERO, job="Show a calm run finishing, seen from behind the operator.")
+    report = env.run()
+    assert probes == []  # held off and not resident: never woken
+    assert any("busy" in r and "not resident" in r for r in report.slots[0].reasons)
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_the_facade_is_asked_once_per_provider_per_run(env: CompileEnv, imagegen_dir: Path) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    status = {"hero": "d" * 64}
+    probes: list[str] = []
+    _facade(env, weights=["9" * 64], status_map=status, probes=probes)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    env.write_spec("marketing.home.closing", job="Close the page on a quiet workshop scene.")
+    report = env.run()
+    assert [s.status for s in report.slots] == ["compiled", "compiled"]
+    assert len(probes) == 1
 
 
 @pytest.mark.usefixtures("respx_mock")

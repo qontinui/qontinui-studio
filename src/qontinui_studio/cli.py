@@ -38,7 +38,13 @@ from qontinui_studio.briefs import load_brief, validate_brief
 from qontinui_studio.compiler.evidence import render_markdown, slot_evidence
 from qontinui_studio.compiler.image_store import HttpImageStore
 from qontinui_studio.compiler.inputs import IMAGEGEN_DIR_ENV, ImagegenManifest, ImageryReader
-from qontinui_studio.compiler.run import AltText, CompileOptions, Readers, compile_slots
+from qontinui_studio.compiler.run import (
+    AltText,
+    CompileOptions,
+    Readers,
+    compile_slots,
+    merge_reports,
+)
 from qontinui_studio.compiler.target import CompileTarget, load_targets
 from qontinui_studio.errors import (
     GatewayRefusal,
@@ -1224,9 +1230,21 @@ def compile_cmd(
         raise click.ClickException(str(e)) from e
     state = Workspace(obj.root).compile_dir(target.id)
     state.mkdir(parents=True, exist_ok=True)
-    body = render_markdown(report)
-    data = report.as_json()
-    for row, rep in zip(data["slots"], report.slots, strict=True):
+    exit_code = report.exit_code()
+    # A rerun on the same checkout and HEAD (e.g. after writing alt texts)
+    # merges into the earlier run's report, so the PR body covers both.
+    shown = report
+    if not dry_run:
+        try:
+            previous = json.loads((state / "report.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
+        if isinstance(previous, dict):
+            shown = merge_reports(previous, report) or report
+    body = render_markdown(shown)
+    data = shown.as_json()
+    data["exit_code"] = exit_code  # this run's verdict
+    for row, rep in zip(data["slots"], shown.slots, strict=True):
         row["evidence"] = slot_evidence(rep)
     atomic_write(state / "evidence.md", body.encode("utf-8"))
     atomic_write(state / "report.json", (json.dumps(data, indent=2) + "\n").encode("utf-8"))
@@ -1246,13 +1264,13 @@ def compile_cmd(
             click.echo(f"  image generation: {report.imagegen}")
         if report.refusal:
             click.echo(f"  refused: {report.refusal['code']}: {report.refusal['detail']}")
-        for s in report.slots:
+        for s in shown.slots:
             click.echo(f"  {s.slot_id:40} {s.route or '-':10} {s.status}")
             for reason in s.reasons:
                 click.echo(f"      {reason}")
         click.echo(f"  report: {state / 'report.json'}")
         click.echo(f"  evidence (PR body): {evidence or state / 'evidence.md'}")
-    sys.exit(report.exit_code())
+    sys.exit(exit_code)
 
 
 @main.command("compile-schedule")

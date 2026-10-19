@@ -37,8 +37,8 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
-from datetime import datetime
+from dataclasses import dataclass, field, fields, replace
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -166,6 +166,11 @@ class CompileReport:
     imagegen: str | None = None
     refusal: dict[str, str] | None = None
     notices: list[str] = field(default_factory=list)
+    # The checkout's HEAD commit when the run started (None: unreadable): a
+    # later run on the same checkout and HEAD merges into this report.
+    head: str | None = None
+    # How many runs this report covers (a merged report covers several).
+    runs: int = 1
     # Manifest entries (site slot names) no spec declares any more: their files
     # stay until a session removes them with the spec's removal.
     orphans: list[str] = field(default_factory=list)
@@ -211,8 +216,78 @@ class CompileReport:
             "orphans": self.orphans,
             "retired": self.retired,
             "kept": self.kept,
+            "head": self.head,
+            "runs": self.runs,
             "slots": [s.as_json() for s in self.slots],
         }
+
+
+def merge_reports(previous: dict[str, Any], current: CompileReport) -> CompileReport | None:
+    """``current`` merged onto the report an earlier run wrote for the SAME
+    checkout and HEAD (None when ``previous`` is another checkout's, another
+    HEAD's, or unreadable), so the PR body covers every run since HEAD: a slot
+    an earlier run compiled and this run finds fresh keeps the earlier run's
+    evidence (its files are what the checkout holds); every other slot takes
+    this run's. Run-level lists are joined."""
+    if (
+        current.head is None
+        or previous.get("checkout") != current.checkout
+        or previous.get("head") != current.head
+        or not isinstance(previous.get("slots"), list)
+    ):
+        return None
+    names = {f.name for f in fields(SlotReport)}
+    earlier: dict[str, SlotReport] = {}
+    for row in previous["slots"]:
+        if isinstance(row, dict) and isinstance(row.get("slot_id"), str):
+            try:
+                earlier[row["slot_id"]] = SlotReport(**{k: v for k, v in row.items() if k in names})
+            except TypeError:
+                return None
+    merged = replace(current, slots=[], runs=int(previous.get("runs") or 1) + 1)
+    for rep in current.slots:
+        before = earlier.pop(rep.slot_id, None)
+        if before is not None and before.status == "compiled" and rep.status == "fresh":
+            before.reasons = [*before.reasons, "compiled by an earlier run on this HEAD"]
+            merged.slots.append(before)
+        else:
+            merged.slots.append(rep)
+    merged.slots.extend(earlier.values())  # slots this run did not look at (--slot)
+    merged.slots.sort(key=lambda r: r.slot_id)
+    for name in ("notices", "orphans", "retired", "kept"):
+        joined = [*previous.get(name, []), *getattr(current, name)]
+        setattr(merged, name, list(dict.fromkeys(str(x) for x in joined)))
+    merged.bytes_changed = bool(previous.get("files_written")) or current.bytes_changed
+    return merged
+
+
+def checkout_head(checkout: Path) -> str | None:
+    """The commit a linked worktree's HEAD names, read from git's files (no
+    git process): ``<gitdir>/HEAD``, a ref resolved in the worktree's own
+    git dir, then the common dir, then its ``packed-refs``. None when any of it
+    cannot be read."""
+    try:
+        pointer = (checkout / ".git").read_text(encoding="utf-8").strip()
+        gitdir = checkout / pointer.removeprefix("gitdir:").strip()
+        head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head if re.fullmatch(r"[0-9a-f]{40,64}", head) else None
+        ref = head.removeprefix("ref:").strip()
+        common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+        for base in (gitdir, common):
+            path = base / ref
+            if path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                return value if re.fullmatch(r"[0-9a-f]{40,64}", value) else None
+        packed = common / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                sha, _, name = line.partition(" ")
+                if name == ref and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+                    return sha
+    except OSError:
+        return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -510,10 +585,28 @@ def _signature(
             "slot": slot.model_dump(mode="json"),
             "inputs": inputs.as_json(),
             "providers": providers,
-            "candidates": target.candidates,
         },
         sort_keys=True,
     )
+
+
+def _with_variants(base: str, variants: int) -> str:
+    """A batch's full signature: the base inputs plus how many candidates it
+    makes. A one-candidate probe is therefore never resumed as an N batch."""
+    data = json.loads(base)
+    data["variants"] = variants
+    return json.dumps(data, sort_keys=True)
+
+
+def _base_of(signature: str | None) -> str | None:
+    try:
+        data = json.loads(signature or "")
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data.pop("variants", None)
+    return json.dumps(data, sort_keys=True)
 
 
 def _write_brief(
@@ -574,11 +667,13 @@ def _existing_batch(
     ).fetchall()
     keep: sqlite3.Row | None = None
     for row in rows:
-        same = row["compile_spec_sha256"] == spec.sha256 and row["compile_inputs_json"] == signature
-        if same:
+        same_spec = row["compile_spec_sha256"] == spec.sha256
+        if same_spec and row["compile_inputs_json"] == signature:
             if keep is None or row["compile_checkout"] == checkout:
                 keep = row
             continue
+        if same_spec and _base_of(row["compile_inputs_json"]) == _base_of(signature):
+            continue  # the same inputs at another candidate count (a probe): its own
         if row["status"] == "published":
             continue  # its publication stands in its own checkout
         owner = row["compile_checkout"]
@@ -594,39 +689,165 @@ def _existing_batch(
     return keep
 
 
-def _served_mismatch(
-    ctx: Context, target: CompileTarget, spec: LoadedSpec, route: Route, readers: Readers
-) -> str | None:
-    """Why no batch may be generated now, or None. Only when EVERY provider
-    the target names is the fleet's facade, and each serves a recipe map
-    whose hash for this slot's recipe differs from the one the licence
-    manifest names; a facade with no map (older), an unreadable manifest or a
-    non-facade provider leaves the decision to the candidates themselves."""
+def _held_off(conn: sqlite3.Connection, provider_id: str, now: datetime) -> str | None:
+    """Why the provider is holding work off right now (its newest answer was
+    ``busy`` or ``deferred`` and its retry time has not come), or None."""
+    row = conn.execute(
+        "SELECT outcome, retry_after_s, at FROM job_attempts WHERE provider = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (provider_id,),
+    ).fetchone()
+    if row is None or row["outcome"] not in ("busy", "deferred"):
+        return None
+    try:
+        until = datetime.fromisoformat(row["at"]) + timedelta(seconds=row["retry_after_s"] or 0)
+    except (TypeError, ValueError):
+        return f"it last answered {row['outcome']}"
+    return f"it answered {row['outcome']} until {until.isoformat()}" if until > now else None
+
+
+def _facade_verdict(
+    ctx: Context,
+    target: CompileTarget,
+    spec: LoadedSpec,
+    route: Route,
+    readers: Readers,
+    priority: str,
+) -> tuple[Literal["mismatch", "agrees", "unknown"], str]:
+    """What the target's facade providers serve against what the licence
+    manifest names, read before a batch is generated:
+
+    * ``mismatch`` — EVERY provider is the fleet's facade and each serves a
+      recipe map whose hash for this slot's recipe differs from the manifest's:
+      nothing is generated;
+    * ``agrees`` — every facade provider's map agrees (or no provider is a
+      facade): the full N is generated;
+    * ``unknown`` — a facade serves no map, did not answer, or was not asked:
+      the candidates' own provenance decides (with the cool-down).
+
+    A facade that is not resident is woken for the question only when a
+    generation is about to load it anyway: an interactive job, to a provider
+    not holding work off (``busy``/``deferred``). A bulk job never wakes it."""
     recipe_id = target.recipe_for(spec, route)
-    if recipe_id is None:
-        return None
-    named = readers.imagegen.recipe(recipe_id)
-    if not named.known:
-        return None
-    reasons: list[str] = []
+    named = readers.imagegen.recipe(recipe_id) if recipe_id is not None else None
+    facades = []
     for pid in target.providers:
         try:
             provider = ctx.inventory.get(pid)
         except ConfigError:
-            return None
-        if provider.adapter != FACADE_ADAPTER:
-            return None
-        served = readers.facade(provider)
-        if served is None:
-            return None  # no map: the candidates' provenance decides
-        hash_ = served.get(recipe_id)
-        if hash_ == named.value:
-            return None
-        reasons.append(
-            f"{pid}: the facade serves recipe '{recipe_id}' as "
-            f"{(hash_ or 'nothing')[:12]}; the manifest names {str(named.value)[:12]}"
-        )
-    return "; ".join(reasons) or None
+            return "unknown", f"provider '{pid}' is not in the inventory"
+        if provider.adapter == FACADE_ADAPTER:
+            facades.append(provider)
+    if not facades:
+        return "agrees", "no provider is the facade"
+    if named is None or not named.known:
+        return "unknown", "the manifest's recipe hash is unreadable"
+    mismatches: list[str] = []
+    now = ctx.clock()
+    for provider in facades:
+        held = _held_off(ctx.conn, provider.id, now)
+        wake = priority == "interactive" and held is None
+        served = readers.facade(provider, wake=wake)
+        if served.state != "map":
+            return "unknown", served.detail + (f" ({held})" if held else "")
+        hash_ = served.recipes.get(str(recipe_id))
+        if hash_ != named.value:
+            mismatches.append(
+                f"{provider.id}: the facade serves recipe '{recipe_id}' as "
+                f"{(hash_ or 'nothing')[:12]}; the manifest names {str(named.value)[:12]}"
+            )
+    if mismatches and len(mismatches) == len(target.providers):
+        return "mismatch", "; ".join(mismatches)
+    if mismatches:
+        return "unknown", "; ".join(mismatches)
+    return "agrees", "every facade serves the manifest's recipe"
+
+
+def _new_compile_batch(
+    ctx: Context,
+    target: CompileTarget,
+    spec: LoadedSpec,
+    route: Route,
+    priority: str,
+    variants: int,
+    signature: str,
+    checkout: str,
+) -> str | list[str]:
+    """A new compile batch's id, or the brief's problems."""
+    brief_path = _write_brief(ctx, target, spec, route, priority, variants)
+    loaded = load_brief(brief_path, root=ctx.workspace.root)
+    problems = validate_brief(loaded.brief, ctx.sites, ctx.inventory)
+    if problems:
+        return problems
+    batch_id = new_batch(ctx, loaded, publish=False)
+    ctx.conn.execute(
+        "UPDATE batches SET compile_target = ?, compile_slot = ?, compile_spec_sha256 = ?, "
+        "compile_inputs_json = ?, compile_checkout = ? WHERE id = ?",
+        (target.id, spec.slot_id, spec.sha256, signature, checkout, batch_id),
+    )
+    ctx.conn.commit()
+    return batch_id
+
+
+def _probe(
+    ctx: Context,
+    readers: Readers,
+    target: CompileTarget,
+    spec: LoadedSpec,
+    rep: SlotReport,
+    route: Route,
+    slot: Slot,
+    inputs: SlotInputs,
+    base: str,
+    checkout: str,
+    priority: str,
+) -> bool:
+    """A one-candidate probe of what the facade serves now. True when its
+    candidate could be bound (the caller then generates the full N; the probe
+    is never published, uploaded or resumed as the pick). False with ``rep``
+    saying why: it failed on what the facade served again, or is waiting."""
+    signature = _with_variants(base, 1)
+    probe = _existing_batch(ctx.conn, target, spec, signature, checkout, ctx.clock())
+    if probe is None:
+        made = _new_compile_batch(ctx, target, spec, route, priority, 1, signature, checkout)
+        if isinstance(made, list):
+            rep.status, rep.reasons = "refused", [f"brief: {p}" for p in made]
+            return False
+        probe_id, status = made, "generating"
+    else:
+        probe_id, status = str(probe["id"]), str(probe["status"])
+    rep.reasons.append(
+        f"a one-candidate probe ({probe_id}): the last batch for these inputs could not be "
+        "bound because of what the facade served"
+    )
+    if status == "generating":
+        status = drive_batch(ctx, probe_id, publish=False).status
+    if status != "generated":
+        rep.status = "generating" if status == "generating" else "failed"
+        rep.batch_id = probe_id
+        return False
+    candidates = _candidates(
+        ctx, target, spec, route, slot, inputs, Library(ctx.conn).assets(probe_id), readers
+    )
+    passed = any(c.usable for c in candidates)
+    reason = (
+        "probe passed: the facade's output can be bound again"
+        if passed
+        else f"{FACADE_FAILED}: the probe failed ("
+        + "; ".join(c.why_not or "" for c in candidates)
+        + ")"
+    )
+    ctx.conn.execute(
+        "UPDATE batches SET status = 'failed', reason = ? WHERE id = ?", (reason, probe_id)
+    )
+    ctx.conn.commit()
+    if not passed:
+        rep.status = "refused"
+        rep.batch_id = probe_id
+        rep.reasons.append("no usable candidate: " + "; ".join(c.why_not or "" for c in candidates))
+        return False
+    rep.reasons.append("the probe passed; generating the full N")
+    return True
 
 
 def _cooling(
@@ -634,12 +855,14 @@ def _cooling(
 ) -> bool:
     """Whether the newest batch for these exact inputs failed because what the
     facade served could not be bound."""
-    row = conn.execute(
-        "SELECT status, reason FROM batches WHERE compile_target = ? AND compile_slot = ? "
-        "AND compile_spec_sha256 = ? AND compile_inputs_json = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        (target.id, spec.slot_id, spec.sha256, signature),
-    ).fetchone()
+    base = _base_of(signature)
+    rows = conn.execute(
+        "SELECT status, reason, compile_inputs_json FROM batches WHERE compile_target = ? "
+        "AND compile_slot = ? AND compile_spec_sha256 = ? "
+        "ORDER BY created_at DESC, rowid DESC",
+        (target.id, spec.slot_id, spec.sha256),
+    ).fetchall()
+    row = next((r for r in rows if _base_of(r["compile_inputs_json"]) == base), None)
     return bool(
         row is not None
         and row["status"] == "failed"
@@ -833,6 +1056,7 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
         publish_dir=str(publish_dir),
         changed_only=options.changed_only,
         dry_run=options.dry_run,
+        head=checkout_head(checkout),
     )
     library = Library(ctx.conn)
     manifest = _read_manifest(publish_dir)
@@ -1143,37 +1367,34 @@ def _compile_one(
     # The checkout root (the worktree), which exists from allocation to hand-back.
     depth = len(PurePosixPath(target.publish_dir.as_posix()).parts)
     checkout = str(site.publish_dir.resolve().parents[depth - 1])
+    base = signature
+    signature = _with_variants(base, target.candidates)
     batch = _existing_batch(ctx.conn, target, spec, signature, checkout, now)
-    variants = target.candidates
     if batch is None:
-        served = _served_mismatch(ctx, target, spec, route, readers)
-        if served is not None:
+        verdict, why = _facade_verdict(ctx, target, spec, route, readers, priority)
+        if verdict == "mismatch":
             rep.status = "deferred"
-            rep.reasons.append(f"{served}; no generation until they agree")
+            rep.reasons.append(f"{why}; no generation until they agree")
             return
-        if _cooling(ctx.conn, target, spec, signature):
+        if verdict == "unknown":
+            rep.reasons.append(
+                f"what the facade serves is UNKNOWN ({why}); the candidates' provenance decides"
+            )
+        if verdict != "agrees" and _cooling(ctx.conn, target, spec, base):
             # The last batch for these inputs could not be bound because of what
             # the facade served, and no recipe map says whether that changed:
-            # re-probe with one candidate, not N.
-            variants = 1
-            rep.reasons.append(
-                "a one-candidate probe: the previous batch for these inputs could not be "
-                "bound (the facade's output did not match)"
-            )
-        brief_path = _write_brief(ctx, target, spec, route, priority, variants)
-        loaded = load_brief(brief_path, root=ctx.workspace.root)
-        problems = validate_brief(loaded.brief, ctx.sites, ctx.inventory)
-        if problems:
-            rep.status, rep.reasons = "refused", [f"brief: {p}" for p in problems]
-            return
-        batch_id = new_batch(ctx, loaded, publish=False)
-        ctx.conn.execute(
-            "UPDATE batches SET compile_target = ?, compile_slot = ?, compile_spec_sha256 = ?, "
-            "compile_inputs_json = ?, compile_checkout = ? WHERE id = ?",
-            (target.id, spec.slot_id, spec.sha256, signature, checkout, batch_id),
+            # re-probe with ONE candidate first; the N batch only if it passes.
+            if not _probe(
+                ctx, readers, target, spec, rep, route, slot, inputs, base, checkout, priority
+            ):
+                return
+        made = _new_compile_batch(
+            ctx, target, spec, route, priority, target.candidates, signature, checkout
         )
-        ctx.conn.commit()
-        status = "generating"
+        if isinstance(made, list):
+            rep.status, rep.reasons = "refused", [f"brief: {p}" for p in made]
+            return
+        batch_id, status = made, "generating"
     else:
         batch_id, status = str(batch["id"]), str(batch["status"])
         rep.reasons.append(f"resumed batch {batch_id} ({status})")
