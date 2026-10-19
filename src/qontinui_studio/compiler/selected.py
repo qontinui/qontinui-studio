@@ -154,6 +154,8 @@ def _metadata_problems(meta: ET.Element) -> list[str]:
             for key in prop.attrib:
                 if key not in _PACKET_ATTRIBUTES[_DST]:
                     problems.append(f"DigitalSourceType attribute '{key}' is not allowed")
+            if prop.get(f"{_RDF}resource") is not None and not _blank(prop.text):
+                problems.append("DigitalSourceType carries both rdf:resource and text")
             value = (prop.get(f"{_RDF}resource") or prop.text or "").strip()
             if value != marker.DIGITAL_SOURCE_TYPE:
                 problems.append("DigitalSourceType is not trainedAlgorithmicMedia")

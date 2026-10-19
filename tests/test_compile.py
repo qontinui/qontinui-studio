@@ -542,6 +542,12 @@ def test_compile_writes_only_into_a_linked_worktree(env: CompileEnv, tmp_path: P
     (env.checkout / ".git").write_text("gitdir: /somewhere/.git\n")  # not a worktree's git dir
     with pytest.raises(ConfigError, match="not a linked git worktree"):
         env.run()
+    # Under worktrees/, but no git `commondir` pointer: not a worktree's git dir.
+    fake = tmp_path / "x" / "worktrees" / "w"
+    fake.mkdir(parents=True)
+    (env.checkout / ".git").write_text(f"gitdir: {fake}\n")
+    with pytest.raises(ConfigError, match="not a linked git worktree"):
+        env.run()
     assert not env.publish_dir.exists()
 
 
@@ -661,8 +667,14 @@ LOCAL_ROW = """
 LORA = "c" * 64
 
 
-def _facade(env: CompileEnv, weights: list[str]) -> list[dict[str, object]]:
-    """Point the target at the local facade and answer its requests (respx)."""
+def _facade(
+    env: CompileEnv, weights: list[str], recipe: list[str] | None = None
+) -> list[dict[str, object]]:
+    """Point the target at the local facade and answer its requests (respx).
+    ``recipe[0]`` is the recipe hash the facade reports running: a facade
+    serves the manifest it was deployed with, so a test moving the manifest
+    moves it too."""
+    served = recipe if recipe is not None else ["d" * 64]
     import base64
     import io
 
@@ -685,7 +697,7 @@ def _facade(env: CompileEnv, weights: list[str]) -> list[dict[str, object]]:
         buf = io.BytesIO()
         Image.new("RGB", (64, 36), (len(sent) * 40, 90, 120)).save(buf, "PNG")
         record = {
-            "recipe": {"id": body.get("recipe"), "version": 1, "sha256": "d" * 64},
+            "recipe": {"id": body.get("recipe"), "version": 1, "sha256": served[0]},
             "models": [
                 {"id": "z-image-turbo", "weights": [{"path": "w", "sha256": w} for w in weights]}
             ],
@@ -995,6 +1007,7 @@ BYPASSES = {
     "metadata off the root": "<g><metadata>{x}</metadata></g><metadata>{x}</metadata>",
     "text inside metadata": "<metadata>loose text{x}</metadata>",
     "an attribute on the packet's description": "<metadata>{xa}</metadata>",
+    "text beside an rdf:resource": "<metadata>{xr}</metadata>",
 }
 
 
@@ -1013,6 +1026,12 @@ def test_a_metadata_bypass_is_refused(env: CompileEnv, name: str) -> None:
             '<rdf:Description rdf:about=""><foreignObject/></rdf:Description></rdf:RDF>',
         ),
         xa=x.replace('rdf:about=""', 'rdf:about="" onload="x"'),
+        xr=x.replace(
+            "</rdf:RDF>",
+            '<rdf:Description rdf:about=""><Iptc4xmpExt:DigitalSourceType rdf:resource="'
+            + marker.DIGITAL_SOURCE_TYPE
+            + '">hidden</Iptc4xmpExt:DigitalSourceType></rdf:Description></rdf:RDF>',
+        ),
     )
     svg = SVG_OK.format(h=spec_hash, x=x).replace(f"<metadata>{x}</metadata>", payload)
     (env.slots_dir / "onboarding.connect.svg").write_text(svg)
@@ -1033,3 +1052,136 @@ def test_a_processing_instruction_is_refused(env: CompileEnv) -> None:
     bad = env.run().slots[0]
     assert bad.status == "authored_invalid"
     assert any("processing instruction" in r for r in bad.reasons)
+
+
+# ---- review round 3 ----------------------------------------------------------------
+
+
+def test_a_missing_file_in_its_own_checkout_compiles_again_then_is_fresh(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    first = env.run()
+    (env.publish_dir / f"{HERO_FILE}.webp").unlink()
+    again = env.run()
+    [slot] = again.slots
+    assert slot.status == "compiled", slot.reasons
+    assert slot.batch_id == first.slots[0].batch_id  # the same batch, republished here
+    assert any("republished" in r for r in slot.reasons)
+    assert not any("another checkout" in r for r in slot.reasons)
+    assert (env.publish_dir / f"{HERO_FILE}.webp").is_file()
+    assert [s.status for s in env.run().slots] == ["fresh"]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_recipe_change_starts_a_new_batch_and_ends_fresh(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    served = ["d" * 64]
+    _facade(env, weights=["9" * 64], recipe=served)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    first = env.run()
+    assert [s.status for s in first.slots] == ["compiled"]
+    old = first.slots[0].binding
+    assert old is not None
+    manifest_py = imagegen_dir / "qontinui_imagegen" / "manifest.py"
+    manifest_py.write_text(manifest_py.read_text().replace("d" * 64, "f" * 64))
+    served[0] = "f" * 64  # the facade now runs the new recipe
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    second = env.run(changed=True)
+    [slot] = second.slots
+    assert slot.status == "compiled", slot.reasons
+    assert slot.batch_id != first.slots[0].batch_id  # new bytes, never the old batch's
+    assert not any("another checkout" in r or "republished" in r for r in slot.reasons)
+    assert slot.binding is not None and slot.binding["recipe_sha256"] != old["recipe_sha256"]
+    assert [s.status for s in env.run(dry_run=True).slots] == ["fresh"]
+
+
+def test_a_model_change_starts_a_new_batch(
+    env: CompileEnv, studio_root: Path, make_context: Callable[..., Context]
+) -> None:
+    env.write_spec(HERO)
+    first = env.run()
+    providers = studio_root / "providers.yaml"
+    providers.write_text(providers.read_text().replace("model: fake-v1", "model: fake-v9"))
+    env.ctx = make_context()
+    second = env.run()
+    [slot] = second.slots
+    assert slot.status == "compiled" and slot.batch_id != first.slots[0].batch_id
+    assert slot.pick is not None and slot.pick["model"] == "fake-v9"
+    assert [s.status for s in env.run().slots] == ["fresh"]
+
+
+def test_removing_the_last_spec_retires_its_entry(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.run()
+    (env.slots_dir / f"{HERO}.yaml").unlink()
+    report = env.run()
+    assert report.orphans == [HERO] and report.files_written
+    manifest = json.loads((env.publish_dir / "studio-manifest.json").read_text())
+    assert manifest["slots"] == {}
+    assert {p.name for p in env.publish_dir.iterdir()} == {"studio-manifest.json"}
+
+
+def test_an_orphan_never_deletes_a_file_a_surviving_entry_names(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.run()
+    path = env.publish_dir / "studio-manifest.json"
+    manifest = json.loads(path.read_text())
+    live = manifest["slots"][HERO_FILE]
+    manifest["slots"]["old.slot"] = {"files": dict(live["files"]), "sha256": dict(live["sha256"])}
+    path.write_text(json.dumps(manifest))
+    report = env.run()
+    assert report.orphans == ["old.slot"]
+    for name in live["files"].values():
+        assert (env.publish_dir / name).is_file(), name
+        assert any(
+            k.startswith(f"{name}: another manifest entry still names it") for k in report.kept
+        )
+    assert "old.slot" not in json.loads(path.read_text())["slots"]
+    assert [s.status for s in env.run().slots] == ["fresh"]
+
+
+def test_a_refused_run_writes_nothing_at_all(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.write_spec("marketing.home.closing")
+    env.run()
+    (env.slots_dir / "marketing.home.closing.yaml").unlink()  # an orphan to retire
+    env.write_spec(HERO, job="A changed hero, stale now.")  # a slot to compile
+    before = _snapshot(env.publish_dir)
+    ctx = env.context()
+    ctx.imagegen = ImagegenPolicy(lambda repo: DialReading("off", "coord answered", "repo"))
+    report = env.run()
+    assert report.exit_code() == 6 and not report.files_written
+    assert _snapshot(env.publish_dir) == before
+    assert any("skipped: generation refused" in n for n in report.notices)
+
+
+def test_another_checkouts_waiting_batch_is_not_failed(env: CompileEnv, tmp_path: Path) -> None:
+    env.write_spec(HERO)
+    ctx = env.context()
+    ctx.adapters.adapters["fake"] = DeferOnce()
+    a = env.run()
+    assert a.slots[0].status == "generating"
+    other = make_checkout(tmp_path / "checkout2")
+    (other / "frontend" / "image-slots" / f"{HERO}.yaml").write_text(
+        (env.slots_dir / f"{HERO}.yaml").read_text().replace("calm automation", "quiet run")
+    )
+    env.run(checkout=other)
+
+    def status(batch: str | None) -> str:
+        return str(
+            ctx.conn.execute("SELECT status FROM batches WHERE id = ?", (batch,)).fetchone()[0]
+        )
+
+    assert status(a.slots[0].batch_id) == "generating"  # A's own, untouched
+    # Once A's worktree is handed back (gone), its stale batch is superseded.
+    shutil.rmtree(env.checkout)
+    (other / "frontend" / "image-slots" / f"{HERO}.yaml").write_text(
+        (other / "frontend" / "image-slots" / f"{HERO}.yaml")
+        .read_text()
+        .replace("quiet run", "third")
+    )
+    env.run(checkout=other)
+    assert status(a.slots[0].batch_id) == "failed"

@@ -262,11 +262,12 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #
 # Version 6 — the asset compile step (plan 2026-10-13 Phase 19):
 #
-# * ``batches.compile_target`` / ``compile_slot`` / ``compile_spec_sha256`` /
+# * ``batches.compile_target`` / ``compile_slot`` / ``compile_spec_sha256`` / ``compile_checkout`` /
 #   ``compile_inputs_json``: set on a batch ``studio compile`` created for one
 #   image slot of one compile target — the target id, the spec's slot id, the
-#   spec's content hash and the input digests (recipe, imagery, exemplars,
-#   LoRA) it was generated against. A compile batch publishes only into the
+#   spec's content hash, the input digests (recipe, imagery, exemplars,
+#   LoRA, every provider's adapter, model and recipe hash) it was generated
+#   against, and the checkout (publish dir) it was made in. A compile batch publishes only into the
 #   checkout a compile run names, so ``jobs run`` never drives it and
 #   ``publish``/``unpublish --batch`` refuse it; a later compile run resumes it
 #   while its spec and inputs are unchanged, and fails it once they are not.
@@ -441,7 +442,13 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
-    for column in ("compile_target", "compile_slot", "compile_spec_sha256", "compile_inputs_json"):
+    for column in (
+        "compile_target",
+        "compile_slot",
+        "compile_spec_sha256",
+        "compile_inputs_json",
+        "compile_checkout",
+    ):
         conn.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
     conn.execute(
         "CREATE INDEX batches_compile ON batches (compile_target, compile_slot, status) "

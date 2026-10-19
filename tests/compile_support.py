@@ -184,6 +184,10 @@ class CompileEnv:
 
 def make_checkout(path: Path) -> Path:
     (path / "frontend" / "image-slots").mkdir(parents=True)
-    # A linked worktree's .git is a file naming its git dir.
-    (path / ".git").write_text("gitdir: /elsewhere/.git/worktrees/x\n")
+    # A linked worktree's .git is a file naming its git dir,
+    # <common>/worktrees/<name>, which holds git's `commondir` pointer.
+    gitdir = path.parent / f".git-common-{path.name}" / "worktrees" / path.name
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n")
+    (path / ".git").write_text(f"gitdir: {gitdir}\n")
     return path

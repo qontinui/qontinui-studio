@@ -347,7 +347,13 @@ def _v1_db_with_inflight_jobs(
     ctx.conn.close()
     raw = sqlite3.connect(db)  # back to the v1 shape: what a v1 studio.db holds
     raw.execute("DROP INDEX batches_compile")  # v6
-    for col in ("compile_target", "compile_slot", "compile_spec_sha256", "compile_inputs_json"):
+    for col in (
+        "compile_target",
+        "compile_slot",
+        "compile_spec_sha256",
+        "compile_inputs_json",
+        "compile_checkout",
+    ):
         raw.execute(f"ALTER TABLE batches DROP COLUMN {col}")
     for col in ("unpublish_command", "public_url"):  # v5
         raw.execute(f"ALTER TABLE launches DROP COLUMN {col}")

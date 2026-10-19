@@ -116,6 +116,7 @@ class CompileTask:
         t = self.target
         repo_name = t.repo.split("/", 1)[1]
         ws = self.workspace_root
+        done = f"bash {ws}/{ALLOCATE} --done --path"
         report = f"{self.studio_root}/.studio/compile/{t.id}/report.json"
         evidence = f"{self.studio_root}/.studio/compile/{t.id}/evidence.md"
         if self.imagegen_dir is not None:
@@ -124,19 +125,18 @@ class CompileTask:
                 f"Step 1b: the image licence manifest is pinned at {self.imagegen_dir}; "
                 "allocate nothing for it."
             )
-            hand_back_q = ""
+            release_q = ""
+            replaced = "<W>"
         else:
             imagegen = "<Q>/docker/imagegen"
             manifest_step = (
                 f"Step 1b: run exactly once: {self._allocate(QONTINUI_REPO)} . Q is the path "
                 f"on its line for {QONTINUI_REPO} (origin/main: the image licence manifest and "
-                "recipes the recipe and LoRA axes are read from). If it refuses, hand W back "
-                "(step 3's command) and stop: without the manifest those axes are UNKNOWN."
+                "recipes the recipe and LoRA axes are read from). If it refuses, go to the "
+                "final step: without the manifest those axes are UNKNOWN."
             )
-            hand_back_q = (
-                f" Whatever happens after step 1b, hand Q back at the end with: bash "
-                f"{ws}/{ALLOCATE} --done --path <Q> --abandon (you never change it)."
-            )
+            release_q = f" Then, if Q was allocated: {done} <Q> --abandon (you never change Q)."
+            replaced = "<W> and <Q>"
         compile_cmd = (
             f"poetry run --quiet studio --root {shlex.quote(self.studio_root)} compile "
             f"--target {t.id} --slots <W>/{t.slots_dir.as_posix()} --changed "
@@ -145,31 +145,35 @@ class CompileTask:
         return " ".join(
             [
                 f"You re-render stale image slots of {t.repo} (studio compile target '{t.id}').",
+                "Every path that stops after step 1 — a refusal, an exit code that says stop, "
+                "nothing written, or the PR opened — ends with the FINAL step; never stop "
+                "without it.",
                 f"Step 1: run exactly once: {self._allocate(repo_name)} . It prints '<repo> "
                 f"<path> <branch>' lines; W is the path and B the branch on the line for "
-                f"{repo_name}. If it refuses, stop and report its message.",
+                f"{repo_name}. If it refuses, stop and report its message (nothing to hand back).",
                 manifest_step,
-                f"Step 2: from this working directory run: {compile_cmd} (with "
-                f"{'<W> and <Q>' if self.imagegen_dir is None else '<W>'} replaced). It writes {report} and {evidence}. Read the report's exit_code and "
-                "files_written. Exit 6 = image generation is switched off or refused: stop. "
-                "Exit 3 = generation deferred or failed (a host outside its bulk window, or "
-                "busy): the batch resumes on the next run; continue to step 4 only if "
-                "files_written is true. Exit 7 with slots in status awaiting_alt_text: open "
+                f"Step 2: from this working directory run: {compile_cmd} (with {replaced} "
+                f"replaced). It writes {report} and {evidence}. Read the report's exit_code and "
+                "files_written. Exit 6 = image generation is switched off or refused, and the "
+                "run wrote nothing: go to the final step. Exit 3 = generation deferred or "
+                "failed (a host outside its bulk window, or busy): the batch resumes on the "
+                "next run; go to step 3. Exit 7 with slots in status awaiting_alt_text: open "
                 "each such slot's derivative files listed in the report, write one factual "
                 "alt text per slot describing exactly that image, save them as JSON "
                 '{"<slot id>": {"asset_sha256": "<the slot pick asset_sha256>", "text": '
                 '"<alt text>"}} in a file outside W, and run the step 2 command once more '
                 "with --alt-texts <that file>. Leave every other status for an interactive "
                 "session; do not author SVGs or change icons.",
-                f"Step 3: if files_written is false, hand the worktree back with: bash "
-                f"{ws}/{ALLOCATE} --done --path <W> --abandon , and stop.",
+                "Step 3: if files_written is false, go to the final step.",
                 f"Step 4: in W, run git status: only files under {t.publish_dir.as_posix()} "
-                "may have changed; if anything else changed, stop and report it. Stage only "
-                f"{t.publish_dir.as_posix()}, commit with the message 'feat(images): re-render "
-                f"stale image slots (studio compile --changed)', push B with git push -u "
-                f"origin B, and open the PR with gh pr create --base main --head B --title "
-                f"'feat(images): re-render stale image slots for {t.id}' --body-file {evidence} . "
-                "Report the PR URL." + hand_back_q,
+                "may have changed; if anything else changed, report it and go to the final "
+                f"step. Stage only {t.publish_dir.as_posix()}, commit with the message "
+                "'feat(images): re-render stale image slots (studio compile --changed)', push "
+                "B with git push -u origin B, and open the PR with gh pr create --base main "
+                f"--head B --title 'feat(images): re-render stale image slots for {t.id}' "
+                f"--body-file {evidence} . Report the PR URL.",
+                f"FINAL step (on every path): if you opened the PR from W, run {done} <W> ; "
+                f"otherwise run {done} <W> --abandon .{release_q}",
                 "Never merge the PR, never force-push, never touch a file outside W except the "
                 "alt-text JSON, and never run studio compile without --changed.",
             ]

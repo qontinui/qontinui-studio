@@ -73,6 +73,15 @@ def user_lock_dir() -> Path:
         else Path.home() / ".cache" / "qontinui-studio" / "locks"
     )
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        st = os.stat(base)
+        if st.st_uid != os.getuid():
+            raise OSError(f"lock directory {base} is not owned by this user; refusing it")
+        if st.st_mode & 0o077:
+            # Ours, but open to others: close it before trusting it.
+            os.chmod(base, 0o700)
+            if os.stat(base).st_mode & 0o077:
+                raise OSError(f"lock directory {base} is open to other users; refusing it")
     return base
 
 

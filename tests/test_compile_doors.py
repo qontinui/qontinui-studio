@@ -446,6 +446,14 @@ def test_the_task_runs_changed_in_an_allocated_worktree_and_studio_runs_no_git(
     # The recipe and LoRA axes are read from a qontinui worktree at origin/main,
     # allocated beside W and handed back at the end.
     assert "--repo qontinui " in prompt and "--done --path <Q> --abandon" in prompt
+    # Every stop path ends with the hand-back step, exit 6 included.
+    assert "never stop without it" in prompt
+    assert (
+        "Exit 6 = image generation is switched off or refused, and the run wrote nothing: go to the final step"
+        in prompt
+    )
+    final = prompt[prompt.index("FINAL step") :]
+    assert "--done --path <W> --abandon" in final and "--done --path <Q> --abandon" in final
     assert "gh pr create" in prompt and "--body-file" in prompt
     assert "Never merge" in prompt and "--done --path <W> --abandon" in prompt
     assert body["schedule"] == {"type": "Cron", "value": "30 2 * * *"}
@@ -573,3 +581,22 @@ def test_the_shipped_targets_load() -> None:
     targets = load_targets(repo / "targets", repo)
     assert targets["qontinui-web"].repo == "qontinui/qontinui-web"
     assert targets["qontinui-web"].providers == ["local-gpu"]
+
+
+def test_a_lock_dir_must_be_this_users_and_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import stat
+
+    from qontinui_studio.locks import user_lock_dir
+
+    runtime = tmp_path / "run"
+    (runtime / "qontinui-studio-locks").mkdir(parents=True)
+    os.chmod(runtime / "qontinui-studio-locks", 0o777)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    base = user_lock_dir()  # ours but open: closed to 0700
+    assert stat.S_IMODE(os.stat(base).st_mode) == 0o700
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(base).st_uid + 1)
+    with pytest.raises(OSError, match="not owned by this user"):
+        user_lock_dir()

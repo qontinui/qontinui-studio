@@ -1285,7 +1285,18 @@ def update_entries(
         if manifest_bytes(manifest) != before:
             site.publish_dir.mkdir(parents=True, exist_ok=True)
             atomic_write(site.publish_dir / MANIFEST, manifest_bytes(manifest))
+        # A file any entry left in the manifest still names is never deleted,
+        # whichever entry named it before.
+        named = {
+            str(fname)
+            for entry in manifest["slots"].values()
+            if isinstance(entry, dict) and isinstance(entry.get("files"), dict)
+            for fname in entry["files"].values()
+        }
         for path, sha in doomed:
+            if path.name in named:
+                out.kept.append(f"{path.name}: another manifest entry still names it; kept")
+                continue
             current = _file_sha(path)
             if current is None:
                 continue

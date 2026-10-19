@@ -34,6 +34,7 @@ while its spec and inputs are unchanged, and failed once they are not.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -65,8 +66,14 @@ from qontinui_studio.library import AssetRecord, Library, VariantRecord
 from qontinui_studio.notify import Delivery, FileNotifier, Notice
 from qontinui_studio.pipeline import Context, drive_batch, new_batch, policy_adapters
 from qontinui_studio.postprocess import sha256_file
-from qontinui_studio.publish import MANIFEST, lowest_index_pick, publish_batch, update_entries
-from qontinui_studio.sites import Site, Slot, check_cross_site
+from qontinui_studio.publish import (
+    MANIFEST,
+    inside_publish_dir,
+    lowest_index_pick,
+    publish_batch,
+    update_entries,
+)
+from qontinui_studio.sites import SLOT_PATTERN, Site, Slot, check_cross_site
 
 PICK_UNJUDGED = "unjudged (Phase 20 not landed)"
 # The site slot of a spec no image file is published for: a manifest key only.
@@ -233,7 +240,8 @@ class Readers:
 def checkout_of(slots_dir: Path, target: CompileTarget) -> Path:
     """The checkout root ``slots_dir`` belongs to: ``slots_dir`` must END with
     the target's ``slots_dir``, and the root must be a LINKED worktree (its
-    ``.git`` a file naming ``<common dir>/worktrees/<name>``) — studio writes only
+    ``.git`` a file naming ``<common dir>/worktrees/<name>``, a directory that
+    holds git's ``commondir`` pointer) — studio writes only
     into a worktree a session allocated, never into a shared primary checkout or
     an arbitrary directory."""
     resolved = slots_dir.resolve()
@@ -255,8 +263,9 @@ def checkout_of(slots_dir: Path, target: CompileTarget) -> Path:
         pointer = dot_git.read_text(encoding="utf-8").strip()
     except OSError:
         pointer = ""
-    gitdir = pointer.removeprefix("gitdir:").strip() if pointer.startswith("gitdir:") else ""
-    if not gitdir or "worktrees" not in Path(gitdir).parts[:-1]:
+    raw = pointer.removeprefix("gitdir:").strip() if pointer.startswith("gitdir:") else ""
+    gitdir = (root / raw) if raw else None  # a relative gitdir is the worktree's own
+    if gitdir is None or gitdir.parent.name != "worktrees" or not (gitdir / "commondir").is_file():
         raise ConfigError(
             f"{root} is not a linked git worktree; studio compile writes only into a worktree "
             "the calling session allocated (allocate-worktree.sh)"
@@ -453,21 +462,42 @@ def _staleness(
 
 
 def _signature(
+    ctx: Context,
+    target: CompileTarget,
+    spec: LoadedSpec,
     route: Route,
-    recipe_id: str | None,
     slot: Slot,
     inputs: SlotInputs,
-    providers: list[str],
-    n: int,
+    readers: Readers,
 ) -> str:
+    """What a compile batch was generated against. A batch is resumed only
+    while this is unchanged: the route, the facade recipe id, the cut, the
+    inputs, N, and for EVERY provider the target names its adapter, its model
+    and its current compile recipe hash (the facade recipe's own hash
+    included) — so a recipe or model change starts a new batch rather than
+    republishing the old one's bytes."""
+    providers: dict[str, dict[str, str | None]] = {}
+    for pid in target.providers:
+        try:
+            row = ctx.inventory.get(pid)
+        except ConfigError:
+            providers[pid] = {"absent": "not in the inventory"}
+            continue
+        recipe = _current_recipe(ctx, target, spec, route, slot, pid, inputs.look_sha256, readers)
+        providers[pid] = {
+            "adapter": row.adapter,
+            "model": row.model,
+            "recipe_sha256": recipe.value,
+            "recipe_unknown": None if recipe.known else recipe.source,
+        }
     return json.dumps(
         {
             "route": route,
-            "recipe": recipe_id,
+            "recipe": target.recipe_for(spec, route),
             "slot": slot.model_dump(mode="json"),
             "inputs": inputs.as_json(),
             "providers": providers,
-            "candidates": n,
+            "candidates": target.candidates,
         },
         sort_keys=True,
     )
@@ -510,10 +540,15 @@ def _existing_batch(
     target: CompileTarget,
     spec: LoadedSpec,
     signature: str,
+    checkout: str,
     now: datetime,
 ) -> sqlite3.Row | None:
-    """The compile batch this slot can resume, if any. One made for another
-    spec or other inputs is failed (unless another process is driving it)."""
+    """The compile batch this slot can resume, if any: one made for this
+    spec and these inputs, in any checkout (its result is valid anywhere),
+    this checkout's first. One made for another spec or other inputs is failed
+    only when it belongs to THIS checkout, or to a checkout that no longer
+    exists (a worktree handed back) — another live checkout's deferred or
+    waiting batch is its own (and never while another process drives it)."""
     rows = conn.execute(
         "SELECT * FROM batches WHERE compile_target = ? AND compile_slot = ? "
         "AND status IN ('generating', 'generated', 'refused', 'published') ORDER BY created_at",
@@ -523,10 +558,14 @@ def _existing_batch(
     for row in rows:
         same = row["compile_spec_sha256"] == spec.sha256 and row["compile_inputs_json"] == signature
         if same:
-            keep = row
+            if keep is None or row["compile_checkout"] == checkout:
+                keep = row
             continue
         if row["status"] == "published":
             continue  # its publication stands in its own checkout
+        owner = row["compile_checkout"]
+        if owner and owner != checkout and Path(owner).exists():
+            continue  # another live checkout's batch
         conn.execute(
             "UPDATE batches SET status = 'failed', reason = ? WHERE id = ? "
             "AND status IN ('generating', 'generated', 'refused') "
@@ -537,16 +576,30 @@ def _existing_batch(
     return keep
 
 
-def _rehome(conn: sqlite3.Connection, batch_id: str) -> None:
-    """A batch published into ANOTHER checkout, which this one does not hold.
-    Its publication rows stay live — that checkout still holds the files —
-    and the batch is made publishable again so it can be published into this
-    checkout without regenerating it."""
+def _republish(conn: sqlite3.Connection, site: Site, batch_id: str, now: datetime) -> int:
+    """Make a published batch publishable again into THIS checkout, whose slot
+    is missing or stale although the batch's inputs are unchanged: its rows
+    in this checkout (files since deleted or altered) are marked unpublished;
+    its rows in any other checkout stay live — that checkout still holds its
+    files. Returns how many of this checkout's rows were released."""
+    released = 0
+    for row in conn.execute(
+        "SELECT id, published_path FROM publications WHERE batch_id = ? AND site = ? "
+        "AND unpublished_at IS NULL",
+        (batch_id, site.id),
+    ).fetchall():
+        if inside_publish_dir(site, Path(row["published_path"])):
+            conn.execute(
+                "UPDATE publications SET unpublished_at = ? WHERE id = ?",
+                (now.isoformat(), row["id"]),
+            )
+            released += 1
     conn.execute(
         "UPDATE batches SET status = 'unpublished', reason = ? WHERE id = ? AND status = 'published'",
-        ("published into another checkout; publishing it into this one too", batch_id),
+        ("published before; publishing it into this checkout", batch_id),
     )
     conn.commit()
+    return released
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +762,15 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
         else:
             site_slots[spec.site_slot] = MANIFEST_ONLY_SLOT
     report.orphans = sorted(set(manifest) - {s.site_slot for s in all_specs})
+    for name in report.orphans:
+        # An orphan is a slot of the site too, so its retirement is written
+        # through it even when no spec is left; a key that is no safe slot name
+        # is never turned into a path.
+        if re.fullmatch(SLOT_PATTERN, name):
+            site_slots[name] = MANIFEST_ONLY_SLOT
+        else:
+            report.kept.append(f"manifest key {name!r} is not a slot name; left as it is")
+    report.orphans = [n for n in report.orphans if n in site_slots]
     routed: list[tuple[LoadedSpec, SlotReport, Route | None]] = []
     for spec in specs:
         route, source = route_for(target, spec)
@@ -796,22 +858,35 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
                     to_compile.append((spec, rep, route, slot, inputs))
 
     notifier = _CompileNotifier(FileNotifier(ctx.workspace.notices_dir), checkout, report)
+    if to_compile:
+        if site is None:
+            raise ConfigError(f"target '{target.id}': no site to publish into")
+        _generate_and_publish(ctx, options, readers, report, site, to_compile, checkout, notifier)
     if not options.dry_run:
         # Studio owns the manifest: an entry no spec declares any more goes,
         # with the files it names, in this same compile.
         entries.update(dict.fromkeys(report.orphans))
-    if entries:
-        assert site is not None
+    if entries and report.refusal is not None:
+        # Generation was refused (the dial, the machine switch, a gateway): this
+        # run writes nothing at all, so the checkout stays clean.
+        report.notices.append(
+            "manifest-only updates (lucide entries, orphan retirement) skipped: "
+            f"generation refused ({report.refusal['code']})"
+        )
+        for rep in report.slots:
+            if rep.manifest_written:
+                rep.manifest_written = False
+                rep.reasons.append("its manifest entry is NOT written: generation was refused")
+    elif entries:
+        if site is None:
+            raise ConfigError(f"target '{target.id}': no site to write the manifest of")
         update = update_entries(
             ctx.conn, site, entries, notifier, ctx.clock, root=ctx.workspace.root
         )
         report.retired = [n for n in update.written if n in report.orphans] + [
             str(p) for p in update.removed_files
         ]
-        report.kept = update.kept
-    if to_compile:
-        assert site is not None
-        _generate_and_publish(ctx, options, readers, report, site, to_compile, checkout, notifier)
+        report.kept += update.kept
     return report
 
 
@@ -961,15 +1036,11 @@ def _compile_one(
 ) -> None:
     target = options.target
     now = ctx.clock()
-    signature = _signature(
-        route,
-        target.recipe_for(spec, route),
-        slot,
-        inputs,
-        list(target.providers),
-        target.candidates,
-    )
-    batch = _existing_batch(ctx.conn, target, spec, signature, now)
+    signature = _signature(ctx, target, spec, route, slot, inputs, readers)
+    # The checkout root (the worktree), which exists from allocation to hand-back.
+    depth = len(PurePosixPath(target.publish_dir.as_posix()).parts)
+    checkout = str(site.publish_dir.resolve().parents[depth - 1])
+    batch = _existing_batch(ctx.conn, target, spec, signature, checkout, now)
     if batch is None:
         brief_path = _write_brief(ctx, target, spec, route, priority)
         loaded = load_brief(brief_path, root=ctx.workspace.root)
@@ -980,8 +1051,8 @@ def _compile_one(
         batch_id = new_batch(ctx, loaded, publish=False)
         ctx.conn.execute(
             "UPDATE batches SET compile_target = ?, compile_slot = ?, compile_spec_sha256 = ?, "
-            "compile_inputs_json = ? WHERE id = ?",
-            (target.id, spec.slot_id, spec.sha256, signature, batch_id),
+            "compile_inputs_json = ?, compile_checkout = ? WHERE id = ?",
+            (target.id, spec.slot_id, spec.sha256, signature, checkout, batch_id),
         )
         ctx.conn.commit()
         status = "generating"
@@ -1103,8 +1174,15 @@ def _publish_pick(
         rep.status, rep.reasons = "refused", [*rep.reasons, *problems]
         return pick
     if published_before:
-        _rehome(ctx.conn, batch_id)
-        rep.reasons.append("its earlier publication went to another checkout; re-homed here")
+        if _republish(ctx.conn, site, batch_id, ctx.clock()):
+            rep.reasons.append(
+                f"batch {batch_id} was live here, but the checkout no longer holds its files "
+                "as published; republished"
+            )
+        else:
+            rep.reasons.append(
+                f"batch {batch_id} was published into another checkout; published here too"
+            )
     key = (site.id, spec.site_slot)
     binding_json = binding.model_dump(mode="json", exclude_none=True)
     extra: dict[str, Any] = {
