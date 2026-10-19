@@ -1134,3 +1134,15 @@ def test_a_non_string_code_is_not_a_nothing_started_503(tmp_path: Path, code: ob
     )
     with pytest.raises(ProviderOutcomeUnknown):
         _adapter(tmp_path / "state").submit(_request(), tmp_path)
+
+
+@pytest.mark.parametrize("pid", ["gemini-web", "chatgpt-web"])
+def test_local_only_never_admits_a_web_account_wrapper(pid: str) -> None:
+    """Rebase onto main's image-generation dial: the wrapper rows drive cloud
+    sites (Gemini, ChatGPT) through the LOCAL runner, so ``local_only`` must not
+    mistake them for the fleet's own image host — they carry no local-network
+    base URL, and the classifier refuses them."""
+    from qontinui_studio.imagegen_policy import is_fleet_provider
+
+    shipped = load_providers(Path(__file__).resolve().parent.parent / "providers.yaml")
+    assert not is_fleet_provider(shipped.get(pid), None)
