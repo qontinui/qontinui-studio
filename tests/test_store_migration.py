@@ -118,7 +118,7 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
     db = tmp_path / ".studio" / "studio.db"
     _v0_db(db, write_image(tmp_path / "raw.png"))
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
     # v6: compile batches; every upgraded batch is an ordinary one.
     assert (
         conn.execute("SELECT COUNT(*) FROM batches WHERE compile_target IS NOT NULL").fetchone()[0]
@@ -262,3 +262,24 @@ def test_concurrent_connects_migrate_exactly_once(tmp_path: Path) -> None:
     conn = connect(db)
     assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+
+
+def test_a_v6_database_without_compile_checkout_gains_it(tmp_path: Path) -> None:
+    """This phase's first commits shipped the compile columns without
+    ``compile_checkout``; v7 adds it where absent, and leaves it where
+    present."""
+    db = tmp_path / ".studio" / "studio.db"
+    conn = connect(db)
+    conn.execute("ALTER TABLE batches DROP COLUMN compile_checkout")
+    conn.execute("PRAGMA user_version = 6")
+    conn.commit()
+    conn.close()
+    again = connect(db)
+    assert again.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+    columns = {r[1] for r in again.execute("PRAGMA table_info(batches)")}
+    assert "compile_checkout" in columns
+    again.execute("PRAGMA user_version = 6")  # a v6 that already has it
+    again.commit()
+    again.close()
+    third = connect(db)
+    assert third.execute("PRAGMA user_version").fetchone()[0] == 7

@@ -448,9 +448,11 @@ def test_the_task_runs_changed_in_an_allocated_worktree_and_studio_runs_no_git(
     assert "--repo qontinui " in prompt and "--done --path <Q> --abandon" in prompt
     # Every stop path ends with the hand-back step, exit 6 included.
     assert "never stop without it" in prompt
+    assert "route on files_written FIRST" in prompt
+    assert "files_written true goes to step 4" in prompt
     assert (
-        "Exit 6 = image generation is switched off or refused, and the run wrote nothing: go to the final step"
-        in prompt
+        "Exit 6 (image generation switched off or refused) with files_written false: "
+        "go to the final step" in prompt
     )
     final = prompt[prompt.index("FINAL step") :]
     assert "--done --path <W> --abandon" in final and "--done --path <Q> --abandon" in final

@@ -76,6 +76,7 @@ from qontinui_studio.publish import (
 from qontinui_studio.sites import SLOT_PATTERN, Site, Slot, check_cross_site
 
 PICK_UNJUDGED = "unjudged (Phase 20 not landed)"
+LAGGING_RECIPE = "the facade has not applied the current recipe"
 # The site slot of a spec no image file is published for: a manifest key only.
 MANIFEST_ONLY_SLOT = Slot(width=1, height=1, category="decorative", formats=["png"], rendered=False)
 RESUMABLE = ("generating", "generated", "refused")
@@ -163,12 +164,14 @@ class CompileReport:
     # What this run removed for them: the entries and the files.
     retired: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
+    # Set at the end of a run: the publish dir's bytes differ from its start.
+    bytes_changed: bool = False
 
     @property
     def files_written(self) -> bool:
-        return any(s.status == "compiled" or s.manifest_written for s in self.slots) or bool(
-            self.retired
-        )
+        """Whether the checkout's publish dir differs, byte for byte, from
+        what it held when the run started."""
+        return self.bytes_changed
 
     def exit_code(self) -> int:
         statuses = {s.status for s in self.slots}
@@ -646,6 +649,7 @@ def _candidates(
     slot: Slot,
     inputs: SlotInputs,
     assets: list[AssetRecord],
+    readers: Readers,
 ) -> list[_Candidate]:
     out: list[_Candidate] = []
     for asset in sorted(assets, key=_index):
@@ -673,6 +677,16 @@ def _candidates(
             why_not = (
                 f"the slot names LoRA '{spec.spec.style.lora}', and this candidate's "
                 "provenance does not show those weights applied"
+            )
+        current = _current_recipe(
+            ctx, target, spec, route, slot, asset.provider, inputs.look_sha256, readers
+        )
+        if why_not is None and current.known and current.value != recipe:
+            # A binding made from it would be stale the moment it is written
+            # (a facade still serving the recipe the manifest has moved past).
+            why_not = (
+                f"{LAGGING_RECIPE}: the candidate was made under recipe {recipe[:12]}, the "
+                f"current one is {str(current.value)[:12]}"
             )
         out.append(_Candidate(asset, sidecar, recipe, why_not is None, why_not))
     return out
@@ -749,6 +763,7 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
     )
     library = Library(ctx.conn)
     manifest = _read_manifest(publish_dir)
+    at_start = file_shas(publish_dir)
 
     # Every spec is a slot of the Site, filtered by --slot or not: the journal
     # then recognises every slot file the checkout holds. A slot no file is
@@ -887,7 +902,15 @@ def compile_slots(ctx: Context, options: CompileOptions, readers: Readers) -> Co
             str(p) for p in update.removed_files
         ]
         report.kept += update.kept
+    report.bytes_changed = file_shas(publish_dir) != at_start
     return report
+
+
+def file_shas(directory: Path) -> dict[str, str]:
+    """sha256 of every file directly in ``directory`` (none when it is absent)."""
+    if not directory.is_dir():
+        return {}
+    return {p.name: sha256_file(p) for p in sorted(directory.iterdir()) if p.is_file()}
 
 
 LUCIDE_PACKAGE = "lucide-react"
@@ -1010,6 +1033,13 @@ def _generate_and_publish(
         return
     priority = "bulk" if options.changed_only else "interactive"
     for spec, rep, route, slot, inputs in work:
+        if report.refusal is not None:
+            # Refused mid-run: no slot after it is published either.
+            rep.status = "generation_refused"
+            rep.reasons = [
+                f"not attempted: {report.refusal['code']} refused generation earlier in this run"
+            ]
+            continue
         try:
             _compile_one(
                 ctx, options, readers, site, notifier, spec, rep, route, slot, inputs, priority
@@ -1088,7 +1118,9 @@ def _compile_one(
             ]
             return
     library = Library(ctx.conn)
-    candidates = _candidates(ctx, target, spec, route, slot, inputs, library.assets(batch_id))
+    candidates = _candidates(
+        ctx, target, spec, route, slot, inputs, library.assets(batch_id), readers
+    )
     confirmed = _upload_candidates(readers.store, candidates, rep)
     pick = _publish_pick(
         ctx,
@@ -1134,6 +1166,15 @@ def _publish_pick(
     if not usable:
         rep.status = "refused"
         rep.reasons += ["no usable candidate: " + "; ".join(c.why_not or "" for c in candidates)]
+        if all(LAGGING_RECIPE in (c.why_not or "") for c in candidates):
+            # Its bytes can never be bound: a later run must generate afresh
+            # once the facade serves the current recipe, not resume this batch.
+            ctx.conn.execute(
+                "UPDATE batches SET status = 'failed', reason = ? WHERE id = ? "
+                "AND status IN ('generated', 'refused', 'unpublished', 'published')",
+                (f"{LAGGING_RECIPE}; generate again once it has", batch_id),
+            )
+            ctx.conn.commit()
         return None
     pairs = [
         (c.asset, v)
@@ -1173,16 +1214,8 @@ def _publish_pick(
     if problems:
         rep.status, rep.reasons = "refused", [*rep.reasons, *problems]
         return pick
-    if published_before:
-        if _republish(ctx.conn, site, batch_id, ctx.clock()):
-            rep.reasons.append(
-                f"batch {batch_id} was live here, but the checkout no longer holds its files "
-                "as published; republished"
-            )
-        else:
-            rep.reasons.append(
-                f"batch {batch_id} was published into another checkout; published here too"
-            )
+    released = _republish(ctx.conn, site, batch_id, ctx.clock()) if published_before else None
+    files_before = file_shas(site.publish_dir)
     key = (site.id, spec.site_slot)
     binding_json = binding.model_dump(mode="json", exclude_none=True)
     extra: dict[str, Any] = {
@@ -1212,6 +1245,18 @@ def _publish_pick(
         {"gate": g.gate, "subject": g.subject, "outcome": g.outcome, "detail": g.detail}
         for g in result.gate_results
     ]
+    if released is not None:
+        files_after = file_shas(site.publish_dir)
+        changed = sorted(
+            n
+            for n in set(files_before) | set(files_after)
+            if n != MANIFEST and files_before.get(n) != files_after.get(n)
+        )
+        where = "was live here" if released else "was published into another checkout"
+        rep.reasons.append(
+            f"batch {batch_id} {where}; republished, changing "
+            + (", ".join(changed) if changed else "no image file")
+        )
     if not result.published:
         rep.status = "refused"
         rep.reasons += [f"{g.gate} {g.outcome}: {g.detail}" for g in result.failures]

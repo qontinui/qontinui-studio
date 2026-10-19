@@ -1185,3 +1185,118 @@ def test_another_checkouts_waiting_batch_is_not_failed(env: CompileEnv, tmp_path
     )
     env.run(checkout=other)
     assert status(a.slots[0].batch_id) == "failed"
+
+
+# ---- review round 4 ----------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_facade_lagging_behind_the_manifest_is_never_bound(
+    env: CompileEnv, imagegen_dir: Path
+) -> None:
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    served = ["d" * 64]
+    sent = _facade(env, weights=["9" * 64], recipe=served)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    assert [s.status for s in env.run().slots] == ["compiled"]
+    manifest_py = imagegen_dir / "qontinui_imagegen" / "manifest.py"
+    manifest_py.write_text(manifest_py.read_text().replace("d" * 64, "f" * 64))
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    before = _snapshot(env.publish_dir)
+    # The facade still runs the old recipe (not redeployed yet).
+    for _ in range(2):
+        report = env.run(changed=True)
+        [slot] = report.slots
+        assert slot.status == "refused" and report.exit_code() == 2
+        assert any("the facade has not applied the current recipe" in r for r in slot.reasons)
+        assert not report.files_written and _snapshot(env.publish_dir) == before
+        assert not any("republished" in r for r in slot.reasons)
+        lagging = (
+            env.context()
+            .conn.execute("SELECT status FROM batches WHERE id = ?", (slot.batch_id,))
+            .fetchone()[0]
+        )
+        assert lagging == "failed"  # never resumed: its bytes can never be bound
+    # Redeployed: the next run generates afresh, binds, and is fresh after.
+    served[0] = "f" * 64
+    calls = len(sent)
+    report = env.run(changed=True)
+    assert [s.status for s in report.slots] == ["compiled"] and report.files_written
+    assert len(sent) > calls
+    assert [s.status for s in env.run(dry_run=True).slots] == ["fresh"]
+
+
+def test_files_written_is_the_bytes_and_republish_names_what_changed(env: CompileEnv) -> None:
+    env.write_spec(HERO)
+    env.run()
+    assert not env.run().files_written  # fresh: nothing changed
+    (env.publish_dir / f"{HERO_FILE}.webp").unlink()
+    report = env.run()
+    [slot] = report.slots
+    assert report.files_written
+    assert any(r.endswith(f"republished, changing {HERO_FILE}.webp") for r in slot.reasons), (
+        slot.reasons
+    )
+
+
+def test_a_mid_run_refusal_stops_publishing_and_still_reports_what_was_written(
+    env: CompileEnv,
+) -> None:
+    """Slots compile in id order: a publishes, b's generation is refused (the
+    dial went off), and c — whose batch is already generated and waits only
+    for its alt text, so it needs no provider call — is not published after
+    the refusal either."""
+    env.write_spec("marketing.c", alt="kind: required")
+    waiting = env.run()
+    [c] = waiting.slots
+    assert c.status == "awaiting_alt_text" and c.pick is not None
+    alt = {"marketing.c": AltText(c.pick["asset_sha256"], "A person watches a run finish.")}
+    env.write_spec("marketing.a", job="The first slot of the page.")
+    env.write_spec("marketing.b", job="The second slot of the page.")
+    first = env.publish_dir / "marketing.a.avif"
+
+    def dial(repo: str | None) -> DialReading:
+        # On until the first slot is in the checkout, then switched off.
+        return DialReading("off" if first.exists() else "on", "coord answered", "repo")
+
+    env.context().imagegen = ImagegenPolicy(dial, poll_interval_s=0)
+    report = env.run(alt_texts=alt)
+    states = {s.slot_id: s.status for s in report.slots}
+    assert states == {
+        "marketing.a": "compiled",
+        "marketing.b": "generation_refused",
+        "marketing.c": "generation_refused",
+    }
+    assert any("refused generation earlier in this run" in r for r in report.slots[2].reasons)
+    assert report.exit_code() == 6 and report.files_written
+    assert not (env.publish_dir / "marketing.c.avif").exists()
+
+
+def test_republishing_in_one_checkout_keeps_the_others_publication(
+    env: CompileEnv, tmp_path: Path
+) -> None:
+    env.write_spec(HERO)
+    first = env.run()
+    other = make_checkout(tmp_path / "checkout2")
+    other_publish = other / "frontend" / "public" / "image-slots"
+    (other / "frontend" / "image-slots" / f"{HERO}.yaml").write_text(
+        (env.slots_dir / f"{HERO}.yaml").read_text()
+    )
+    second = env.run(checkout=other)
+    assert [s.status for s in second.slots] == ["compiled"]
+    assert any("published into another checkout" in r for r in second.slots[0].reasons)
+    (env.publish_dir / f"{HERO_FILE}.webp").unlink()
+    third = env.run()
+    assert [s.status for s in third.slots] == ["compiled"]
+    assert third.slots[0].batch_id == first.slots[0].batch_id
+    live = {
+        Path(r["published_path"]).parent
+        for r in env.context().conn.execute(
+            "SELECT published_path FROM publications WHERE unpublished_at IS NULL"
+        )
+    }
+    assert live == {env.publish_dir, other_publish}
+    assert [s.status for s in env.run(checkout=other).slots] == ["fresh"]
+    assert [s.status for s in env.run().slots] == ["fresh"]

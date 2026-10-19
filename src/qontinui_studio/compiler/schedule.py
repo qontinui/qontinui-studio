@@ -154,8 +154,10 @@ class CompileTask:
                 manifest_step,
                 f"Step 2: from this working directory run: {compile_cmd} (with {replaced} "
                 f"replaced). It writes {report} and {evidence}. Read the report's exit_code and "
-                "files_written. Exit 6 = image generation is switched off or refused, and the "
-                "run wrote nothing: go to the final step. Exit 3 = generation deferred or "
+                "files_written, and route on files_written FIRST: whatever the exit code, "
+                "files_written true goes to step 4 (a refusal can come after slots were "
+                "written). Exit 6 (image generation switched off or refused) with "
+                "files_written false: go to the final step. Exit 3 = generation deferred or "
                 "failed (a host outside its bulk window, or busy): the batch resumes on the "
                 "next run; go to step 3. Exit 7 with slots in status awaiting_alt_text: open "
                 "each such slot's derivative files listed in the report, write one factual "
