@@ -10,11 +10,13 @@ same ids and the one admitted ``WITH`` exception. ``tests/test_spdx.py`` pins
 the id set and the exception map to those values, so a change to qontinui's
 admitted set is a deliberate change here too.
 
-One deliberate difference: an ``OR`` anywhere is refused. qontinui admits a
-choice when one branch is admitted (a component offered under several
-licences); the licence a generated IMAGE carries is the conjunction of what
-made it, and a facade stamping an OR would leave which licence governs the
-pixels unsaid — so studio refuses it with that reason rather than guess.
+One deliberate difference: a CHOICE of licence is refused — an ``OR``
+anywhere, and an id with a trailing ``+`` ("this version or any later one").
+qontinui admits a choice when an admitted licence is among the options (a
+component offered under several licences); the licence a generated IMAGE
+carries is the conjunction of what made it, and a facade stamping a choice
+would leave which licence governs the pixels unsaid — so studio refuses it
+with that reason rather than guess.
 """
 
 from __future__ import annotations
@@ -40,8 +42,8 @@ ADMITTED_SPDX: frozenset[str] = frozenset(
 ADMITTED_EXCEPTIONS: dict[str, frozenset[str]] = {"Apache-2.0": frozenset({"LLVM-exception"})}
 
 OR_REFUSED = (
-    "an OR leaves which licence governs the image unsaid; a facade result names the "
-    "conjunction of what made it"
+    "a choice of licence (OR, or a trailing + for 'or later') leaves which licence "
+    "governs the image unsaid; a facade result names the conjunction of what made it"
 )
 
 _TOKEN = re.compile(r"\(|\)|[A-Za-z0-9][A-Za-z0-9.:-]*\+?")
@@ -126,16 +128,21 @@ class _Parser:
         return leaf
 
 
-def _base_id(identifier: str) -> str:
-    return identifier[:-1] if identifier.endswith("+") else identifier
+def _or_later(identifier: str) -> list[str]:
+    """``X+`` is "X or any later version": a choice, refused like OR."""
+    return [f"{identifier}: {OR_REFUSED}"] if identifier.endswith("+") else []
 
 
 def _blockers(node: _Node) -> list[str]:
     kind = node[0]
     if kind == "ID":
-        return [] if _base_id(node[1]) in ADMITTED_SPDX else [node[1]]
+        if _or_later(node[1]):
+            return _or_later(node[1])
+        return [] if node[1] in ADMITTED_SPDX else [node[1]]
     if kind == "WITH":
-        base = _base_id(node[1][1])
+        base = node[1][1]
+        if _or_later(base):
+            return _or_later(base)
         if base not in ADMITTED_SPDX:
             return [node[1][1]]
         if node[2] not in ADMITTED_EXCEPTIONS.get(base, frozenset()):
@@ -149,6 +156,7 @@ def _blockers(node: _Node) -> list[str]:
 def spdx_blockers(expression: str) -> list[str]:
     """What keeps ``expression`` from being admitted for an image; ``[]``
     means admitted. ``AND`` needs every operand admitted; ``X WITH e`` needs
-    ``X`` admitted and ``e`` admitted for ``X``; ``OR`` is refused. Raises
+    ``X`` admitted and ``e`` admitted for ``X``; ``OR`` and ``X+`` are
+    refused (a choice). Raises
     :class:`SpdxError` for an expression that does not parse."""
     return _blockers(_Parser(_tokenize(expression)).parse())

@@ -40,7 +40,21 @@ def test_the_admitted_set_is_qontinuis() -> None:
 @pytest.mark.parametrize("identifier", sorted(QONTINUI_IDS))
 def test_each_admitted_id_is_admitted(identifier: str) -> None:
     assert spdx_blockers(identifier) == []
-    assert spdx_blockers(identifier + "+") == []  # "or later" of an admitted id
+
+
+@pytest.mark.parametrize("identifier", sorted(QONTINUI_IDS))
+def test_or_later_is_a_choice_and_refused_like_or(identifier: str) -> None:
+    """``X+`` is "X or any later version": a choice of licence, as OR is."""
+    assert spdx_blockers(identifier + "+") == [f"{identifier}+: {OR_REFUSED}"]
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["Apache-2.0+ WITH LLVM-exception", "MIT AND Zlib+", "(Apache-2.0 AND MIT+) AND IJG"],
+)
+def test_or_later_inside_an_expression_is_refused(expression: str) -> None:
+    [blocked] = spdx_blockers(expression)
+    assert blocked.endswith(OR_REFUSED) and "+" in blocked
 
 
 @pytest.mark.parametrize(
@@ -89,7 +103,7 @@ def test_an_or_is_refused_with_its_reason(expression: str) -> None:
     licence is the conjunction of what made it, so studio refuses a choice."""
     blocked = spdx_blockers(expression)
     assert OR_REFUSED in blocked
-    assert "unsaid" in OR_REFUSED
+    assert "unsaid" in OR_REFUSED and "or later" in OR_REFUSED
 
 
 @pytest.mark.parametrize(

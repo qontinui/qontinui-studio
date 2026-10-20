@@ -598,6 +598,15 @@ def _with_variants(base: str, variants: int) -> str:
     return json.dumps(data, sort_keys=True)
 
 
+def _variants_of(signature: str | None) -> int | None:
+    try:
+        data = json.loads(signature or "")
+    except ValueError:
+        return None
+    value = data.get("variants") if isinstance(data, dict) else None
+    return value if isinstance(value, int) else None
+
+
 def _base_of(signature: str | None) -> str | None:
     try:
         data = json.loads(signature or "")
@@ -727,7 +736,14 @@ def _facade_verdict(
 
     A facade that is not resident is woken for the question only when a
     generation is about to load it anyway: an interactive job, to a provider
-    not holding work off (``busy``/``deferred``). A bulk job never wakes it."""
+    not holding work off (``busy``/``deferred``). A bulk job never wakes it.
+
+    The accepted cost: when the woken facade's map then DISAGREES, nothing is
+    generated, so waking it unloaded the resident model (an LLM such as the
+    gemma emitter) for nothing. That is bounded to one interactive slot per
+    provider per run — the probe caches its answer, a failed wake included —
+    and the verdict says so, naming the model it unloaded, so the report
+    carries it."""
     recipe_id = target.recipe_for(spec, route)
     named = readers.imagegen.recipe(recipe_id) if recipe_id is not None else None
     facades = []
@@ -743,11 +759,13 @@ def _facade_verdict(
     if named is None or not named.known:
         return "unknown", "the manifest's recipe hash is unreadable"
     mismatches: list[str] = []
+    evicted: list[str] = []
     now = ctx.clock()
     for provider in facades:
         held = _held_off(ctx.conn, provider.id, now)
         wake = priority == "interactive" and held is None
         served = readers.facade(provider, wake=wake)
+        evicted += served.evicted
         if served.state != "map":
             return "unknown", served.detail + (f" ({held})" if held else "")
         hash_ = served.recipes.get(str(recipe_id))
@@ -757,6 +775,11 @@ def _facade_verdict(
                 f"{(hash_ or 'nothing')[:12]}; the manifest names {str(named.value)[:12]}"
             )
     if mismatches and len(mismatches) == len(target.providers):
+        if evicted:
+            mismatches.append(
+                f"waking the facade unloaded the resident model ({', '.join(sorted(evicted))}); "
+                "the served recipe then disagreed"
+            )
         return "mismatch", "; ".join(mismatches)
     if mismatches:
         return "unknown", "; ".join(mismatches)
@@ -814,12 +837,13 @@ def _probe(
             rep.status, rep.reasons = "refused", [f"brief: {p}" for p in made]
             return False
         probe_id, status = made, "generating"
+        rep.reasons.append(
+            f"a one-candidate probe ({probe_id}): the last batch for these inputs could not be "
+            "bound because of what the facade served"
+        )
     else:
         probe_id, status = str(probe["id"]), str(probe["status"])
-    rep.reasons.append(
-        f"a one-candidate probe ({probe_id}): the last batch for these inputs could not be "
-        "bound because of what the facade served"
-    )
+        rep.reasons.append(f"resumed the one-candidate probe {probe_id} ({status})")
     if status == "generating":
         status = drive_batch(ctx, probe_id, publish=False).status
     if status != "generated":
@@ -850,11 +874,17 @@ def _probe(
     return True
 
 
+#: A batch that has not reached an end: it is resumed, never left behind.
+IN_FLIGHT = ("generating", "generated", "refused")
+
+
 def _cooling(
     conn: sqlite3.Connection, target: CompileTarget, spec: LoadedSpec, signature: str
 ) -> bool:
-    """Whether the newest batch for these exact inputs failed because what the
-    facade served could not be bound."""
+    """Whether these inputs are cooling down: the newest batch for them failed
+    because what the facade served could not be bound, or is a one-candidate
+    probe still in flight (deferred, or waiting for its result) — which the
+    caller resumes rather than leaving behind for a fresh N."""
     base = _base_of(signature)
     rows = conn.execute(
         "SELECT status, reason, compile_inputs_json FROM batches WHERE compile_target = ? "
@@ -863,11 +893,37 @@ def _cooling(
         (target.id, spec.slot_id, spec.sha256),
     ).fetchall()
     row = next((r for r in rows if _base_of(r["compile_inputs_json"]) == base), None)
-    return bool(
-        row is not None
-        and row["status"] == "failed"
-        and str(row["reason"] or "").startswith(FACADE_FAILED)
-    )
+    if row is None:
+        return False
+    if row["status"] in IN_FLIGHT and _variants_of(row["compile_inputs_json"]) == 1:
+        return True
+    return bool(row["status"] == "failed" and str(row["reason"] or "").startswith(FACADE_FAILED))
+
+
+def _retire_probes(
+    conn: sqlite3.Connection,
+    target: CompileTarget,
+    spec: LoadedSpec,
+    base: str,
+    reason: str,
+    now: datetime,
+) -> None:
+    """Close a one-candidate probe for these inputs that is still in flight,
+    once the N batch goes ahead without it (the facade's map agrees)."""
+    rows = conn.execute(
+        "SELECT id, compile_inputs_json FROM batches WHERE compile_target = ? "
+        "AND compile_slot = ? AND compile_spec_sha256 = ? AND status IN (?, ?, ?)",
+        (target.id, spec.slot_id, spec.sha256, *IN_FLIGHT),
+    ).fetchall()
+    for row in rows:
+        sig = row["compile_inputs_json"]
+        if _variants_of(sig) == 1 and _base_of(sig) == _base_of(base):
+            conn.execute(
+                "UPDATE batches SET status = 'failed', reason = ? WHERE id = ? "
+                "AND (driver IS NULL OR driver_until < ?)",
+                (reason, row["id"], now.isoformat()),
+            )
+    conn.commit()
 
 
 def _republish(conn: sqlite3.Connection, site: Site, batch_id: str, now: datetime) -> int:
@@ -1380,10 +1436,16 @@ def _compile_one(
             rep.reasons.append(
                 f"what the facade serves is UNKNOWN ({why}); the candidates' provenance decides"
             )
-        if verdict != "agrees" and _cooling(ctx.conn, target, spec, base):
+        probing = target.candidates > 1  # with N = 1 the batch IS the probe
+        if verdict == "agrees" and probing:
+            _retire_probes(
+                ctx.conn, target, spec, base, "superseded: the facade's recipe map agrees", now
+            )
+        if verdict != "agrees" and probing and _cooling(ctx.conn, target, spec, base):
             # The last batch for these inputs could not be bound because of what
-            # the facade served, and no recipe map says whether that changed:
-            # re-probe with ONE candidate first; the N batch only if it passes.
+            # the facade served (or its probe is still in flight), and no recipe
+            # map says whether that changed: probe with ONE candidate first —
+            # resuming the probe in flight — and the N batch only if it passes.
             if not _probe(
                 ctx, readers, target, spec, rep, route, slot, inputs, base, checkout, priority
             ):

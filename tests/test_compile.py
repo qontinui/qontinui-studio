@@ -1503,6 +1503,7 @@ def test_a_served_recipe_map_that_disagrees_defers_without_generating(
             for r in slot.reasons
         )
         assert not report.files_written
+        assert not any("unloaded" in r for r in slot.reasons)  # it was resident: no wake
     assert len(sent) == calls and len(env.store.uploads) == uploads
     assert len(batches(env.context())) == count  # no batch at all
     # The facade is redeployed: its map agrees, and the slot compiles.
@@ -1622,18 +1623,123 @@ def test_a_map_that_agrees_gets_the_full_n_even_while_cooling_down(
     assert not any("probe" in r for r in slot.reasons)
 
 
-@pytest.mark.usefixtures("respx_mock")
-def test_a_one_candidate_probe_is_never_resumed_as_the_n_batch(
-    env: CompileEnv, imagegen_dir: Path
-) -> None:
-    """The candidate count is part of a batch's signature: a probe left
-    generating (the facade deferred it) is resumed as a probe, and the N batch
-    that follows it is a batch of its own."""
-    from qontinui_studio.compiler.run import _base_of, _with_variants
+def _defer_next_drive(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make the next ``drive_batch`` leave its batch ``generating`` without
+    generating anything (the facade deferred it: the bulk window); later
+    drives are real. Returns the batch ids that were deferred."""
+    from qontinui_studio.compiler import run as run_mod
+    from qontinui_studio.pipeline import BatchOutcome
 
-    base = json.dumps({"slot": HERO, "inputs": {}}, sort_keys=True)
-    one, n = _with_variants(base, 1), _with_variants(base, 2)
-    assert one != n and _base_of(one) == _base_of(n) == base
+    real = run_mod.drive_batch
+    deferred: list[str] = []
+
+    def drive(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutcome:
+        if not deferred:
+            deferred.append(batch_id)
+            return BatchOutcome(batch_id=batch_id, status="generating")
+        return real(ctx, batch_id, publish=publish)
+
+    monkeypatch.setattr(run_mod, "drive_batch", drive)
+    return deferred
+
+
+def _cooling_after_a_mismatch(
+    env: CompileEnv, imagegen_dir: Path, **facade: object
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Compile HERO, move the manifest's recipe hash, and run one night: N
+    candidates come back made under the old recipe and the cool-down starts."""
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    served = ["d" * 64]
+    sent = _facade(env, weights=["9" * 64], recipe=served, **facade)  # type: ignore[arg-type]
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    env.run()
+    _move_manifest(imagegen_dir, "d" * 64, "f" * 64)
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    assert env.run(changed=True).slots[0].status == "refused"
+    return sent, served
+
+
+def _compile_batches(env: CompileEnv) -> list[tuple[str, str, int]]:
+    rows = (
+        env.context()
+        .conn.execute(
+            "SELECT id, status, compile_inputs_json FROM batches WHERE compile_slot = ? "
+            "ORDER BY created_at, rowid",
+            (HERO,),
+        )
+        .fetchall()
+    )
+    return [(r["id"], r["status"], json.loads(r["compile_inputs_json"])["variants"]) for r in rows]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_deferred_probe_is_resumed_not_skipped_for_a_fresh_n(
+    env: CompileEnv, imagegen_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Night 2's one-candidate probe is deferred. Night 3 resumes THAT probe —
+    it does not read the in-flight probe as the end of the cool-down and
+    generate the full N — and the probe never stays ``generating``."""
+    sent, _served = _cooling_after_a_mismatch(env, imagegen_dir)
+    deferred = _defer_next_drive(monkeypatch)
+    before = len(sent)
+    night2 = env.run(changed=True)
+    assert night2.slots[0].status == "generating" and len(sent) == before
+    [probe] = deferred
+    assert _compile_batches(env)[-1] == (probe, "generating", 1)
+
+    before = len(sent)
+    night3 = env.run(changed=True)
+    [slot] = night3.slots
+    assert f"resumed the one-candidate probe {probe} (generating)" in slot.reasons
+    assert len(sent) - before == 1  # the probe's one candidate, no N
+    assert slot.status == "refused" and slot.batch_id == probe  # still the old recipe
+    rows = _compile_batches(env)
+    assert rows[-1] == (probe, "failed", 1)
+    assert not [r for r in rows if r[1] == "generating"]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_deferred_probe_that_passes_on_resumption_leads_to_the_full_n(
+    env: CompileEnv, imagegen_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent, served = _cooling_after_a_mismatch(env, imagegen_dir)
+    deferred = _defer_next_drive(monkeypatch)
+    env.run(changed=True)
+    served[0] = "f" * 64  # redeployed while the probe waited
+    before = len(sent)
+    [slot] = env.run(changed=True).slots
+    assert slot.status == "compiled" and len(sent) - before == 1 + 2
+    assert slot.pick is not None and slot.pick["of"] == 2 and slot.batch_id != deferred[0]
+    assert [r[1:] for r in _compile_batches(env)[-2:]] == [("failed", 1), ("published", 2)]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_probe_in_flight_is_closed_when_the_map_then_agrees(
+    env: CompileEnv, imagegen_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A redeployed facade whose recipe map agrees ends the cool-down: the
+    probe still in flight is closed, never left ``generating``, and the full N
+    goes ahead without it."""
+    status = {"hero": "d" * 64}
+    with_map = [False]
+    sent, served = _cooling_after_a_mismatch(
+        env, imagegen_dir, status_map=status, serve_map=with_map
+    )
+    deferred = _defer_next_drive(monkeypatch)
+    env.run(changed=True)
+    served[0] = status["hero"] = "f" * 64
+    with_map[0] = True
+    before = len(sent)
+    [slot] = env.run(changed=True).slots
+    assert slot.status == "compiled" and len(sent) - before == 2
+    reason = (
+        env.context()
+        .conn.execute("SELECT status, reason FROM batches WHERE id = ?", (deferred[0],))
+        .fetchone()
+    )
+    assert tuple(reason) == ("failed", "superseded: the facade's recipe map agrees")
 
 
 # ---- review round 6: the preflight never makes llama-swap swap a model in -------------
@@ -1685,6 +1791,12 @@ def test_an_interactive_run_wakes_the_facade_it_is_about_to_use_anyway(
     report = env.run()
     assert [s.status for s in report.slots] == ["deferred"] and sent == []
     assert probes == ["/upstream/qontinui-imagegen/qontinui/status"]
+    # The accepted cost, stated: the wake unloaded the resident model for nothing.
+    assert any(
+        "waking the facade unloaded the resident model (gemma-4-31b); the served recipe "
+        "then disagreed" in r
+        for r in report.slots[0].reasons
+    )
 
 
 @pytest.mark.usefixtures("respx_mock")

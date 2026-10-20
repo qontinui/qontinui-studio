@@ -20,7 +20,10 @@ whatever is resident (an LLM such as the gemma emitter). So the probe:
    about to happen anyway (``wake``): an interactive job the facade is not
    holding off. A bulk run (the facade's bulk window may defer it) or a facade
    that answered ``busy``/``deferred`` is never woken for a probe;
-3. answers each provider once per run (cached).
+3. answers each provider once per run (cached) — including an UNKNOWN that a
+   wake attempt produced, so a facade that will not wake costs one wait per
+   run, not one per slot. Only an UNKNOWN from a call that was not allowed to
+   wake is asked again, by a caller that may.
 
 A provider pointed straight at the facade (no llama-swap: ``/running`` is a
 404) is asked directly. Anything unreadable is UNKNOWN, never "agrees".
@@ -29,7 +32,7 @@ A provider pointed straight at the facade (no llama-swap: ``/running`` is a
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, Protocol
 from urllib.parse import quote
 
@@ -60,6 +63,9 @@ class Served:
     state: ServedState
     detail: str
     recipes: dict[str, str] = field(default_factory=dict)
+    # The model(s) THIS read unloaded by waking the facade (llama-swap keeps
+    # one resident); empty for a cached answer and for a read that woke nothing.
+    evicted: tuple[str, ...] = ()
 
 
 class FacadeProbe(Protocol):
@@ -76,15 +82,18 @@ def _root(provider: Provider) -> str | None:
 class HttpFacadeProbe:
     def __init__(self, http: httpx.Client | None = None) -> None:
         self.http = http or httpx.Client(timeout=LLAMA_SWAP_TIMEOUT_S)
-        self._cache: dict[str, Served] = {}
+        # provider id -> (answer, whether the read that produced it could wake)
+        self._cache: dict[str, tuple[Served, bool]] = {}
         self.calls: list[str] = []  # every URL asked, for the report and tests
 
     def __call__(self, provider: Provider, *, wake: bool) -> Served:
         cached = self._cache.get(provider.id)
-        if cached is not None and (cached.state != "unknown" or not wake):
-            return cached
+        if cached is not None:
+            answer, could_wake = cached
+            if answer.state != "unknown" or could_wake or not wake:
+                return replace(answer, evicted=())  # the eviction was reported once
         served = self._read(provider, wake)
-        self._cache[provider.id] = served
+        self._cache[provider.id] = (served, wake)
         return served
 
     def _get(self, url: str, timeout: float) -> httpx.Response | None:
@@ -124,7 +133,8 @@ class HttpFacadeProbe:
         # The entry llama-swap lists as the facade, else the provider's model.
         target = sorted(listed)[0] if listed else sorted(entries)[0]
         url = f"{root}/upstream/{quote(target, safe='')}{STATUS_PATH}"
-        return self._status(url, WAKE_TIMEOUT_S, f"facade {target}, woken for this generation")
+        served = self._status(url, WAKE_TIMEOUT_S, f"facade {target}, woken for this generation")
+        return replace(served, evicted=tuple(sorted(ready - entries)))
 
     def _facade_entries(self, root: str) -> set[str]:
         """The model ids llama-swap lists as the image facade."""

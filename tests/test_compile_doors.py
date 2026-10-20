@@ -718,6 +718,25 @@ def test_the_facade_probe_answers_each_provider_once_per_run() -> None:
 
 
 @respx.mock
+def test_a_failed_wake_is_cached_for_the_run() -> None:
+    """A wake that produced no answer (the facade did not come up) is not
+    paid again by every later slot: up to WAKE_TIMEOUT_S each."""
+    from qontinui_studio.compiler.facade import HttpFacadeProbe
+
+    provider = _facade_provider()
+    respx.get(f"{SWAP}/running").mock(return_value=_running("gemma-4-31b"))
+    respx.get(f"{SWAP}/v1/models").mock(return_value=httpx.Response(200, json=FACADE_MODELS))
+    upstream = respx.get(url__regex=r".*/upstream/.*").mock(return_value=httpx.Response(503))
+    probe = HttpFacadeProbe()
+    first = probe(provider, wake=True)
+    assert first.state == "unknown" and first.evicted == ("gemma-4-31b",)
+    for _ in range(3):
+        again = probe(provider, wake=True)
+        assert again.state == "unknown" and again.evicted == ()  # reported once
+    assert upstream.call_count == 1
+
+
+@respx.mock
 def test_the_facade_probe_without_llama_swap_asks_the_facade_and_unreadable_is_unknown() -> None:
     from qontinui_studio.compiler.facade import HttpFacadeProbe
 
