@@ -1742,6 +1742,94 @@ def test_a_probe_in_flight_is_closed_when_the_map_then_agrees(
     assert tuple(reason) == ("failed", "superseded: the facade's recipe map agrees")
 
 
+@pytest.mark.usefixtures("respx_mock")
+def test_a_probe_that_fails_to_drive_does_not_end_the_cool_down(
+    env: CompileEnv, imagegen_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Night 2's probe fails for a reason that says nothing about the facade
+    (a provider error). Night 3 still cools down — one candidate, not N —
+    because the newest batch that DOES say something is night 1's failure."""
+    from qontinui_studio.compiler import run as run_mod
+    from qontinui_studio.pipeline import BatchOutcome
+
+    sent, _served = _cooling_after_a_mismatch(env, imagegen_dir)
+    real = run_mod.drive_batch
+    failed: list[str] = []
+
+    def drive(ctx: Context, batch_id: str, publish: bool = True) -> BatchOutcome:
+        if not failed:
+            failed.append(batch_id)
+            ctx.conn.execute(
+                "UPDATE batches SET status = 'failed', reason = 'provider error: timed out' "
+                "WHERE id = ?",
+                (batch_id,),
+            )
+            ctx.conn.commit()
+            return BatchOutcome(batch_id=batch_id, status="failed")
+        return real(ctx, batch_id, publish=publish)
+
+    monkeypatch.setattr(run_mod, "drive_batch", drive)
+    before = len(sent)
+    assert env.run(changed=True).slots[0].status == "failed" and len(sent) == before
+    before = len(sent)
+    [slot] = env.run(changed=True).slots
+    assert len(sent) - before == 1  # a fresh probe, not the full N
+    assert slot.status == "refused" and slot.batch_id != failed[0]
+    assert [r[1:] for r in _compile_batches(env)[-2:]] == [("failed", 1), ("failed", 1)]
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_probe_left_refused_is_closed_and_replaced(
+    env: CompileEnv, imagegen_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe in a state that is not resumed (``refused``) would otherwise be
+    picked up again every run and never move: it is closed, and a fresh probe
+    runs in its place."""
+    sent, _served = _cooling_after_a_mismatch(env, imagegen_dir)
+    _defer_next_drive(monkeypatch)
+    env.run(changed=True)
+    [stuck] = [r[0] for r in _compile_batches(env) if r[1] == "generating"]
+    conn = env.context().conn
+    conn.execute("UPDATE batches SET status = 'refused' WHERE id = ?", (stuck,))
+    conn.commit()
+    before = len(sent)
+    [slot] = env.run(changed=True).slots
+    assert f"closed the refused probe {stuck}; probing afresh" in slot.reasons
+    assert len(sent) - before == 1 and slot.batch_id != stuck
+    rows = {r[0]: r[1] for r in _compile_batches(env)}
+    assert rows[stuck] == "failed" and rows[slot.batch_id] == "failed"
+    assert "refused" not in rows.values() and "generating" not in rows.values()
+    # The closed probe says nothing about the facade: the cool-down holds.
+    before = len(sent)
+    env.run(changed=True)
+    assert len(sent) - before == 1
+
+
+@pytest.mark.usefixtures("respx_mock")
+def test_a_wake_that_ends_unknown_reports_the_eviction(env: CompileEnv, imagegen_dir: Path) -> None:
+    """Waking the facade unloads the resident model; when the woken facade
+    then serves no recipe map, the report says so too (not only on a
+    mismatch)."""
+    from qontinui_studio.compiler.inputs import ImagegenManifest
+
+    up = [False]
+    probes: list[str] = []
+    _facade(env, weights=["9" * 64], resident=up, probes=probes)  # an older facade: no map
+    env.imagegen = ImagegenManifest(imagegen_dir)
+    env.write_spec(HERO)
+    [slot] = env.run().slots
+    assert probes == ["/upstream/qontinui-imagegen/qontinui/status"]
+    assert any(
+        "waking the facade unloaded the resident model (gemma-4-31b); it then served no "
+        "usable recipe map" in r
+        for r in slot.reasons
+    )
+    up[0] = True  # resident now: asked without a wake, nothing evicted
+    env.write_spec(HERO, job="Show a calm run finishing, seen from behind the operator.")
+    [again] = env.run().slots
+    assert not any("unloaded" in r for r in again.reasons)
+
+
 # ---- review round 6: the preflight never makes llama-swap swap a model in -------------
 
 

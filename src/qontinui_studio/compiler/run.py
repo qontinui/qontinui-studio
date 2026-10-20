@@ -84,6 +84,10 @@ LORA_NOT_APPLIED = "LoRA not applied"
 FACADE_DEPENDENT = (RECIPE_MISMATCH, LORA_NOT_APPLIED)
 # The reason a batch failed for a facade-dependent cause starts with this.
 FACADE_FAILED = "facade output unbindable"
+# How a closed one-candidate probe says the facade's output CAN be bound: it
+# passed, or the facade's recipe map came to agree while it waited.
+PROBE_PASSED = "probe passed"
+PROBE_SUPERSEDED = "superseded: the facade's recipe map agrees"
 # The site slot of a spec no image file is published for: a manifest key only.
 MANIFEST_ONLY_SLOT = Slot(width=1, height=1, category="decorative", formats=["png"], rendered=False)
 RESUMABLE = ("generating", "generated", "refused")
@@ -767,7 +771,9 @@ def _facade_verdict(
         served = readers.facade(provider, wake=wake)
         evicted += served.evicted
         if served.state != "map":
-            return "unknown", served.detail + (f" ({held})" if held else "")
+            return "unknown", served.detail + (f" ({held})" if held else "") + _eviction_note(
+                evicted, "it then served no usable recipe map"
+            )
         hash_ = served.recipes.get(str(recipe_id))
         if hash_ != named.value:
             mismatches.append(
@@ -775,15 +781,22 @@ def _facade_verdict(
                 f"{(hash_ or 'nothing')[:12]}; the manifest names {str(named.value)[:12]}"
             )
     if mismatches and len(mismatches) == len(target.providers):
-        if evicted:
-            mismatches.append(
-                f"waking the facade unloaded the resident model ({', '.join(sorted(evicted))}); "
-                "the served recipe then disagreed"
-            )
-        return "mismatch", "; ".join(mismatches)
+        return "mismatch", "; ".join(mismatches) + _eviction_note(
+            evicted, "the served recipe then disagreed"
+        )
     if mismatches:
-        return "unknown", "; ".join(mismatches)
+        return "unknown", "; ".join(mismatches) + _eviction_note(
+            evicted, "the served recipe then disagreed"
+        )
     return "agrees", "every facade serves the manifest's recipe"
+
+
+def _eviction_note(evicted: list[str], then: str) -> str:
+    """The report's note that a wake unloaded the resident model for a
+    question whose answer then generated nothing by itself."""
+    if not evicted:
+        return ""
+    return f"; waking the facade unloaded the resident model ({', '.join(sorted(evicted))}); {then}"
 
 
 def _new_compile_batch(
@@ -831,6 +844,19 @@ def _probe(
     saying why: it failed on what the facade served again, or is waiting."""
     signature = _with_variants(base, 1)
     probe = _existing_batch(ctx.conn, target, spec, signature, checkout, ctx.clock())
+    if probe is not None and probe["status"] not in IN_FLIGHT:
+        # A probe left in a state that is not resumed (``refused``): close it
+        # and start a fresh one rather than resuming it forever.
+        ctx.conn.execute(
+            "UPDATE batches SET status = 'failed', reason = ? WHERE id = ?",
+            (
+                f"closed: the probe was left {probe['status']}; a fresh probe replaces it",
+                probe["id"],
+            ),
+        )
+        ctx.conn.commit()
+        rep.reasons.append(f"closed the {probe['status']} probe {probe['id']}; probing afresh")
+        probe = None
     if probe is None:
         made = _new_compile_batch(ctx, target, spec, route, priority, 1, signature, checkout)
         if isinstance(made, list):
@@ -855,7 +881,7 @@ def _probe(
     )
     passed = any(c.usable for c in candidates)
     reason = (
-        "probe passed: the facade's output can be bound again"
+        f"{PROBE_PASSED}: the facade's output can be bound again"
         if passed
         else f"{FACADE_FAILED}: the probe failed ("
         + "; ".join(c.why_not or "" for c in candidates)
@@ -874,17 +900,34 @@ def _probe(
     return True
 
 
-#: A batch that has not reached an end: it is resumed, never left behind.
-IN_FLIGHT = ("generating", "generated", "refused")
+#: A probe batch that is resumed: still generating, or generated and not yet
+#: judged. Any other non-terminal state (``refused``) is closed and replaced.
+IN_FLIGHT = ("generating", "generated")
+#: Every state a probe may be left in that is not an end.
+UNFINISHED = (*IN_FLIGHT, "refused")
+
+
+def _says_about_the_facade(row: sqlite3.Row) -> bool:
+    """Whether a batch's outcome says anything about what the facade serves.
+    A batch that failed for another reason (a provider error, a timeout, a
+    closed probe) does not: the cool-down is decided by an older batch."""
+    if row["status"] != "failed":
+        return True
+    reason = str(row["reason"] or "")
+    return reason.startswith((FACADE_FAILED, PROBE_PASSED, PROBE_SUPERSEDED))
 
 
 def _cooling(
     conn: sqlite3.Connection, target: CompileTarget, spec: LoadedSpec, signature: str
 ) -> bool:
-    """Whether these inputs are cooling down: the newest batch for them failed
-    because what the facade served could not be bound, or is a one-candidate
-    probe still in flight (deferred, or waiting for its result) — which the
-    caller resumes rather than leaving behind for a fresh N."""
+    """Whether these inputs are cooling down, decided by the newest batch for
+    them that says something about the facade (a batch that failed for
+    another reason — a provider error, a timeout — is skipped, so a failed
+    drive does not end the cool-down while the lag persists): it failed
+    because what the facade served could not be bound, or it is a
+    one-candidate probe still unfinished (deferred, or waiting for its
+    result) — which the caller resumes or replaces, never leaving it behind
+    for a fresh N."""
     base = _base_of(signature)
     rows = conn.execute(
         "SELECT status, reason, compile_inputs_json FROM batches WHERE compile_target = ? "
@@ -892,10 +935,17 @@ def _cooling(
         "ORDER BY created_at DESC, rowid DESC",
         (target.id, spec.slot_id, spec.sha256),
     ).fetchall()
-    row = next((r for r in rows if _base_of(r["compile_inputs_json"]) == base), None)
+    row = next(
+        (
+            r
+            for r in rows
+            if _base_of(r["compile_inputs_json"]) == base and _says_about_the_facade(r)
+        ),
+        None,
+    )
     if row is None:
         return False
-    if row["status"] in IN_FLIGHT and _variants_of(row["compile_inputs_json"]) == 1:
+    if row["status"] in UNFINISHED and _variants_of(row["compile_inputs_json"]) == 1:
         return True
     return bool(row["status"] == "failed" and str(row["reason"] or "").startswith(FACADE_FAILED))
 
@@ -913,7 +963,7 @@ def _retire_probes(
     rows = conn.execute(
         "SELECT id, compile_inputs_json FROM batches WHERE compile_target = ? "
         "AND compile_slot = ? AND compile_spec_sha256 = ? AND status IN (?, ?, ?)",
-        (target.id, spec.slot_id, spec.sha256, *IN_FLIGHT),
+        (target.id, spec.slot_id, spec.sha256, *UNFINISHED),
     ).fetchall()
     for row in rows:
         sig = row["compile_inputs_json"]
@@ -1438,9 +1488,7 @@ def _compile_one(
             )
         probing = target.candidates > 1  # with N = 1 the batch IS the probe
         if verdict == "agrees" and probing:
-            _retire_probes(
-                ctx.conn, target, spec, base, "superseded: the facade's recipe map agrees", now
-            )
+            _retire_probes(ctx.conn, target, spec, base, PROBE_SUPERSEDED, now)
         if verdict != "agrees" and probing and _cooling(ctx.conn, target, spec, base):
             # The last batch for these inputs could not be bound because of what
             # the facade served (or its probe is still in flight), and no recipe
