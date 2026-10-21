@@ -118,7 +118,10 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
     db = tmp_path / ".studio" / "studio.db"
     _v0_db(db, write_image(tmp_path / "raw.png"))
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+    # v5: a launch's notice fields, frozen at publish; pre-v5 launches have none.
+    launch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(launches)")}
+    assert {"unpublish_command", "public_url"} <= launch_cols
     # v4: the image-generation dial's last-known level; an upgraded studio has
     # read none, and a level outside the dial's vocabulary is refused.
     assert conn.execute("SELECT COUNT(*) FROM imagegen_dial_last_known").fetchone()[0] == 0

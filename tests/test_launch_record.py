@@ -201,6 +201,47 @@ def test_authed_door_sends_bearer_and_reads_bare_document(
     assert isinstance(outcome, NoBuildRecord) and outcome.kind == "unauthorized"
 
 
+TENANT = "00000000-0000-4000-8000-0000000000a1"  # synthetic
+
+
+@respx.mock
+def test_authed_doors_pin_the_active_tenant_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AK2: with STUDIO_WEB_ACTIVE_TENANT set, every authed web read (the live
+    document and the publication) acts in that tenant; unset, no header."""
+    monkeypatch.setenv("STUDIO_WEB_BEARER", "tok-123")
+    authed = respx.get(AUTHED).mock(return_value=httpx.Response(200, json=document()))
+    publication = respx.get(f"{AUTHED}/publication").mock(
+        return_value=httpx.Response(404, json={"detail": "not deployed"})
+    )
+    client = BuildRecordClient(web_base=WEB)
+
+    client.fetch_authed(SLUG)
+    client.publication(SLUG)
+    for route in (authed, publication):
+        assert "X-Qontinui-Active-Tenant" not in route.calls.last.request.headers
+
+    monkeypatch.setenv("STUDIO_WEB_ACTIVE_TENANT", f" {TENANT}\n")
+    client.fetch_authed(SLUG)
+    client.publication(SLUG)
+    for route in (authed, publication):
+        headers = route.calls.last.request.headers
+        assert headers["X-Qontinui-Active-Tenant"] == TENANT
+        assert headers["Authorization"] == "Bearer tok-123"
+
+
+def test_a_malformed_active_tenant_refuses_the_authed_door(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin that is not a tenant UUID never silently drops to the home tenant."""
+    monkeypatch.setenv("STUDIO_WEB_BEARER", "tok-123")
+    monkeypatch.setenv("STUDIO_WEB_ACTIVE_TENANT", "not-a-tenant")
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.route().mock(return_value=httpx.Response(200, json=document()))
+        outcome = BuildRecordClient(web_base=WEB).fetch_authed(SLUG)
+    assert isinstance(outcome, NoBuildRecord) and outcome.kind == "misconfigured"
+    assert "STUDIO_WEB_ACTIVE_TENANT" in outcome.detail and not route.called
+
+
 def test_record_file_bare_or_wrapped(tmp_path: Path) -> None:
     bare = tmp_path / "bare.json"
     bare.write_text(json.dumps(document()))

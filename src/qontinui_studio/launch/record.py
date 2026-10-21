@@ -7,7 +7,8 @@ Two doors serve a ``build-record/1`` document:
   ``{public_slug, version, published_at, content_sha256, document}``;
 * the AUTHED proxy, ``GET {web}/api/v1/build-records/{slug}`` — the live
   document from coord, bare, behind a bearer (``STUDIO_WEB_BEARER`` /
-  ``STUDIO_WEB_BEARER_FILE``).
+  ``STUDIO_WEB_BEARER_FILE``). With ``STUDIO_WEB_ACTIVE_TENANT`` set, every
+  authed call also sends ``X-Qontinui-Active-Tenant`` so it acts in that tenant.
 
 Whichever door answers, the document is re-validated here against the same D3
 allowlist the factory applies (key for key, at every depth; any extra key is a
@@ -24,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -45,6 +47,14 @@ AUTHED_PATH: Final = "/api/v1/build-records/{slug}"
 PUBLICATION_PATH: Final = "/api/v1/build-records/{slug}/publication"
 WEB_BEARER_ENV: Final = "STUDIO_WEB_BEARER"
 WEB_BEARER_FILE_ENV: Final = "STUDIO_WEB_BEARER_FILE"
+#: The tenant an authed web call acts in (a UUID). qontinui-web reads it from
+#: ``X-Qontinui-Active-Tenant``; without it a multi-tenant account's call lands
+#: in its home tenant. The hub sets it so every read is in the publishing tenant.
+ACTIVE_TENANT_ENV: Final = "STUDIO_WEB_ACTIVE_TENANT"
+ACTIVE_TENANT_HEADER: Final = "X-Qontinui-Active-Tenant"
+_UUID_RE: Final = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 SLUG_PATTERN: Final = r"^[a-z0-9][a-z0-9-]{0,62}$"
 
 
@@ -363,9 +373,14 @@ class NoBuildRecord:
     Phase 1 not deployed), ``unreachable`` (transport failure or 5xx),
     ``unauthorized`` (401/403 on the authed door), ``no_credential`` (authed
     door asked for with no bearer configured), ``refused_door`` (the authed
-    door's host is not https on an allowlisted host, so no bearer is sent)."""
+    door's host is not https on an allowlisted host, so no bearer is sent),
+    ``misconfigured`` (the authed door's configuration is wrong — e.g. a
+    ``STUDIO_WEB_ACTIVE_TENANT`` that is not a tenant UUID; never a reason to
+    fall back to anything)."""
 
-    kind: Literal["not_found", "unreachable", "unauthorized", "no_credential", "refused_door"]
+    kind: Literal[
+        "not_found", "unreachable", "unauthorized", "no_credential", "refused_door", "misconfigured"
+    ]
     url: str
     detail: str
 
@@ -444,7 +459,18 @@ class BuildRecordClient:
             return NoBuildRecord(
                 "no_credential", url, f"set {WEB_BEARER_ENV} or {WEB_BEARER_FILE_ENV}"
             )
-        return {"Authorization": f"Bearer {bearer}"}
+        headers = {"Authorization": f"Bearer {bearer}"}
+        tenant = os.environ.get(ACTIVE_TENANT_ENV, "").strip()
+        if tenant:
+            if not _UUID_RE.fullmatch(tenant):
+                # Never act in an unintended tenant: a malformed pin is a
+                # configuration error, never silently dropped (and never a
+                # reason for a gate to fall back to the product's pins).
+                return NoBuildRecord(
+                    "misconfigured", url, f"{ACTIVE_TENANT_ENV} is set but is not a tenant UUID"
+                )
+            headers[ACTIVE_TENANT_HEADER] = tenant
+        return headers
 
     def fetch_authed(self, slug: str) -> FetchOutcome:
         url = self.web_base + AUTHED_PATH.format(slug=slug)

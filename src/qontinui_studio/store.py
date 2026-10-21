@@ -247,9 +247,21 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   run has no memory of its own, so without this row an unreadable dial could
 #   only fall to the no-last-known default (``local_only``). Written only from
 #   a successful read; never from a default.
+#
+# Version 5 — what a launch's notices say, frozen at publish (plan
+# 2026-10-17-build-qontinui-io-factory-hub, B4):
+#
+# * ``launches.unpublish_command``: the product's ``publish.unpublish_command``
+#   as it was when the launch went live (NULL: the studio's own
+#   ``studio launch unpublish --launch <id>``).
+# * ``launches.public_url``: the product's ``publish.public_url`` then (NULL:
+#   the notice names the local files).
+#   Recovery and readopt re-send notices from these, never from whatever
+#   product yaml sits at ``product_path`` later. Launches published before v5
+#   keep NULL in both.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _BATCHES_V1 = """
 CREATE TABLE batches_v1 (
@@ -411,11 +423,17 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE launches ADD COLUMN unpublish_command TEXT")
+    conn.execute("ALTER TABLE launches ADD COLUMN public_url TEXT")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
+    4: _migrate_v4_to_v5,
 }
 
 

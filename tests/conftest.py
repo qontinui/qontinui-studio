@@ -482,3 +482,11 @@ def make_context(
         return ctx
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _no_studio_host_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The studio host exports the hub clone/preview roots and the web tenant
+    pin; tests never inherit them. A test that needs one sets it itself."""
+    for name in ("STUDIO_HUB_CLONE", "STUDIO_HUB_PREVIEW", "STUDIO_WEB_ACTIVE_TENANT"):
+        monkeypatch.delenv(name, raising=False)

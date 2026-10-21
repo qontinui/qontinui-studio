@@ -8,6 +8,7 @@ bundle publishes.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Literal
@@ -97,6 +98,12 @@ class PublishTarget(BaseModel):
     # images. Same-origin by construction: a path, never a URL, so a published
     # page can only run code its own host serves.
     page_scripts: tuple[str, ...] = ()
+    # The one-step unpublish the published notice prints, verbatim, in place
+    # of the studio's own ``studio launch unpublish --launch <id>``. For a
+    # bundle that goes live through another system (a hub repo whose PR
+    # lands it), the studio's own command only deletes files in a checkout;
+    # the host's command is the real retraction (e.g. `hub unpublish <slug>`).
+    unpublish_command: str | None = Field(default=None, min_length=1, max_length=500)
 
     @property
     def has_preview(self) -> bool:
@@ -125,6 +132,17 @@ class PublishTarget(BaseModel):
         if len(set(scripts)) != len(scripts):
             raise ValueError("page_scripts lists a path twice")
         return scripts
+
+    @field_validator("unpublish_command")
+    @classmethod
+    def _unpublish_command(cls, command: str | None) -> str | None:
+        if command is None:
+            return None
+        if not command.strip() or any(ord(c) < 32 or ord(c) == 127 for c in command):
+            raise ValueError(
+                "unpublish_command must be one non-blank line with no control characters"
+            )
+        return command
 
     @model_validator(mode="after")
     def _preview(self) -> PublishTarget:
@@ -252,9 +270,53 @@ class LaunchProduct(BaseModel):
         return self.record.public_url or public_record_url(self.slug, self.record.web_base)
 
 
-def _resolve(raw: dict[str, object], key: str, base: Path) -> None:
+#: ``${NAME}`` in a path value: expanded from the environment at load.
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env(value: str, where: str) -> str:
+    """Expand every ``${NAME}`` in ``value`` from the environment. A variable
+    that is unset (or empty) is refused, naming it: a path that silently lost
+    its root would land somewhere nobody chose."""
+    missing = [name for name in _ENV_REF_RE.findall(value) if not os.environ.get(name)]
+    if missing:
+        names = ", ".join(sorted(set(missing)))
+        raise ConfigError(
+            f"{where} uses ${{{missing[0]}}} but {names} is not set in the environment "
+            f"({value!r}); set it to an absolute path on this host"
+        )
+    return _ENV_REF_RE.sub(lambda m: os.environ[m.group(1)], value)
+
+
+def _resolve(raw: dict[str, object], key: str, base: Path, where: str = "") -> None:
+    """Make a path value absolute and canonical. ``${NAME}`` references are
+    expanded first and must then yield an absolute path, so a pinned path
+    (``${STUDIO_HUB_CLONE}/public/<slug>``) is the same string whichever
+    checkout or working directory loads the yaml. A plain relative value
+    resolves against ``base`` (the yaml's own directory)."""
     value = raw.get(key)
-    if isinstance(value, str) and not Path(value).is_absolute():
+    if not isinstance(value, str):
+        return
+    label = f"{where}{key}"
+    if "$" in _ENV_REF_RE.sub("", value):
+        # `$NAME`, an unclosed `${`, `${X:-y}`, `${1X}`: none is expanded, so
+        # the value would otherwise land relative to the yaml, as a literal.
+        raise ConfigError(
+            f"{label} {value!r} contains a '$' that is not a ${{NAME}} reference "
+            "(only ${NAME}, NAME = [A-Za-z_][A-Za-z0-9_]*, is expanded; no $NAME, "
+            "defaults or other shell forms)"
+        )
+    if _ENV_REF_RE.search(value):
+        expanded = expand_env(value, label)
+        if not Path(expanded).is_absolute():
+            raise ConfigError(
+                f"{label} {value!r} expands to {expanded!r}, which is not absolute; "
+                "an environment-pinned path must be absolute"
+            )
+        raw[key] = str(Path(expanded).resolve())
+    elif Path(value).is_absolute():
+        raw[key] = str(Path(value).resolve())
+    else:
         raw[key] = str((base / value).resolve())
 
 
@@ -269,15 +331,18 @@ def load_product(path: Path, root: Path | None = None) -> LaunchProduct:
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: expected a mapping")
     base = path.parent
-    _resolve(raw, "brief", base)
-    for section, keys in (
-        ("capture", ("script", "serve_dir")),
-        ("publish", ("publish_dir", "preview_dir")),
-    ):
-        sub = raw.get(section)
-        if isinstance(sub, dict):
-            for key in keys:
-                _resolve(sub, key, base)
+    try:
+        _resolve(raw, "brief", base)
+        for section, keys in (
+            ("capture", ("script", "serve_dir")),
+            ("publish", ("publish_dir", "preview_dir")),
+        ):
+            sub = raw.get(section)
+            if isinstance(sub, dict):
+                for key in keys:
+                    _resolve(sub, key, base, f"{section}.")
+    except ConfigError as e:
+        raise ConfigError(f"{path}: {e}") from e
     try:
         product = LaunchProduct.model_validate(raw)
         product.publish.check_paths(root if root is not None else path.resolve().parent.parent)

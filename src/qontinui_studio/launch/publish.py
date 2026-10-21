@@ -410,8 +410,57 @@ def gate_footer(bundle: Path, manifest: dict[str, Any]) -> GateResult:
 
 
 def _studio_file(rel: str) -> bool:
-    """The studio's own bookkeeping in a publish dir: the lock and journals."""
+    """The studio's own bookkeeping in a publish dir: the lock and journals,
+    which live at its TOP level only (a same-named file deeper down is not
+    the studio's)."""
+    if Path(rel).parent != Path("."):
+        return False
     return rel == LOCK_NAME or (rel.startswith(JOURNAL_PREFIX) and rel.endswith(".json"))
+
+
+#: How :func:`_dir_contents` names the directory itself when the directory
+#: itself is foreign (a symlink, or not a directory at all).
+DIR_ITSELF = "(the directory itself)"
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
+def _dir_contents(directory: Path) -> tuple[dict[str, Path], list[str]]:
+    """``({rel: path} of regular files, [rel of everything else])`` under
+    ``directory``, the studio's top-level lock and journals aside.
+
+    Walked without following links. Anything that is not a regular file or a
+    real directory — a symlink to a file or a directory (dangling or not), a
+    FIFO, a socket, a device — is reported in the second list as itself:
+    never hashed (a FIFO would block forever), never followed, never skipped,
+    because a launch only ever places regular files. A symlinked (or
+    non-directory) ``directory`` is reported as :data:`DIR_ITSELF`. A
+    directory that cannot be read raises its :class:`OSError` rather than
+    being silently left out."""
+    files: dict[str, Path] = {}
+    other: list[str] = []
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        return files, [DIR_ITSELF]
+    if not directory.exists():
+        return files, other
+    for dirpath, dirnames, filenames in os.walk(
+        directory, followlinks=False, onerror=_raise_walk_error
+    ):
+        here = Path(dirpath)
+        for name in [*dirnames, *filenames]:
+            path = here / name
+            rel = str(path.relative_to(directory))
+            if path.is_symlink():
+                other.append(rel)
+            elif name in dirnames:
+                continue  # a real directory: walked
+            elif not path.is_file():
+                other.append(rel)
+            elif not _studio_file(rel):
+                files[rel] = path
+    return files, sorted(other)
 
 
 def _live_launch(conn: sqlite3.Connection, publish_dir: Path) -> sqlite3.Row | None:
@@ -427,15 +476,21 @@ def gate_foreign_file(conn: sqlite3.Connection, publish_dir: Path, launch_id: st
     placed, still holding the bytes it placed (the lock and journals aside)."""
     live = _live_launch(conn, publish_dir)
     owned: dict[str, str] = json.loads(live["published_files"] or "{}") if live else {}
-    foreign: list[str] = []
-    if publish_dir.is_dir():
-        for path in sorted(p for p in publish_dir.rglob("*") if p.is_file()):
-            rel = str(path.relative_to(publish_dir))
-            if _studio_file(rel):
-                continue
-            if owned.get(rel) != sha256_file(path):
-                foreign.append(rel)
     subject = f"launch {launch_id} -> {publish_dir}"
+    try:
+        files, other = _dir_contents(publish_dir)
+        # Non-regular entries first: they are named in the detail's example.
+        foreign = other + sorted(
+            rel for rel, path in files.items() if owned.get(rel) != sha256_file(path)
+        )
+    except OSError as e:
+        return GateResult(
+            "foreign_file",
+            subject,
+            "fail",
+            f"the directory cannot be fully read ({type(e).__name__}: {e}); the kit never "
+            "publishes over files it cannot see, so it refuses",
+        )
     if foreign:
         return GateResult(
             "foreign_file",
@@ -1031,8 +1086,15 @@ def _mark_notified(conn: sqlite3.Connection, launch_id: str) -> None:
 def _published_notice(
     row: sqlite3.Row, root: Path | None, extra: list[str] | None = None
 ) -> Notice:
+    """The published notice, from the launch row alone: the product's
+    ``publish.unpublish_command`` and ``publish.public_url`` were frozen on the
+    row when it went live (schema v5), so a notice re-sent later (recovery,
+    readopt) says what the publish said, whatever yaml sits at its path now.
+    The command is printed verbatim in place of the studio's own; with a
+    public URL the notice names the public pages, not the local files."""
     publish_dir = Path(row["publish_dir"])
     files = json.loads(row["published_files"] or "{}")
+    base = (row["public_url"] or "").rstrip("/")
     return Notice(
         batch_id=row["id"],
         outcome="published",
@@ -1044,8 +1106,8 @@ def _published_notice(
                 *(extra or []),
             ]
         ),
-        urls=[str(publish_dir / p) for p in PAGES],
-        unpublish_command=unpublish_command(row["id"], root),
+        urls=[f"{base}/{p}" if base else str(publish_dir / p) for p in PAGES],
+        unpublish_command=row["unpublish_command"] or unpublish_command(row["id"], root),
     )
 
 
@@ -1431,8 +1493,15 @@ def _publish_locked(
         conn.execute(
             "UPDATE launches SET status = 'published', reason = NULL, publish_dir = ?, "
             "published_files = ?, published_at = ?, unpublished_at = NULL, superseded_by = NULL, "
-            "notified_at = NULL WHERE id = ?",
-            (str(publish_dir), json.dumps(copied), now.isoformat(), launch_id),
+            "notified_at = NULL, unpublish_command = ?, public_url = ? WHERE id = ?",
+            (
+                str(publish_dir),
+                json.dumps(copied),
+                now.isoformat(),
+                product.publish.unpublish_command,
+                product.publish.public_url,
+                launch_id,
+            ),
         )
         conn.commit()
     except BundleChanged as e:
@@ -1498,9 +1567,6 @@ def _publish_locked(
     extra += [f"note: {n}" for n in json.loads(row["operator_notes"] or "[]")]
     try:
         notice = _published_notice(_launch_row(conn, launch_id), root, extra)
-        base = (product.publish.public_url or "").rstrip("/")
-        if base:
-            notice = dataclasses.replace(notice, urls=[f"{base}/{p}" for p in PAGES])
         result.delivery = notifier.notify(notice)
         _mark_notified(conn, launch_id)
     except Exception as e:  # recovery re-sends a notice whose notified_at is unset
@@ -1607,3 +1673,186 @@ def unpublish_launch(
             )
         )
     return removed
+
+
+# ---- readopt ----------------------------------------------------------------------
+
+ReadoptArm = Literal["superseded", "by_bytes"]
+ReadoptRefusalCode = Literal[
+    "not_unpublished",
+    "no_publish_dir",
+    "launch_live",
+    "not_newest",
+    "bytes_differ",
+    "foreign_file",
+]
+
+
+class ReadoptRefused(StudioError):
+    """``readopt`` refused: the launch cannot be made live again as it stands.
+    ``code`` says which condition failed."""
+
+    def __init__(self, launch_id: str, code: ReadoptRefusalCode, detail: str) -> None:
+        super().__init__(f"launch '{launch_id}' not readopted ({code}): {detail}")
+        self.launch_id = launch_id
+        self.code: ReadoptRefusalCode = code
+        self.detail = detail
+
+
+@dataclass
+class ReadoptResult:
+    launch_id: str
+    arm: ReadoptArm
+    publish_dir: Path
+    files: int
+    delivery: Delivery | None = None
+    # Post-commit problems (the notice): the launch IS published again.
+    warnings: list[str] = field(default_factory=list)
+
+
+def _dir_matches_launch(publish_dir: Path, owned: dict[str, str]) -> tuple[list[str], list[str]]:
+    """``(differ, foreign)``: files the launch placed that are missing or hold
+    other bytes, and files the launch did not place (every symlink among
+    them). The studio's top-level lock and journals are ignored — exactly what
+    ``gate_foreign_file`` ignores, walked the same way."""
+    present, other = _dir_contents(publish_dir)
+    differ = sorted(
+        rel
+        for rel, digest in owned.items()
+        if rel not in present or sha256_file(present[rel]) != digest
+    )
+    foreign = other + sorted(rel for rel in present if rel not in owned)
+    return differ, foreign
+
+
+def readopt_launch(
+    conn: sqlite3.Connection,
+    launch_id: str,
+    notifier: Notifier,
+    clock: Callable[[], datetime],
+    root: Path | None = None,
+) -> ReadoptResult:
+    """Make an ``unpublished`` launch the live publication of its directory
+    again, when that directory already holds exactly its bytes — the state a
+    hub clone is left in when a successor's (or a retraction's) PR closes
+    unlanded and the clone is reset to the landed tree.
+
+    Two arms, both refusing while ANY launch at the directory is published and
+    both requiring the directory to hold exactly the launch's
+    ``published_files`` by sha256 and nothing else (the lock and journals
+    aside):
+
+    * ``superseded`` — the launch was superseded (``superseded_by`` is set);
+    * ``by_bytes`` — the launch was unpublished outright (no ``superseded_by``)
+      and is the newest launch that ever went live at that directory.
+
+    Under the directory's lock, after recovery, in one transaction: the launch
+    becomes ``published`` again with ``superseded_by`` and ``unpublished_at``
+    cleared. Nothing on disk is touched. Refusals raise
+    :class:`ReadoptRefused`; an unknown launch raises :class:`KeyError`."""
+    row = _launch_row(conn, launch_id)
+    if not row["publish_dir"]:
+        raise ReadoptRefused(
+            launch_id, "no_publish_dir", f"status {row['status']}; it never went live anywhere"
+        )
+    publish_dir = Path(row["publish_dir"])
+    # Checked before the lock, which would create (or follow) the directory.
+    if publish_dir.is_symlink() or (publish_dir.exists() and not publish_dir.is_dir()):
+        raise ReadoptRefused(
+            launch_id,
+            "foreign_file",
+            f"{publish_dir} is not a real directory ({DIR_ITSELF} is a symlink or a file); "
+            "a launch only ever placed regular files in a real directory",
+        )
+    if not publish_dir.exists():
+        raise ReadoptRefused(
+            launch_id,
+            "bytes_differ",
+            f"{publish_dir} does not exist; it holds none of this launch's files",
+        )
+    with site_locks([publish_dir]):
+        _recover_locked(conn, publish_dir, notifier, root)
+        now = clock()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = _launch_row(conn, launch_id)
+            if row["status"] != "unpublished":
+                raise ReadoptRefused(
+                    launch_id,
+                    "not_unpublished",
+                    f"status is {row['status']}; only an unpublished launch is readopted",
+                )
+            live = _live_launch(conn, publish_dir)
+            if live is not None:
+                raise ReadoptRefused(
+                    launch_id,
+                    "launch_live",
+                    f"launch {live['id']} is the live publication of {publish_dir}",
+                )
+            arm: ReadoptArm = "superseded" if row["superseded_by"] else "by_bytes"
+            if arm == "by_bytes":
+                newest = conn.execute(
+                    "SELECT id FROM launches WHERE publish_dir = ? AND published_at IS NOT NULL "
+                    "ORDER BY published_at DESC, created_at DESC, id DESC LIMIT 1",
+                    (str(publish_dir),),
+                ).fetchone()
+                if newest is None or newest["id"] != launch_id:
+                    raise ReadoptRefused(
+                        launch_id,
+                        "not_newest",
+                        f"launch {newest['id'] if newest else '(none)'} went live at "
+                        f"{publish_dir} after it; only the newest is readopted by its bytes",
+                    )
+            owned: dict[str, str] = json.loads(row["published_files"] or "{}")
+            differ, foreign = _dir_matches_launch(publish_dir, owned)
+            if foreign:
+                raise ReadoptRefused(
+                    launch_id,
+                    "foreign_file",
+                    f"{len(foreign)} file(s) in {publish_dir} are not this launch's "
+                    f"(e.g. {foreign[0]})",
+                )
+            if differ or not owned:
+                raise ReadoptRefused(
+                    launch_id,
+                    "bytes_differ",
+                    f"{len(differ)} of this launch's file(s) are missing or hold other bytes "
+                    f"(e.g. {differ[0]})"
+                    if differ
+                    else "the launch records no published files",
+                )
+            # published_at is "when it last went live": a readopted launch is
+            # the newest live one at the dir, so a later by-bytes readopt of it
+            # is not refused as not_newest because of the successor it outlived.
+            conn.execute(
+                "UPDATE launches SET status = 'published', reason = NULL, superseded_by = NULL, "
+                "unpublished_at = NULL, published_at = ? WHERE id = ? AND status = 'unpublished'",
+                (now.isoformat(), launch_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        result = ReadoptResult(
+            launch_id=launch_id, arm=arm, publish_dir=publish_dir, files=len(owned)
+        )
+        try:
+            row = _launch_row(conn, launch_id)
+            notice = _published_notice(
+                row,
+                root,
+                [
+                    f"Readopted ({arm}) at {now.isoformat()}: the directory already held exactly "
+                    "this launch's bytes; nothing on disk changed."
+                ],
+            )
+            result.delivery = notifier.notify(
+                dataclasses.replace(
+                    notice,
+                    outcome="readopted",
+                    title=f"qontinui-studio readopted launch {launch_id} ({row['product_slug']})",
+                )
+            )
+        except Exception as e:  # committed; the notice is best-effort
+            result.warnings.append(f"readopted notice not sent ({type(e).__name__}: {e})")
+    return result

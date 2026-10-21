@@ -1209,3 +1209,159 @@ def test_page_scripts_refuse_a_duplicate(studio_root: Path) -> None:
     path = write_product(studio_root, capture=False, page_scripts=("/_hub/a.js", "/_hub/a.js"))
     with pytest.raises(ConfigError, match="twice"):
         load_product(path)
+
+
+# ---- C1/AG2: environment-pinned publish and preview paths -----------------------
+
+
+def _pinned_product(studio_root: Path) -> Path:
+    product_path = write_product(studio_root, capture=False)
+    text = product_path.read_text()
+    text = text.replace("publish_dir: ../published-launch", "publish_dir: ${HUB}/public/launch")
+    text = text.replace("preview_dir: ../../previews/launch", "preview_dir: ${HUB_PREVIEW}/launch")
+    product_path.write_text(text)
+    return product_path
+
+
+def test_env_pinned_paths_are_identical_from_any_checkout_and_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two studio checkouts, loaded from two working directories, yield the
+    same canonical publish_dir and preview_dir: the launches.publish_dir key
+    gate_foreign_file matches on never depends on where the yaml was read."""
+    hub = tmp_path / "hub-publish"
+    preview = tmp_path / "hub-preview"
+    hub.mkdir()
+    preview.mkdir()
+    # An uncanonical spelling of the same directory (a .. hop and a symlink).
+    link = tmp_path / "hub-link"
+    link.symlink_to(hub)
+    loaded = []
+    for name, hub_value, cwd in (
+        ("checkout-a", str(hub), tmp_path),
+        ("checkout-b", str(link / ".." / "hub-link"), tmp_path / "checkout-b"),
+    ):
+        root = tmp_path / name
+        (root / "sites").mkdir(parents=True)
+        product_path = _pinned_product(root)
+        monkeypatch.setenv("HUB", hub_value)
+        monkeypatch.setenv("HUB_PREVIEW", str(preview))
+        monkeypatch.chdir(cwd)
+        loaded.append(load_product(product_path, root))
+    a, b = (p.publish for p in loaded)
+    assert a.publish_dir == b.publish_dir == (hub / "public" / "launch").resolve()
+    assert a.preview_dir == b.preview_dir == (preview / "launch").resolve()
+    assert str(a.publish_dir) == str(b.publish_dir)
+
+
+def test_an_unset_path_variable_is_refused_and_named(
+    studio_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    product_path = _pinned_product(studio_root)
+    monkeypatch.delenv("HUB", raising=False)
+    monkeypatch.setenv("HUB_PREVIEW", str(tmp_path / "pv"))
+    with pytest.raises(ConfigError, match=r"publish\.publish_dir uses \$\{HUB\}.*HUB is not set"):
+        load_product(product_path)
+    monkeypatch.setenv("HUB", str(tmp_path / "hub"))
+    monkeypatch.delenv("HUB_PREVIEW")
+    with pytest.raises(ConfigError, match="HUB_PREVIEW is not set"):
+        load_product(product_path)
+    # Empty is as good as unset: the path would silently lose its root.
+    monkeypatch.setenv("HUB_PREVIEW", "")
+    with pytest.raises(ConfigError, match="HUB_PREVIEW is not set"):
+        load_product(product_path)
+
+
+def test_an_env_pinned_path_must_expand_to_an_absolute_path(
+    studio_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    product_path = _pinned_product(studio_root)
+    monkeypatch.setenv("HUB", "relative/hub")
+    monkeypatch.setenv("HUB_PREVIEW", str(tmp_path / "pv"))
+    with pytest.raises(ConfigError, match="not absolute"):
+        load_product(product_path)
+
+
+def test_cli_launch_run_without_a_preview_refuses_with_exit_2(
+    studio_root: Path, record_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D7 is never waived: a product that declares no preview is refused by
+    `launch run` (exit 2, d7_page_health not_configured) and nothing is copied.
+    (Moved here from the shipped self-launch, which now declares the hub's.)"""
+    from click.testing import CliRunner
+
+    from qontinui_studio.cli import main
+
+    monkeypatch.delenv("STUDIO_COORD_BEARER", raising=False)
+    monkeypatch.delenv("STUDIO_COORD_BEARER_FILE", raising=False)
+    product_path = write_product(studio_root, capture=False, preview=False)
+    r = CliRunner().invoke(
+        main,
+        [
+            "--root",
+            str(studio_root),
+            "launch",
+            "run",
+            str(product_path),
+            "--record-file",
+            str(record_file),
+            "--no-video",
+            "--no-capture",
+            "--no-generate",
+        ],
+    )
+    assert r.exit_code == 2, r.output
+    assert "not_configured  d7_page_health" in r.output
+    assert not (studio_root / "published-launch" / "index.html").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "$HUB/public/launch",
+        "${HUB/public/launch",
+        "${HUB:-/srv/hub}/public/launch",
+        "${1HUB}/public/launch",
+        "../published-$x",
+    ],
+)
+def test_a_dollar_that_is_not_a_name_reference_is_refused(
+    studio_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str
+) -> None:
+    """Only ${NAME} expands; any other `$` form would silently land relative
+    to the yaml as a literal, so it is refused at load and named."""
+    monkeypatch.setenv("HUB", str(tmp_path / "hub"))
+    product_path = write_product(studio_root, capture=False)
+    product_path.write_text(
+        product_path.read_text().replace(
+            "publish_dir: ../published-launch", f"publish_dir: '{value}'"
+        )
+    )
+    with pytest.raises(ConfigError, match=r"publish\.publish_dir .* contains a '\$' that is not"):
+        load_product(product_path)
+
+
+def test_a_malformed_active_tenant_fails_the_tenant_gate_instead_of_using_the_pin(
+    studio_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A STUDIO_WEB_ACTIVE_TENANT that is not a UUID is `misconfigured`, which
+    d1_tenant never treats as 'door unavailable, fall back to the pin'."""
+    from qontinui_studio.launch.publish import gate_tenant
+    from qontinui_studio.launch.record import BuildRecordClient
+
+    monkeypatch.setenv("STUDIO_WEB_BEARER", "tok")
+    product_path = write_product(studio_root, capture=False)
+    product_path.write_text(
+        product_path.read_text().replace(
+            "public_url: 'https://build.example.test/qontinui-studio'}",
+            "public_url: 'https://build.example.test/qontinui-studio', expected_version: 1}",
+        )
+    )
+    product = load_product(product_path)
+    manifest = {"launch_id": "L1", "record": {"version": 1, "content_sha256": "a" * 64}}
+    client = BuildRecordClient()
+
+    # Unset with no reachable route would be judged by the pin; malformed is not.
+    monkeypatch.setenv("STUDIO_WEB_ACTIVE_TENANT", "not-a-uuid")
+    gate = gate_tenant(manifest, product, client)
+    assert gate.failed and "misconfigured" in gate.detail, gate.detail

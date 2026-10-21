@@ -1,6 +1,7 @@
 """``studio`` — the command line.
 
-Exit codes: 0 ok; 1 config/usage error; 2 publication refused by a gate;
+Exit codes: 0 ok; 1 config/usage error; 2 publication refused by a gate (or a
+``launch readopt`` refused);
 3 generation deferred (quota spent, a host's ``busy``/``deferred``, an
 ``unknown`` outcome being retried) or failed; 4 no build record yet (the
 factory's record route answered 404 or was unreachable); 5 a launch trigger was
@@ -18,6 +19,7 @@ stays ``generating`` and resumes once the switch allows it.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,7 +46,9 @@ from qontinui_studio.launch.product import LaunchProduct, load_product
 from qontinui_studio.launch.publish import (
     LaunchNotPublished,
     LaunchPublishResult,
+    ReadoptRefused,
     publish_launch,
+    readopt_launch,
     recover_all_launches,
     unpublish_launch,
 )
@@ -819,6 +823,80 @@ def launch_unpublish(obj: Obj, launch_id: str) -> None:
     except (KeyError, LaunchNotPublished) as e:
         raise click.ClickException(str(e)) from e
     click.echo(f"unpublished {launch_id}: removed {len(removed)} file(s)")
+
+
+@launch.command("readopt")
+@click.option("--launch", "launch_id", required=True)
+@click.option("--json", "as_json", is_flag=True, help="Print one JSON object.")
+@click.pass_obj
+def launch_readopt(obj: Obj, launch_id: str, as_json: bool) -> None:
+    """Make an unpublished launch live again when its directory already holds
+    exactly its bytes (a successor's or a retraction's hub PR closed unlanded
+    and the clone was reset). Arm `superseded`: the launch has a superseded_by.
+    Arm `by_bytes`: it has none and is the newest launch that went live there.
+    Both refuse while any launch there is published. Nothing on disk changes.
+
+    Exit codes (with --json, every outcome prints ONE JSON object; a failure
+    is {"launch_id", "readopted": false, "code", "detail"}):
+
+    \b
+    0  readopted ("readopted": true, "arm", "publish_dir", "files", ...)
+    2  refused: code is not_unpublished, no_publish_dir, launch_live,
+       not_newest, bytes_differ or foreign_file; nothing changed
+    1  not_found (no such launch) or error (an unexpected failure, e.g. a
+       journal recovery refused or a file unreadable); nothing changed"""
+
+    def fail(code: str, detail: str, exit_code: int) -> None:
+        if as_json:
+            out = {"launch_id": launch_id, "readopted": False, "code": code, "detail": detail}
+            click.echo(json.dumps(out, sort_keys=True))
+        elif exit_code == 2:
+            click.echo(f"refused {launch_id}: {code}: {detail}")
+        else:
+            click.echo(f"error: {code}: {detail}", err=True)
+        sys.exit(exit_code)
+
+    try:
+        ctx = _context(obj.root)
+        result = readopt_launch(ctx.conn, launch_id, ctx.notifier, ctx.clock, obj.root)
+    except KeyError as e:
+        fail("not_found", str(e.args[0]), 1)
+        return
+    except ReadoptRefused as e:
+        fail(e.code, e.detail, 2)
+        return
+    except (StudioError, OSError, sqlite3.Error) as e:
+        fail("error", f"{type(e).__name__}: {e}", 1)
+        return
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "launch_id": result.launch_id,
+                    "readopted": True,
+                    "arm": result.arm,
+                    "publish_dir": str(result.publish_dir),
+                    "files": result.files,
+                    "notice": (
+                        {"channel": result.delivery.channel, "location": result.delivery.location}
+                        if result.delivery
+                        else None
+                    ),
+                    "warnings": result.warnings,
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        click.echo(
+            f"readopted {result.launch_id} ({result.arm}): {result.files} file(s) at "
+            f"{result.publish_dir}"
+        )
+        for w in result.warnings:
+            click.echo(f"warning: {w}")
+        if result.delivery:
+            click.echo(f"notice -> {result.delivery.channel}: {result.delivery.location}")
+    sys.exit(0)
 
 
 @launch.command("recover")
