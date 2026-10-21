@@ -1,0 +1,31 @@
+# The factory's visitor gallery at build.qontinui.io is itself a factory
+# product, so it gets a launch bundle beside the exhibits it shows. Every number
+# on its pages comes from the factory's build record for this slug; nothing
+# here states one. No capture (the hub is the host of the bundle, not a product
+# the kit drives) and no decoration brief.
+slug: qontinui-factory-hub
+title: qontinui-factory-hub
+tagline: The Qontinui software factory's visitor gallery — every exhibit built from a published, checkable build record.
+description: >-
+  build.qontinui.io shows what the Qontinui software factory has shipped. Each
+  exhibit is rendered from a product's public build record, whose
+  content_sha256 a visitor can recompute, with replayed scenes of how it was
+  built and a launch bundle served beside it.
+repos: [qontinui-factory/hub]
+homepage: https://build.qontinui.io/
+record:
+  # The hub shows only what the public route serves (A7).
+  door: public
+  public_url: https://build.qontinui.io/qontinui-factory-hub/how-it-was-built.html
+publish:
+  # See products/qontinui-studio.yaml: the one hub clone and preview on the
+  # studio host, pinned by environment; unset is refused at load.
+  publish_dir: ${STUDIO_HUB_CLONE}/public/qontinui-factory-hub
+  commercial: false
+  preview_dir: ${STUDIO_HUB_PREVIEW}/qontinui-factory-hub
+  ui_bridge_url: http://127.0.0.1:4330/api/ui-bridge
+  preview_url: http://127.0.0.1:4330/qontinui-factory-hub/
+  preview_manifest_url: http://127.0.0.1:4330/qontinui-factory-hub/launch-manifest.json
+  page_scripts: ["/_hub/ui-bridge.js"]
+  unpublish_command: hub unpublish qontinui-factory-hub
+video_seconds: 60

@@ -20,6 +20,7 @@ from PIL import Image
 
 from qontinui_studio.adapters import build_adapters
 from qontinui_studio.cli import main
+from qontinui_studio.errors import ConfigError
 from qontinui_studio.launch.kit import KitOptions, run_kit
 from qontinui_studio.launch.product import load_product
 from qontinui_studio.notify import FileNotifier
@@ -135,51 +136,41 @@ def test_self_launch_with_the_shipped_product_definition(
     tmp_path: Path, record_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The kit launches ITSELF: the repo's own products/qontinui-studio.yaml,
-    capturing the studio's own UI (its review page), on a fixture record."""
+    capturing the studio's own UI (its review page), on a fixture record, into
+    the hub clone the yaml pins with ${STUDIO_HUB_CLONE}."""
     # The shipped local-gpu row points at a loopback facade; here none listens
     # (a port nothing is bound to), so the local GPU answers a typed busy.
     monkeypatch.setenv("STUDIO_LOCAL_GPU_BASE_URL", f"http://127.0.0.1:{closed_port()}/v1")
     root = tmp_path / "self"
+    # The hub clone and the hub preview live OUTSIDE the studio root (C1/AG2).
+    hub_clone = tmp_path / "hub-publish"
+    hub_preview = tmp_path / "hub-preview"
+    monkeypatch.setenv("STUDIO_HUB_CLONE", str(hub_clone))
+    monkeypatch.setenv("STUDIO_HUB_PREVIEW", str(hub_preview))
     for name in ("products", "sites", "briefs", "style"):
         shutil.copytree(REPO / name, root / name)
     shutil.copy(REPO / "providers.yaml", root / "providers.yaml")
     product_yaml = root / "products" / "qontinui-studio.yaml"
-    product_yaml.write_text(
-        product_yaml.read_text().replace("video_seconds: 60", "video_seconds: 5")
-    )
-    args = [
-        "--root",
-        str(root),
-        "launch",
-        "run",
-        str(product_yaml),
-        "--record-file",
-        str(record_file),
-    ]
-    if not FFMPEG:
-        args.append("--no-video")
-    r = CliRunner().invoke(main, args)
-    # The shipped definition declares no page-health URL (where the bundle is
-    # hosted is the operator's open decision), and a launch is a product, so
-    # page health cannot be waived: the gates REFUSE, nothing is copied.
-    assert r.exit_code == 2, r.output
-    assert "not_configured  d7_page_health" in r.output
-    # The local GPU is the only schedulable generator and no facade is
-    # listening: the decoration batch waits on a typed busy, and the launch
-    # still assembles without it (D1).
-    assert "brief qontinui-studio-launch.yaml: batch qontinui-studio-launch-" in r.output
-    assert "generating" in r.output
-    published = root / ".studio" / "published" / "qontinui-studio"
-    assert not (published / "index.html").exists()  # only the publish lock was taken
-
-    # With a D7 preview declared (a fake preview server + UI Bridge), the same
-    # shipped definition publishes its own launch.
-    product_yaml.write_text(
-        product_yaml.read_text().replace(
-            "  commercial: false",
-            "  commercial: false\n" + "\n".join(preview_lines("launch", "  ")),
+    text = product_yaml.read_text().replace("video_seconds: 60", "video_seconds: 5")
+    # The shipped yaml declares the hub preview (127.0.0.1:4330, `hub preview`);
+    # here the fake preview server + UI Bridge stand in for it: its four D7
+    # fields REPLACE the shipped ones.
+    shipped = [
+        line
+        for line in text.splitlines()
+        if line.strip().startswith(
+            ("ui_bridge_url:", "preview_url:", "preview_dir:", "preview_manifest_url:")
         )
-    )
+    ]
+    assert len(shipped) == 4, shipped
+    text = text.replace(shipped[0], "\n".join(preview_lines("launch", "  ")))
+    for line in shipped[1:]:
+        text = text.replace(line + "\n", "")
+    product_yaml.write_text(text)
+    product = load_product(product_yaml)
+    assert product.publish.publish_dir == (hub_clone / "public" / "qontinui-studio").resolve()
+    assert product.publish.preview_url == "http://preview.test/launch/index.html"
+
     ws = Workspace(root)
     inventory = load_providers(ws.providers_path)
     fake = launch_preview(root)
@@ -194,16 +185,39 @@ def test_self_launch_with_the_shipped_product_definition(
         fetch=fake.fetch,
     )
     run = run_kit(ctx, product_yaml, KitOptions(video=FFMPEG), public_client(), publish=True)
+    # The local GPU is the only schedulable generator and no facade is
+    # listening: the decoration batch waits on a typed busy, and the launch
+    # still assembles and publishes without it (D1).
+    assert any("qontinui-studio-launch" in n for n in run.bundle.notes), run.bundle.notes
     assert run.publish is not None and run.publish.published, run.publish.failures
+    published = hub_clone / "public" / "qontinui-studio"
     assert (published / "screenshots" / "review.png").is_file()
+    assert not (root / ".studio" / "published").exists()
     page = (published / "how-it-was-built.html").read_text()
-    assert "https://api.qontinui.io/api/v1/public/build-records/qontinui-studio" in page
+    # The footer links the record page beside the bundle on the hub
+    # (record.public_url), not the API route.
+    footer = "https://build.qontinui.io/qontinui-studio/how-it-was-built.html"
+    assert footer in page and footer in (published / "index.html").read_text()
+    # The hub's UI Bridge boot script loads on every bundle page.
+    assert "/_hub/ui-bridge.js" in (published / "index.html").read_text()
+    # The published notice names the hub's one-step retraction.
+    notice = next(ws.notices_dir.glob(f"{run.launch_id}-published-*.md")).read_text()
+    assert "hub unpublish qontinui-studio" in notice
     if FFMPEG:
         assert (published / "video" / "launch.mp4").is_file()
 
 
-def test_shipped_product_definition_is_valid() -> None:
+def test_shipped_product_definition_is_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STUDIO_HUB_CLONE", str(tmp_path / "hub-publish"))
+    monkeypatch.setenv("STUDIO_HUB_PREVIEW", str(tmp_path / "hub-preview"))
     product = load_product(REPO / "products" / "qontinui-studio.yaml")
+    assert product.publish.publish_dir == (tmp_path / "hub-publish" / "public" / "qontinui-studio")
+    assert product.publish.preview_dir == (tmp_path / "hub-preview" / "qontinui-studio")
+    assert product.publish.has_preview and product.publish.page_scripts == ("/_hub/ui-bridge.js",)
+    assert product.publish.unpublish_command == "hub unpublish qontinui-studio"
+    assert product.record.door == "public"
     assert product.slug == "qontinui-studio" and product.repos == ["qontinui/qontinui-studio"]
     assert product.capture is not None and product.capture.script.is_file()
     assert product.brief is not None and product.brief.is_file()
@@ -212,6 +226,41 @@ def test_shipped_product_definition_is_valid() -> None:
     # unmetered local GPU.
     assert r.exit_code == 0, r.output
     assert r.output.strip().endswith(": ok"), r.output
+
+
+def test_shipped_product_definition_names_an_unset_hub_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the studio host's hub clone, the shipped yaml is refused at
+    load, naming the variable — it never resolves into whatever checkout holds
+    the yaml (C1)."""
+    monkeypatch.delenv("STUDIO_HUB_CLONE", raising=False)
+    monkeypatch.setenv("STUDIO_HUB_PREVIEW", str(tmp_path / "hub-preview"))
+    for name in ("qontinui-studio", "qontinui-factory-hub"):
+        with pytest.raises(ConfigError, match="STUDIO_HUB_CLONE is not set"):
+            load_product(REPO / "products" / f"{name}.yaml")
+
+
+def test_shipped_hub_product_definition_is_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STUDIO_HUB_CLONE", str(tmp_path / "hub-publish"))
+    monkeypatch.setenv("STUDIO_HUB_PREVIEW", str(tmp_path / "hub-preview"))
+    product = load_product(REPO / "products" / "qontinui-factory-hub.yaml")
+    assert product.slug == "qontinui-factory-hub" and product.repos == ["qontinui-factory/hub"]
+    assert product.homepage == "https://build.qontinui.io/"
+    assert product.record.door == "public"
+    assert product.record_url() == (
+        "https://build.qontinui.io/qontinui-factory-hub/how-it-was-built.html"
+    )
+    assert product.publish.publish_dir == (
+        tmp_path / "hub-publish" / "public" / "qontinui-factory-hub"
+    )
+    assert product.publish.preview_dir == (tmp_path / "hub-preview" / "qontinui-factory-hub")
+    assert product.publish.has_preview
+    assert product.publish.preview_url == "http://127.0.0.1:4330/qontinui-factory-hub/"
+    assert product.publish.unpublish_command == "hub unpublish qontinui-factory-hub"
+    assert product.capture is None and product.brief is None
 
 
 def test_cli_build_exits_4_without_a_record(

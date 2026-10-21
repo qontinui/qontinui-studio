@@ -13,13 +13,16 @@ description: >-
 repos: [qontinui/qontinui-studio]
 homepage: https://github.com/qontinui/qontinui-studio
 record:
+  # The hub (build.qontinui.io) shows only what the public route serves (A7).
   door: public
-  # public_url: set once the operator decides the public org/domain for build
-  # records (plan "Open questions"); until then the public snapshot route.
+  # The bundle's footer links here: the frozen record page beside the bundle
+  # on the hub, served at /<slug>/.
+  public_url: https://build.qontinui.io/qontinui-studio/how-it-was-built.html
   # Publication must prove the snapshot is this tenant's: with a web bearer
-  # (STUDIO_WEB_BEARER) the authed product listing does; without one, pin the
-  # published snapshot here — expected_sha256: <content_sha256> and/or
-  # expected_version: <n>.
+  # (STUDIO_WEB_BEARER / STUDIO_WEB_BEARER_FILE, plus STUDIO_WEB_ACTIVE_TENANT
+  # to act in the publishing tenant) the authed publication route does;
+  # without one, pin the published snapshot here — expected_sha256:
+  # <content_sha256> and/or expected_version: <n>.
 capture:
   script: qontinui-studio.capture.yaml
   # The studio's own UI is its static review page; the kit builds it and
@@ -30,12 +33,21 @@ capture:
 brief: ../briefs/qontinui-studio-launch.yaml
 assets_site: qontinui-studio-launch
 publish:
-  # Local until the public org/domain is decided.
-  publish_dir: ../.studio/published/qontinui-studio
+  # The bundle publishes into the one hub clone on the studio host and goes
+  # live when coord lands the hub PR `hub publish qontinui-studio` opens. Both
+  # variables are set only on that host (to the realpaths of
+  # <workspace-root>/.studio/hub-publish and .studio/hub-preview); loading
+  # this file without them is refused, naming the variable.
+  publish_dir: ${STUDIO_HUB_CLONE}/public/qontinui-studio
   commercial: false
-  # No D7 preview yet (ui_bridge_url + preview_url + preview_dir +
-  # preview_manifest_url): the preview belongs with wherever the bundle is
-  # hosted, which is the operator's open decision. D7 is never waived, so
-  # `studio launch run` REFUSES publication (not_configured) until all four
-  # are declared here. preview_dir must sit outside the studio root.
+  # D7 runs on `hub preview`: 127.0.0.1:4330 serves ${STUDIO_HUB_PREVIEW}/<slug>
+  # at /<slug>/ and relays the preview tab's UI Bridge.
+  preview_dir: ${STUDIO_HUB_PREVIEW}/qontinui-studio
+  ui_bridge_url: http://127.0.0.1:4330/api/ui-bridge
+  preview_url: http://127.0.0.1:4330/qontinui-studio/
+  preview_manifest_url: http://127.0.0.1:4330/qontinui-studio/launch-manifest.json
+  # The hub's UI Bridge boot script, so D7 sees the page's images.
+  page_scripts: ["/_hub/ui-bridge.js"]
+  # Retraction is the hub's one step (record DELETE, studio unpublish, removal PR).
+  unpublish_command: hub unpublish qontinui-studio
 video_seconds: 60
