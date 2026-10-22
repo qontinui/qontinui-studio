@@ -19,6 +19,7 @@ import {
   type SceneTrace,
   type Timeline,
 } from "../../api";
+import { discoverySlots } from "./graph-layout";
 
 /** The event kinds that drive S7 (its beats). */
 export const S7_KINDS = ["gui.state_found", "gui.transition_found", "gui.transition_taken"] as const satisfies readonly EventKind[];
@@ -29,7 +30,6 @@ export const S7_TIMING = {
   outroMs: 2200,
 } as const;
 
-export { MAX_STATES } from "./graph-layout";
 /** Rows of room in the learned-model panel. */
 export const MODEL_ROWS = 4;
 
@@ -40,7 +40,7 @@ export function s7Timeline(trace: SceneTrace, fps: number): Timeline {
 export interface StateNode {
   id: string;
   label: string;
-  /** Slot in discovery order (0..MAX_STATES-1); the layout places slots. */
+  /** Slot in discovery order (0..MAX_STATES-1, graph-layout.ts); the layout places slots. */
   slot: number;
   level: AttentionLevel;
   appear: number;
@@ -83,10 +83,8 @@ export function s7State(trace: SceneTrace, timeline: Timeline, frame: number): S
   const appearOf = (beat: Beat) => progress(frame, beat.startFrame, fast, easings.enter);
 
   // Slots follow discovery order over the WHOLE trace, so a state never moves.
-  const slotOf = new Map<string, number>();
-  for (const b of beats) {
-    if (b.event.kind === "gui.state_found" && !slotOf.has(b.event.state)) slotOf.set(b.event.state, slotOf.size);
-  }
+  // The same function the scene's check uses, so the check judges these slots.
+  const slotOf = discoverySlots(trace);
   const transitionById = new Map(trace.entities.transitions.map((t) => [t.id, t]));
   const stateLabel = (id: string) => trace.entities.states.find((s) => s.id === id)?.label ?? id;
 
