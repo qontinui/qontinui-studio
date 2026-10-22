@@ -583,6 +583,9 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
       // A session registers a gate while it is running, not after it ended.
       const ended = trace.events.findIndex((e, j) => e.kind === "session.ended" && e.session === event.session && precedes(j, i));
       if (ended >= 0) issue("session", `"${event.session}" registers a gate after it ended`);
+      // ...nor before it started (a session with no start event runs from the beginning).
+      const startedBefore = trace.events.some((e, j) => e.kind === "session.started" && e.session === event.session && precedes(j, i));
+      if (startedSessions.has(event.session) && !startedBefore) issue("session", `"${event.session}" registers a gate before it started`);
     }
     if (event.kind === "gui.state_found") ref("state", guiStates, event.state);
     if (event.kind === "gui.transition_found" || event.kind === "gui.transition_taken") {
@@ -704,6 +707,11 @@ export const sceneTrace = traceShape.superRefine((trace, ctx) => {
         "a continuation starts before gate.cleared for",
         "a continuation of a gate that is never cleared:",
       );
+      // A cleared gate dispatches one continuation.
+      const other = trace.events.findIndex(
+        (e, j) => j !== i && e.kind === "session.started" && e.continues === event.continues && precedes(j, i),
+      );
+      if (other >= 0 && gates.has(event.continues)) issue("continues", `gate "${event.continues}" is continued more than once`);
     }
     if (event.kind === "question.answered") {
       const asked = eventsById.get(event.question);

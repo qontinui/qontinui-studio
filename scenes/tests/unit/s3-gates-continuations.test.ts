@@ -85,6 +85,22 @@ describe("S3 trace fields", () => {
     expect(errors).toContain('events.14.gate: gate "g-upstream" is registered more than once');
   });
 
+  it("refuses a registration before the session started", () => {
+    const json = traceJson();
+    (json.events[1] as Mutable).session = "s-cont";
+    expect(errorsOf(json)).toContain('events.1.session: "s-cont" registers a gate before it started');
+    // A session with no start event runs from the beginning of the trace.
+    const unstarted = traceJson();
+    unstarted.events = unstarted.events.filter((e) => e.id !== "e01");
+    expect(errorsOf(unstarted)).toEqual([]);
+  });
+
+  it("refuses a gate continued by two sessions", () => {
+    const json = traceJson();
+    (json.events[10] as Mutable).continues = "g-upstream";
+    expect(errorsOf(json)).toContain('events.10.continues: gate "g-upstream" is continued more than once');
+  });
+
   it("needs a continuation and at most three sessions", () => {
     const json = traceJson();
     for (const e of json.events) delete (e as Mutable).continues;
