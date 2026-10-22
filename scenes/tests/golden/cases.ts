@@ -217,12 +217,66 @@ const S4_CASES: readonly GoldenCase[] = [
   { id: "s4-merge-train-1x1-long-labels", scene: "s4-merge-train", aspect: "1:1", frames: [359], trace: s4LongLabelsTrace },
 ];
 
+/** `text`, which must be exactly `max` characters: a schema maximum, reached without padding. */
+function exactly(text: string, max: number): string {
+  if (text.length !== max) throw new Error(`fixture text is ${text.length} characters, not ${max}: "${text}"`);
+  return text;
+}
+
+/**
+ * S5 with every label it draws at the schema's maximum: 24-character
+ * machines, 80-character sessions and intents, 60-character repos and
+ * 60-character resources (they clamp inside their cards, log rows and
+ * caption). Each resource keeps one long name, so a contended claim still
+ * names the held one. Frame 340 is Session 3's worktree allocated, the one
+ * beat whose caption carries a whole repo.
+ */
+export function s5LongLabelsTrace(): SceneTrace {
+  const json = JSON.parse(readFileSync(illustrativeTraceFile("s5-fleet"), "utf8"));
+  const repos: Record<string, string> = {
+    "example/sync-service": "example-org/sync-service-with-an-extra-long-repository-names",
+    "example/web-app": "example-org/web-app-with-an-unusually-long-repository-titles",
+  };
+  const intents: Record<string, string> = {
+    "plan retry-budget, phase 2": "plan retry-budget, phase 2: a per-tenant retry budget for the sync worker queues",
+    "fix the flaky retry test": "fix the flaky retry test that times out whenever the worker's job queue backs up",
+    "plan metrics export, phase 1": "plan metrics export, phase 1: export retry-budget exhaustions as one typed alert",
+  };
+  const resources: Record<string, string> = {
+    "sync/worker.ts": "sync/worker/per-tenant-retry-budget/queue-consumer/worker.ts",
+    "sync/metrics.ts": "sync/metrics/per-tenant-retry-budget/exporter/metrics-out.ts",
+    "docs/retries.md": "docs/operations/retries/per-tenant-retry-budget-runbook-2.md",
+    "sync/config.ts": "sync/config/per-tenant-retry-budget/defaults/config-types.ts",
+  };
+  const long = (table: Record<string, string>, key: string, max: number) => {
+    const text = table[key];
+    if (text === undefined) throw new Error(`no long form for "${key}"`);
+    return exactly(text, max);
+  };
+  json.entities.machines.forEach((m: { label: string }, i: number) => {
+    m.label = exactly(`Long-running build box ${i + 1}`, 24);
+  });
+  json.entities.sessions.forEach((s: { label: string }, i: number) => {
+    s.label = exactly(`Session ${i + 1}, working on the per-tenant retry budgets for the sync worker job queue`, 80);
+  });
+  for (const e of json.events) {
+    if (typeof e.repo === "string") e.repo = long(repos, e.repo, 60);
+    if (typeof e.intent === "string") e.intent = long(intents, e.intent, 80);
+    if (typeof e.resource === "string") e.resource = long(resources, e.resource, 60);
+  }
+  return parseTrace(json);
+}
+
 /**
  * S5 (588 frames: 36-frame intro, one beat every 27): 0 intro, 240 the
  * avoided collision (Session 2 finds sync/worker.ts held), 467 the poster
  * (every session at work), 587 the end (Session 1 done).
  */
-const S5_CASES = illustrativeCases("s5-fleet", { "16:9": [0, 240, 467, 587], "9:16": [467], "1:1": [240, 467] });
+const S5_CASES: readonly GoldenCase[] = [
+  ...illustrativeCases("s5-fleet", { "16:9": [0, 240, 467, 587], "9:16": [467], "1:1": [240, 467] }),
+  { id: "s5-fleet-9x16-long-labels", scene: "s5-fleet", aspect: "9:16", frames: [340, 467], trace: s5LongLabelsTrace },
+  { id: "s5-fleet-1x1-long-labels", scene: "s5-fleet", aspect: "1:1", frames: [240, 340, 467], trace: s5LongLabelsTrace },
+];
 
 /**
  * S6 (498 frames: 36-frame intro, one beat every 33): 0 intro, 170 the first
