@@ -4,9 +4,9 @@ plan 2026-10-13 Phase 11 step 3).
 
 The runner owns the declaration (``model_gateway::state()``: ``NotDeclared |
 Declared | Unknown``, qontinui-runner#2138). Studio reads it over the runner's
-HTTP API, ``GET {runner}/model-gateway`` — a read #2138 does not ship yet (it
-exposes the state only as the Tauri command ``get_model_gateway``); it was
-proposed to that plan's Phase 9 by coord finding. The expected answer, bare or
+HTTP API, ``GET {runner}/model-gateway`` — a read #2138 did not ship (it
+exposes the state only as the Tauri command ``get_model_gateway``); a runner
+follow-up adds it, so builds from between the two answer 404 (below). The expected answer, bare or
 inside the runner's ``{"data": ...}`` envelope::
 
     {"state": "not_declared" | "declared" | "unknown",
@@ -40,14 +40,17 @@ How each reading resolves:
   saturated past its accept backlog still exists);
 * ``/health`` answers but does not identify a qontinui runner build ->
   ``unknown`` (``unidentified_runner``);
-* ``/model-gateway`` ``404`` from an IDENTIFIED runner -> ``not_declared``: the
-  build serves no gateway read, and the only build that can declare a gateway
-  (#2138) is the one the read is proposed into. TRIPWIRE: once
-  qontinui-runner#2138 merges, a 404 from a build whose ``/health`` ``gitSha``
-  descends from #2138's merge commit is a gateway-capable build lacking the
-  read, and must read ``unknown`` — compare ``gitSha`` against that merge
-  commit here (#2138 is unmerged today, so there is no commit to compare
-  against, and studio holds no runner checkout);
+* ``/model-gateway`` ``404`` from an IDENTIFIED runner whose build provably
+  PREDATES the model gateway -> ``not_declared``: that build cannot declare a
+  gateway at all. "Provably predates" is read off the ``buildId`` stamp
+  (``<sha>-<epoch ms>``): a build stamped before the AUTHOR date of
+  qontinui-runner#2138's first commit (``4b24dbb8f``, 2026-10-10T07:12:15Z)
+  cannot contain it, since an author date survives every rebase. Studio holds
+  no runner checkout, so ancestry against ``gitSha`` is not available here;
+* the same ``404`` from any other identified build (stamped at or after that
+  date, or with no readable stamp) -> ``unknown``
+  (``route_absent_gateway_capable``): it may be a gateway-capable build that
+  serves no gateway read, and a declared gateway must not be bypassed;
 * ``declared`` with ``routes.images`` -> image calls go through that route
   (every adapter speaking the OpenAI images wire is pointed at it; any other
   wire is unavailable);
@@ -79,6 +82,12 @@ READ_TIMEOUT_S = 15.0
 # The only environment-variable names a gateway may nominate as its credential.
 GATEWAY_CREDENTIAL_ENV = re.compile(r"QONTINUI_GATEWAY_[A-Z0-9_]+")
 _GIT_SHA = re.compile(r"[0-9a-f]{7,40}")
+# The runner's ``buildId`` is ``<sha>-<epoch milliseconds>``.
+_BUILD_STAMP = re.compile(r"-(\d{13})$")
+# Author date of qontinui-runner 4b24dbb8f, the first commit of #2138 (the model
+# gateway), as epoch ms: 2026-10-10T07:12:15Z. A build stamped earlier cannot
+# contain the gateway, so its 404 on ``/model-gateway`` means "none declared".
+GATEWAY_CAPABLE_SINCE_MS = 1_791_616_335_000
 
 State = Literal["not_declared", "declared", "unknown"]
 
@@ -87,7 +96,8 @@ State = Literal["not_declared", "declared", "unknown"]
 class GatewayState:
     state: State
     # Where the reading came from (``runner``, ``no_runner``, ``route_absent``,
-    # ``runner_unresponsive``, ``unidentified_runner``, ``unreadable``,
+    # ``route_absent_gateway_capable``, ``runner_unresponsive``,
+    # ``unidentified_runner``, ``unreadable``,
     # ``unacceptable_route``, ``unacceptable_credential_env``, ...), so a report
     # can say how it knows.
     source: str
@@ -96,7 +106,7 @@ class GatewayState:
     # The env var holding the GATEWAY's own credential for its images route,
     # when the declaration names one: always a ``QONTINUI_GATEWAY_*`` name.
     images_credential_env: str | None = None
-    # The identified runner build's ``gitSha`` (for the #2138 tripwire above).
+    # The identified runner build's ``gitSha``.
     runner_git_sha: str | None = None
 
     def refusal(self) -> GatewayRefusal | None:
@@ -160,6 +170,20 @@ def runner_identity(body: object) -> str | None:
     return sha
 
 
+def runner_build_ms(body: object) -> int | None:
+    """The epoch-ms stamp of a ``/health`` body's ``buildId`` (top level or inside
+    its ``data`` envelope), else None."""
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data")
+    for scope in [body, data] if isinstance(data, dict) else [body]:
+        build = scope.get("buildId")
+        match = _BUILD_STAMP.search(build) if isinstance(build, str) else None
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def read_gateway_state(base: str | None = None, http: httpx.Client | None = None) -> GatewayState:
     """Read this install's model-gateway state from the local runner. The read
     is unauthenticated, so it is trusted only from a LOOPBACK runner whose
@@ -203,9 +227,10 @@ def _read(root: str, client: httpx.Client) -> GatewayState:
     if isinstance(health, GatewayState):
         return health
     try:
-        sha = runner_identity(health.json()) if health.status_code == 200 else None
+        health_body = health.json() if health.status_code == 200 else None
     except ValueError:
-        sha = None
+        health_body = None
+    sha = runner_identity(health_body)
     if sha is None:
         return GatewayState(
             "unknown",
@@ -219,12 +244,19 @@ def _read(root: str, client: httpx.Client) -> GatewayState:
         # The runner answered /health a moment ago: a refusal now is not "no runner".
         return GatewayState("unknown", "unreadable", resp.reason, runner_git_sha=sha)
     if resp.status_code == 404:
-        # TRIPWIRE (qontinui-runner#2138): see the module docstring — once #2138
-        # merges, a 404 from a build at or past its merge commit reads unknown.
+        stamp = runner_build_ms(health_body)
+        if stamp is not None and stamp < GATEWAY_CAPABLE_SINCE_MS:
+            return GatewayState(
+                "not_declared",
+                "route_absent",
+                f"GET {url} answered 404: runner build {sha} predates the model gateway",
+                runner_git_sha=sha,
+            )
         return GatewayState(
-            "not_declared",
-            "route_absent",
-            f"GET {url} answered 404: runner build {sha} serves no gateway read",
+            "unknown",
+            "route_absent_gateway_capable",
+            f"GET {url} answered 404 from runner build {sha}, which may declare a model "
+            "gateway (qontinui-runner#2138) but serves no read of it",
             runner_git_sha=sha,
         )
     if resp.status_code != 200:

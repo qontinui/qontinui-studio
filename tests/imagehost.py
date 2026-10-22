@@ -176,15 +176,20 @@ def json_reply(status: int, body: object, headers: dict[str, str] | None = None)
 RUNNER_GIT_SHA = "200538ff8d9b"
 
 
-def runner_health(git_sha: str = RUNNER_GIT_SHA) -> Reply:
+# A build stamp from before the model gateway existed (2026-10-06).
+PRE_GATEWAY_BUILD_MS = 1791306076603
+
+
+def runner_health(git_sha: str = RUNNER_GIT_SHA, build_id: str | None = None) -> Reply:
     """``GET /health`` as a qontinui runner build answers it (the identity
     fields studio checks, inside the runner's envelope)."""
+    build = build_id if build_id is not None else f"{git_sha}-{PRE_GATEWAY_BUILD_MS}"
     return json_reply(
         200,
         {
             "success": True,
-            "buildId": f"{git_sha}-1791306076603",
-            "data": {"status": "ok", "gitSha": git_sha, "buildId": f"{git_sha}-1791306076603"},
+            "buildId": build,
+            "data": {"status": "ok", "gitSha": git_sha, "buildId": build},
         },
     )
 
