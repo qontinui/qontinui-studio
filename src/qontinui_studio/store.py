@@ -259,9 +259,33 @@ CREATE TABLE IF NOT EXISTS launch_gate_results (
 #   Recovery and readopt re-send notices from these, never from whatever
 #   product yaml sits at ``product_path`` later. Launches published before v5
 #   keep NULL in both.
+#
+# Version 6 — the asset compile step (plan 2026-10-13 Phase 19):
+#
+# * ``batches.compile_target`` / ``compile_slot`` / ``compile_spec_sha256`` /
+#   ``compile_inputs_json``: set on a batch ``studio compile`` created for one
+#   image slot of one compile target — the target id, the spec's slot id, the
+#   spec's content hash, the input digests (recipe, imagery, exemplars,
+#   LoRA, every provider's adapter, model and recipe hash) it was generated
+#   against. A compile batch publishes only into the checkout a compile run
+#   names, so ``jobs run`` never drives it and ``publish``/``unpublish --batch``
+#   refuse it; a later compile run resumes it
+#   while its spec and inputs are unchanged, and fails it once they are not.
+#   NULL on every other batch.
+#
+# Version 7 — ``batches.compile_checkout``: the checkout root a compile batch
+# was made in, so one checkout's compile never supersedes another live
+# checkout's batch.
+#
+# Versions 6 and 7 add only what is absent (``PRAGMA table_info``,
+# ``CREATE INDEX IF NOT EXISTS``): this phase's commits before the rebase onto
+# main's v5 stamped the compile columns as v5 (with or without
+# ``compile_checkout``) and ``compile_checkout`` as v6, never running main's
+# v5. Version 7 therefore also adds ``launches.unpublish_command`` /
+# ``public_url`` where absent, so every such database ends complete.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 _BATCHES_V1 = """
 CREATE TABLE batches_v1 (
@@ -428,12 +452,43 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE launches ADD COLUMN public_url TEXT")
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    # Only what is missing: a database from this phase's commits before the
+    # rebase onto main's v5 carries the compile columns already, stamped v5.
+    present = _columns(conn, "batches")
+    for column in ("compile_target", "compile_slot", "compile_spec_sha256", "compile_inputs_json"):
+        if column not in present:
+            conn.execute(f"ALTER TABLE batches ADD COLUMN {column} TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS batches_compile "
+        "ON batches (compile_target, compile_slot, status) "
+        "WHERE compile_target IS NOT NULL"
+    )
+
+
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    if "compile_checkout" not in _columns(conn, "batches"):  # a v6 db from before the column
+        conn.execute("ALTER TABLE batches ADD COLUMN compile_checkout TEXT")
+    # A database this phase stamped v6 before the rebase onto main never ran
+    # main's v5, so it may lack the launch notice columns.
+    launch_columns = _columns(conn, "launches")
+    for column in ("unpublish_command", "public_url"):
+        if column not in launch_columns:
+            conn.execute(f"ALTER TABLE launches ADD COLUMN {column} TEXT")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
     4: _migrate_v4_to_v5,
+    5: _migrate_v5_to_v6,
+    6: _migrate_v6_to_v7,
 }
 
 

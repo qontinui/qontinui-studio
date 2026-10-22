@@ -76,7 +76,9 @@ def test_sse_generation_sends_the_extra_body_and_stages_a_marked_provenanced_fil
     [path] = adapter.download(handle, tmp_path / "o")
     assert marker.is_marked(path)
     [record] = staged_provenance(handle)
-    assert record is not None and record["spdx"] == "Apache-2.0" and record["seed"] == 1234
+    assert (
+        record is not None and record["licence"]["spdx"] == "Apache-2.0" and record["seed"] == 1234
+    )
 
 
 def test_the_marker_is_written_even_when_the_host_sends_unmarked_bytes(
@@ -234,13 +236,15 @@ def test_lost_results_are_unknown(
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"spdx": None},
-        {"spdx": "GPL-3.0-only"},
+        {"licence": {}},
+        {"licence": {"spdx": "GPL-3.0-only"}},
+        {"licence": {"spdx": "Apache-2.0 AND (GPL-3.0-only)"}},
+        {"licence": {"spdx": "Apache-2.0 OR MIT"}},
         {"recipe": {"id": "hero"}},
         {"models": [{"id": "z", "weights": []}]},
         {"seed": None},
     ],
-    ids=["no-spdx", "gpl", "no-recipe-hash", "no-weight-hash", "no-seed"],
+    ids=["no-spdx", "gpl", "gpl-in-an-and", "an-or", "no-recipe-hash", "no-weight-hash", "no-seed"],
 )
 def test_incomplete_facade_provenance_is_refused(
     host: ImageHost,

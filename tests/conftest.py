@@ -309,6 +309,29 @@ def generate_media_id(el: DomNode) -> str:
     return f"{prefix}-root"
 
 
+def decoded_width(path: Path) -> int:
+    """What a browser reports as ``naturalWidth`` for an image file: Pillow's
+    decode for a raster, the root ``width`` for an SVG (a browser renders an
+    SVG with an intrinsic size at it); 0 when it does not decode."""
+    if path.suffix == ".svg":
+        from qontinui_studio import marker
+
+        try:
+            root = marker.svg_root(path.read_bytes())
+        except OSError:
+            return 0
+        try:
+            return int(float(root.get("width", "0"))) if root is not None else 0
+        except ValueError:
+            return 0
+    try:
+        with Image.open(path) as img:
+            img.load()
+            return int(img.width)
+    except (OSError, ValueError):
+        return 0
+
+
 class FakeBridge:
     """A fake UI Bridge in front of one site's preview server. ``navigate``
     "loads" a URL and reports it browser-normalised as ``page.url``;
@@ -366,13 +389,7 @@ class FakeBridge:
                 fallback = next(iter(files))  # the <img src>
                 fmt = "avif" if "avif" in files else fallback
                 name = files[fmt]
-                width = 0
-                try:
-                    with Image.open(site_dir / name) as img:
-                        img.load()
-                        width = img.width
-                except (OSError, ValueError):
-                    width = 0
+                width = decoded_width(site_dir / name)
                 sources = [
                     {
                         "srcset": f"/{self.site}/{files[f]}?sha={shas.get(f, '')}",

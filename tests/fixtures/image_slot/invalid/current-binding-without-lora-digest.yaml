@@ -1,0 +1,42 @@
+# refused-by: rule provenance.lora_sha256
+# A current binding of a generated asset that omits the digest of the LoRA the slot names.
+slot: sessions.empty-state
+role: empty_state
+job: "Reassure a first-time operator that nothing is broken; point at 'Start a session'."
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 768, 1280, 1920]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 4/3
+  allowed: [1/1]
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.05, y: 0.2, width: 0.45, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+  lora: qontinui-house-v1
+content:
+  must:
+    - abstract terminal motif
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: forbidden
+alt:
+  kind: decorative
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: 2db94faf3fd15c9aafcc9f4be3f967c90f32185fb72ed7f483da80b3f4f644a7
+  spec_sha256: 61f2bd6aef44334ace9d991271c20a51f13a21d7ebbe24265f4b9c87aa0f3347
+  source: generated
+  ai_generated: true
+  recipe_sha256: 117a4ed2e12f05aa5e3f289c8f122c8d9337f1e04d0d994df02100d13dfe4b52
+  imagery_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81
+  exemplars_sha256: 70258cfa680863e17853e0073f62080d7de54036a91ec1bc463e896814ee8b13

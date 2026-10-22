@@ -118,7 +118,12 @@ def test_upgrade_from_the_355ce64_schema_keeps_every_row(tmp_path: Path) -> None
     db = tmp_path / ".studio" / "studio.db"
     _v0_db(db, write_image(tmp_path / "raw.png"))
     conn = connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+    # v6: compile batches; every upgraded batch is an ordinary one.
+    assert (
+        conn.execute("SELECT COUNT(*) FROM batches WHERE compile_target IS NOT NULL").fetchone()[0]
+        == 0
+    )
     # v5: a launch's notice fields, frozen at publish; pre-v5 launches have none.
     launch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(launches)")}
     assert {"unpublish_command", "public_url"} <= launch_cols
@@ -257,3 +262,93 @@ def test_concurrent_connects_migrate_exactly_once(tmp_path: Path) -> None:
     conn = connect(db)
     assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+
+
+def test_a_v6_database_without_compile_checkout_gains_it(tmp_path: Path) -> None:
+    """This phase's first commits shipped the compile columns without
+    ``compile_checkout``; v7 adds it where absent, and leaves it where
+    present."""
+    db = tmp_path / ".studio" / "studio.db"
+    conn = connect(db)
+    conn.execute("ALTER TABLE batches DROP COLUMN compile_checkout")
+    conn.execute("PRAGMA user_version = 6")
+    conn.commit()
+    conn.close()
+    again = connect(db)
+    assert again.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+    columns = {r[1] for r in again.execute("PRAGMA table_info(batches)")}
+    assert "compile_checkout" in columns
+    again.execute("PRAGMA user_version = 6")  # a v6 that already has it
+    again.commit()
+    again.close()
+    third = connect(db)
+    assert third.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
+COMPILE_COLUMNS = (
+    "compile_target",
+    "compile_slot",
+    "compile_spec_sha256",
+    "compile_inputs_json",
+    "compile_checkout",
+)
+LAUNCH_NOTICE_COLUMNS = ("unpublish_command", "public_url")
+
+
+def _assert_complete_v7(conn: sqlite3.Connection) -> None:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+    batches = {r[1] for r in conn.execute("PRAGMA table_info(batches)")}
+    assert set(COMPILE_COLUMNS) <= batches
+    launches = {r[1] for r in conn.execute("PRAGMA table_info(launches)")}
+    assert set(LAUNCH_NOTICE_COLUMNS) <= launches
+    indexes = {r[1] for r in conn.execute("PRAGMA index_list(batches)")}
+    assert "batches_compile" in indexes
+
+
+def _restamp(db: Path, version: int, *statements: str) -> None:
+    """A complete database taken back to an earlier shape, then stamped."""
+    conn = connect(db)
+    for sql in statements:
+        conn.execute(sql)
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+    conn.close()
+
+
+def test_a_main_v5_database_gains_the_compile_columns(tmp_path: Path) -> None:
+    """Main's v5 holds the launch notice columns and no compile columns; v6 and
+    v7 add the compile step on top of it."""
+    db = tmp_path / ".studio" / "studio.db"
+    _restamp(
+        db,
+        5,
+        "DROP INDEX batches_compile",
+        *(f"ALTER TABLE batches DROP COLUMN {c}" for c in COMPILE_COLUMNS),
+    )
+    _assert_complete_v7(connect(db))
+
+
+_DROP_LAUNCH_NOTICE = tuple(f"ALTER TABLE launches DROP COLUMN {c}" for c in LAUNCH_NOTICE_COLUMNS)
+
+
+@pytest.mark.parametrize(
+    ("version", "statements"),
+    [
+        pytest.param(
+            5,
+            ("ALTER TABLE batches DROP COLUMN compile_checkout", *_DROP_LAUNCH_NOTICE),
+            id="old-branch-v5-without-compile_checkout",
+        ),
+        pytest.param(5, _DROP_LAUNCH_NOTICE, id="old-branch-v5-with-compile_checkout"),
+        pytest.param(6, _DROP_LAUNCH_NOTICE, id="old-branch-v6"),
+    ],
+)
+def test_a_pre_rebase_compile_database_ends_complete(
+    tmp_path: Path, version: int, statements: tuple[str, ...]
+) -> None:
+    """This phase's commits before the rebase onto main's v5 stamped the compile
+    columns v5 and ``compile_checkout`` v6, and never ran main's v5. Each such
+    shape opens without error and ends with every column of v7."""
+    db = tmp_path / ".studio" / "studio.db"
+    _restamp(db, version, *statements)
+    _assert_complete_v7(connect(db))

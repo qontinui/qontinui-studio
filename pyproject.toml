@@ -18,6 +18,12 @@ pillow = "^12"
 # IANA zones for per-provider quota resets (zoneinfo has no database on Windows).
 tzdata = ">=2024.1"
 google-genai = "^1.0"
+# `studio compile` (plan 2026-10-13 Phase 19): the generated ImageSlotSpec model
+# (PD3: one drift-gated contract), pinned to a qontinui-schemas commit that
+# carries it; and vtracer (MIT), which traces flat raster art into SVG at the
+# version the image licence manifest pins (qontinui docker/imagegen/manifest.yaml).
+qontinui-schemas = { git = "https://github.com/qontinui/qontinui-schemas.git", rev = "c415a432156823d0b31c5b976e4ef9014576aae9" }
+vtracer = "0.6.15"
 # Optional [bg] extra: background removal. Absent -> BackgroundRemovalUnavailable.
 rembg = { version = "^2.0", optional = true }
 # Optional [launch] extra: Playwright as the headless browser for walkthrough capture.
@@ -65,7 +71,7 @@ explicit_package_bases = true
 packages = ["qontinui_studio"]
 
 [[tool.mypy.overrides]]
-module = ["rembg"]
+module = ["rembg", "vtracer"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
