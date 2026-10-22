@@ -36,7 +36,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from qontinui_studio.errors import StudioError
+from qontinui_studio.errors import StudioError, omitted
 from qontinui_studio.launch.allowlist import BUILD_RECORD_ALLOWED_PATHS, build_record_violations
 from qontinui_studio.notify import resolve_bearer
 
@@ -418,13 +418,19 @@ class BuildRecordClient:
         except httpx.HTTPError as e:
             return NoBuildRecord("unreachable", url, f"transport failure: {e}")
         if resp.status_code == 404:
-            return NoBuildRecord("not_found", url, f"HTTP 404: {resp.text[:200]}")
+            return NoBuildRecord("not_found", url, f"HTTP 404: {omitted(resp.text)}")
         if resp.status_code in (401, 403):
-            return NoBuildRecord("unauthorized", url, f"HTTP {resp.status_code}: {resp.text[:200]}")
+            return NoBuildRecord(
+                "unauthorized", url, f"HTTP {resp.status_code}: {omitted(resp.text)}"
+            )
         if resp.status_code >= 500:
-            return NoBuildRecord("unreachable", url, f"HTTP {resp.status_code}: {resp.text[:200]}")
+            return NoBuildRecord(
+                "unreachable", url, f"HTTP {resp.status_code}: {omitted(resp.text)}"
+            )
         if resp.status_code != 200:
-            raise BuildRecordInvalid([f"{url} answered HTTP {resp.status_code}: {resp.text[:200]}"])
+            raise BuildRecordInvalid(
+                [f"{url} answered HTTP {resp.status_code}: {omitted(resp.text)}"]
+            )
         return resp
 
     @staticmethod
@@ -509,7 +515,9 @@ class BuildRecordClient:
                 [f"{url}: not the /publication shape ({e.error_count()} error(s))"]
             ) from e
         if answer.public_slug != slug:
-            raise BuildRecordInvalid([f"{url}: answered for {answer.public_slug!r}, not {slug!r}"])
+            raise BuildRecordInvalid(
+                [f"{url}: answered for {omitted(answer.public_slug)}, not {slug!r}"]
+            )
         if not answer.owned_by_caller_tenant and (
             answer.unpublished or answer.version is not None or answer.content_sha256 is not None
         ):

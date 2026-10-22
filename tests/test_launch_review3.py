@@ -305,7 +305,7 @@ def test_r4_a_collision_is_refused_at_assembly(
     [
         ({"extra": 1}, "not the /publication shape"),
         ({"public_slug": None}, "not the /publication shape"),
-        ({"public_slug": "someone-else"}, "answered for 'someone-else'"),
+        ({"public_slug": "someone-else"}, r"answered for detail omitted \(12 bytes"),
         ({"version": "1"}, "not the /publication shape"),
         ({"content_sha256": "ABC"}, "not the /publication shape"),
         ({"owned_by_caller_tenant": False}, "must carry no state"),

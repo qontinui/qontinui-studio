@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlun
 import httpx
 
 from qontinui_studio import marker, provenance
+from qontinui_studio.errors import omitted
 from qontinui_studio.library import AssetRecord, VariantRecord
 from qontinui_studio.postprocess import sha256_file
 from qontinui_studio.sites import Site, Slot
@@ -227,6 +228,12 @@ def d7_page_health(site: Site, probe: PageHealthProbe = http_page_health_probe) 
     )
 
 
+def _shown_summary(summary: str) -> str:
+    """A rejected page-health summary: a status word (``CRITICAL``) is worth
+    printing; anything else is the bridge's free text and is omitted."""
+    return f"'{summary}'" if re.fullmatch(r"[A-Za-z_]{1,32}", summary) else omitted(summary)
+
+
 def page_health_gate(
     subject: str,
     ui_bridge_url: str | None,
@@ -240,7 +247,10 @@ def page_health_gate(
         body = probe(ui_bridge_url.rstrip("/") + "/control/page-health")
     except Exception as e:  # any probe failure is UNKNOWN; UNKNOWN does not publish
         return GateResult(
-            "d7_page_health", subject, "fail", f"page-health probe failed: {type(e).__name__}: {e}"
+            "d7_page_health",
+            subject,
+            "fail",
+            f"page-health probe failed: {type(e).__name__}: {omitted(e)}",
         )
     if not isinstance(body, dict):
         return GateResult("d7_page_health", subject, "fail", "page-health answered a non-object")
@@ -248,14 +258,15 @@ def page_health_gate(
     summary = data.get("summary") if isinstance(data, dict) else None
     if body.get("success") is not True or not isinstance(summary, str):
         return GateResult(
-            "d7_page_health", subject, "fail", f"unreadable page-health answer: {body}"
+            "d7_page_health", subject, "fail", f"unreadable page-health answer: {omitted(body)}"
         )
     if summary.upper() not in ACCEPTED_SUMMARIES:
         return GateResult(
             "d7_page_health",
             subject,
             "fail",
-            f"page-health summary '{summary}' (only {'/'.join(ACCEPTED_SUMMARIES)} publish)",
+            f"page-health summary {_shown_summary(summary)} "
+            f"(only {'/'.join(ACCEPTED_SUMMARIES)} publish)",
         )
     return GateResult("d7_page_health", subject, "pass", f"page-health summary {summary}")
 
@@ -353,13 +364,24 @@ def with_query(url: str, params: dict[str, str]) -> str:
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
+_UNPARSEABLE_PORT = -1
+
+
 def normalise_url(url: str) -> tuple[str, str, int | None, str]:
     """(scheme, host, port, path) as a browser would report them: lowercase
     scheme and host, the default port dropped, dot segments resolved, an empty
-    path as ``/`` (WHATWG URL serialisation, for the parts D7 compares)."""
-    p = urlparse(url)
+    path as ``/`` (WHATWG URL serialisation, for the parts D7 compares).
+
+    A URL ``urlparse`` cannot read (a non-numeric port, a broken IPv6 host)
+    comes back with port ``-1``, which no real URL carries, so it matches
+    nothing. Raising instead would carry the bridge's URL text out in the
+    ``ValueError`` message, past every gate's allowlist."""
+    try:
+        p = urlparse(url)
+        port = p.port
+    except ValueError:
+        return "", "", _UNPARSEABLE_PORT, ""
     scheme = p.scheme.lower()
-    port = p.port
     if port == _DEFAULT_PORTS.get(scheme):
         port = None
     path = p.path or "/"
@@ -393,6 +415,21 @@ def same_page(
         return False
     got, want = parse_qs(a.query), parse_qs(t.query)
     return all(got.get(k) == want.get(k) for k in params)
+
+
+def _shown_url(url: str | None) -> str:
+    """A bridge-reported URL as a gate detail may print it: scheme, host, port
+    and path. Its query, fragment and userinfo are page-controlled free text (a
+    login redirect's ``?code=``, ``user:pw@``) and are left out; a URL that
+    does not parse is omitted whole."""
+    if url is None:
+        return "None"
+    scheme, host, port, path = normalise_url(url)
+    if port == _UNPARSEABLE_PORT:
+        return omitted(url)
+    netloc = host if port is None else f"{host}:{port}"
+    rest = " (query omitted)" if urlsplit(url).query else ""
+    return f"'{scheme}://{netloc}{path}'{rest}"
 
 
 def _current_url(snapshot: dict[str, Any]) -> str | None:
@@ -786,20 +823,20 @@ def preview_page_gates(
                 before = snap
                 break
         except Exception as e:  # e.g. the tab is re-registering after navigation
-            last_error = f"{type(e).__name__}: {e}"
+            last_error = f"{type(e).__name__}: {omitted(e)}"
         if monotonic() >= stop:
             break
         sleep(poll_s)
     if before is None or bridge is None:
         why = (
-            f"bridged page is at {seen!r}, not {what} {target!r}"
+            f"bridged page is at {_shown_url(seen)}, not {what} {target!r}"
             if seen is not None or not last_error
             else f"bridge unavailable: {last_error}"
         )
         if seen is not None and origin(seen) != origin(target):
             why += f" (origin {origin(seen)} is not the preview origin {origin(target)})"
         return [GateResult("d7_navigate", subject, "fail", f"{why} after {deadline_s:.0f}s")]
-    results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {seen}")]
+    results = [GateResult("d7_navigate", subject, "pass", f"bridged page loaded {target}")]
     results.append(page_health_gate(subject, ui_bridge_url, lambda _url: bridge.page_health()))
     # Poll until every changed slot's image has settled (loaded or failed),
     # within the remaining deadline; the page must not move meanwhile.
@@ -808,7 +845,7 @@ def preview_page_gates(
         try:
             snap = bridge.snapshot()
         except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
+            last_error = f"{type(e).__name__}: {omitted(e)}"
         else:
             if not same_page(_current_url(snap), target, spec.params):
                 results.append(
@@ -816,7 +853,7 @@ def preview_page_gates(
                         "d7_navigate",
                         subject,
                         "fail",
-                        f"page moved to {_current_url(snap)!r} during the D7 check",
+                        f"page moved to {_shown_url(_current_url(snap))} during the D7 check",
                     )
                 )
                 return results
@@ -875,7 +912,10 @@ def preview_manifest_gate(
         served = fetch(preview_manifest_url)
     except Exception as e:  # an unreachable preview is a refusal
         return GateResult(
-            "d7_preview", subject, "fail", f"preview manifest fetch failed: {type(e).__name__}: {e}"
+            "d7_preview",
+            subject,
+            "fail",
+            f"preview manifest fetch failed: {type(e).__name__}: {omitted(e)}",
         )
     digest = hashlib.sha256(served).hexdigest()
     if digest != expected_sha256:

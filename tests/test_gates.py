@@ -458,3 +458,115 @@ def test_d6_label_wording(records: tuple[AssetRecord, VariantRecord]) -> None:
 def test_page_health_has_no_waiver() -> None:
     required = d7_page_health(_site())
     assert required.failed and required.outcome == "not_configured"
+
+
+# Free text a probe, a bridge or a preview server answers with: a URL with a
+# query and userinfo, an e-mail address and a marker. None of it may reach a
+# gate's detail, which ``gate_results.detail`` persists (plan A3.6).
+LEAK = "https://op:pw@internal.example:8443/x?token=LEAK-SENTINEL#frag mail op@example.com"
+
+
+def _assert_omitted(detail: str) -> None:
+    assert "LEAK-SENTINEL" not in detail
+    assert "op@example.com" not in detail
+    assert "internal.example" not in detail
+    assert "detail omitted (" in detail
+
+
+def test_d7_gate_details_never_carry_exception_or_answer_text() -> None:
+    site = _site(**PREVIEW)
+
+    def raises(url: str) -> dict[str, object]:
+        raise httpx.ConnectError(LEAK)
+
+    probe = d7_page_health(site, raises)
+    assert probe.failed and "ConnectError" in probe.detail
+    _assert_omitted(probe.detail)
+
+    unreadable = d7_page_health(site, lambda u: {"success": False, "error": LEAK})
+    assert unreadable.failed and "unreadable page-health answer" in unreadable.detail
+    _assert_omitted(unreadable.detail)
+
+    def fetch_raises(url: str) -> bytes:
+        raise httpx.ConnectError(LEAK)
+
+    manifest = d7_preview_manifest(site, SHA, fetch_raises)
+    assert manifest.failed and "ConnectError" in manifest.detail
+    _assert_omitted(manifest.detail)
+
+
+def test_d7_navigation_details_never_carry_bridge_exception_text() -> None:
+    site = _site(**PREVIEW)
+    files = {"hero": {"hero.webp": SHA}}
+
+    def no_bridge(_url: str) -> Bridge:
+        raise ConnectionError(LEAK)
+
+    t = FakeTime()
+    [nav] = d7_preview_page(
+        site, "batch-1", files, no_bridge, lambda u: b"", sleep=t.sleep, monotonic=t.monotonic
+    )
+    assert nav.failed and "bridge unavailable: ConnectionError" in nav.detail
+    _assert_omitted(nav.detail)
+
+    # The page loads, then every later snapshot fails: the settle loop's error.
+    class DropsAfterLoad(Bridge):
+        def snapshot(self) -> dict[str, object]:
+            if self.navigated and getattr(self, "_loaded", False):
+                raise ConnectionError(LEAK)
+            self._loaded = True
+            return super().snapshot()
+
+    results = _run(site, DropsAfterLoad("same", []), files)
+    last = results[-1]
+    assert last.failed and "bridge unavailable: ConnectionError" in last.detail
+    _assert_omitted(last.detail)
+
+
+def test_a_rejected_page_health_summary_is_printed_only_as_a_status_word() -> None:
+    site = _site(**PREVIEW)
+    crit = d7_page_health(site, lambda u: {"success": True, "data": {"summary": "CRITICAL"}})
+    assert crit.failed and "'CRITICAL'" in crit.detail
+    free = d7_page_health(site, lambda u: {"success": True, "data": {"summary": LEAK}})
+    assert free.failed
+    _assert_omitted(free.detail)
+
+
+def test_a_foreign_page_url_is_shown_without_its_query_or_userinfo() -> None:
+    site = _site(**PREVIEW)
+    [nav] = _run(site, Bridge(LEAK, []), {"hero": {"hero.webp": SHA}})
+    assert nav.failed and "/x' (query omitted)" in nav.detail
+    assert "LEAK-SENTINEL" not in nav.detail and "op@example.com" not in nav.detail
+    assert "op:pw" not in nav.detail
+
+    class MovesAway(Bridge):
+        def snapshot(self) -> dict[str, object]:
+            snap = super().snapshot()
+            if getattr(self, "_loaded", False):
+                snap["page"] = {"url": LEAK}
+            self._loaded = True
+            return snap
+
+    moved = _run(site, MovesAway("same", []), {"hero": {"hero.webp": SHA}})[-1]
+    assert moved.failed and "page moved to" in moved.detail
+    assert "LEAK-SENTINEL" not in moved.detail and "op:pw" not in moved.detail
+
+
+def test_an_unparseable_bridge_url_fails_the_gate_without_raising_its_text() -> None:
+    site = _site(**PREVIEW)
+    bad = "http://127.0.0.1:LEAK-SENTINEL/index.html"
+    [nav] = _run(site, Bridge(bad, []), {"hero": {"hero.webp": SHA}})
+    assert nav.failed
+    _assert_omitted(nav.detail)
+
+    class MovesToUnparseable(Bridge):
+        def snapshot(self) -> dict[str, object]:
+            snap = super().snapshot()
+            if getattr(self, "_loaded", False):
+                snap["page"] = {"url": bad}
+            self._loaded = True
+            return snap
+
+    moved = _run(site, MovesToUnparseable("same", []), {"hero": {"hero.webp": SHA}})[-1]
+    assert moved.failed and "page moved to" in moved.detail
+    assert "LEAK-SENTINEL" not in moved.detail
