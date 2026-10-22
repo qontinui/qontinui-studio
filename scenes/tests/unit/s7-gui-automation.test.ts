@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { STUDIO_FPS, findBeat, missingRequirements, parseTrace, validateTrace, type SceneTraceInput } from "../../src/api";
 import { posterFrame } from "../../src/api/scene-root";
 import { s7GuiAutomation } from "../../src/scenes/s7-gui-automation";
+import { discoverySlots } from "../../src/scenes/s7-gui-automation/graph-layout";
 import { s7State, s7Timeline } from "../../src/scenes/s7-gui-automation/model";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -109,6 +110,17 @@ describe("S7 scene model", () => {
     ]);
     expect(state.states.at(-1)?.level).toBe("testing");
     expect(state.caption?.title).toBe("A state is found");
+  });
+
+  it("draws states and edges in the slots the check judges", () => {
+    // The check (graphProblems) reads discoverySlots; the drawing must use the same slots.
+    const slots = discoverySlots(trace);
+    const end = s7State(trace, tl, tl.durationInFrames - 1);
+    expect(end.states.map((s) => [s.id, s.slot])).toEqual(end.states.map((s) => [s.id, slots.get(s.id)]));
+    const byId = new Map(trace.entities.transitions.map((t) => [t.id, t]));
+    for (const e of end.edges) {
+      expect([e.fromSlot, e.toSlot]).toEqual([slots.get(byId.get(e.id)!.from), slots.get(byId.get(e.id)!.to)]);
+    }
   });
 
   it("learns transitions as edges, unlit until taken, the newest one highlighted", () => {
