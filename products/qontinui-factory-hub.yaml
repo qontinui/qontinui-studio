@@ -21,6 +21,9 @@ publish:
   # See products/qontinui-studio.yaml: the one hub clone and preview on the
   # studio host, pinned by environment; unset is refused at load.
   publish_dir: ${STUDIO_HUB_CLONE}/public/qontinui-factory-hub
+  # Where the bundle is served once the hub PR lands: og:image is absolute
+  # under it, and the published notice names these pages, not the clone.
+  public_url: https://build.qontinui.io/qontinui-factory-hub/
   commercial: false
   preview_dir: ${STUDIO_HUB_PREVIEW}/qontinui-factory-hub
   ui_bridge_url: http://127.0.0.1:4330/api/ui-bridge

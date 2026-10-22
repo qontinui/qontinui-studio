@@ -437,6 +437,8 @@ upgraded in place the first time any command opens it.
 | `QONTINUI_IMAGEGEN` | this machine's image-generation switch: `0` turns generation off with no coord read (any value but `0`, `1` or empty is read as off too) |
 | `COORD_DEVICE_JWT` (then `~/.qontinui/coord-device-jwt`, then a runner mint) | reading coord's `image_generation` dial before generating. `COORD_HTTP_URL` overrides the coord host; a runner-minted token goes to production coord only. `STUDIO_COORD_TENANT_ID` names the tenant to a runner bound to several. |
 | `STUDIO_WEB_BEARER` or `STUDIO_WEB_BEARER_FILE` | the launch kit's authed build-record door (`record.door: authed`) |
+| `STUDIO_WEB_ACTIVE_TENANT` | the tenant (a UUID) every authed web call acts in, sent as `X-Qontinui-Active-Tenant`. A value that is not a UUID is `misconfigured`: the call is not made and `d1_tenant` fails rather than falling back to the product's pins. |
+| `STUDIO_HUB_CLONE`, `STUDIO_HUB_PREVIEW` | the hub clone and hub preview roots on the studio host, which `products/qontinui-studio.yaml` and `products/qontinui-factory-hub.yaml` pin their `publish_dir` / `preview_dir` to. Unset, those products are refused at load. |
 | `STUDIO_COORD_BEARER` or `STUDIO_COORD_BEARER_FILE` | `studio launch register-trigger`, and operator notices posted to `https://coord.qontinui.io/coord/agent-findings`. This needs a device/agent JWT. Without one, or when coord refuses, the notice is written to `.studio/notices/` and says why. Notice files are timestamped and never overwritten. |
 
 To let the scheduler use a provider, set `daily_quota` on its row. This is the
@@ -548,6 +550,10 @@ facade's loopback bind is.
   optional background removal.
 - `products/*.yaml`: launch-kit products (slug, repos, record door, capture
   script, brief and assets site, publish target), plus their capture scripts.
+  A path value may use `${NAME}`, expanded from the environment at load; an
+  unset or empty variable, or any other `$` form, is refused, and the expanded
+  path must be absolute. Relative paths resolve against the yaml's directory.
+  Every path is canonicalised (`Path.resolve()`).
 - `briefs/*.yaml`: the asset id, purpose, targets (`{site, slot}` or
   `{campaign}`), aspect ratio, prompt, style guide, reference images, provider
   preference, number of variants and optional library `tags`. The
@@ -765,6 +771,23 @@ launched in one step:
    `studio launch publish --launch <id>`, which re-runs every gate, D7 on a
    preview included.
 
+   A product whose bundle goes live through another system sets
+   `publish.unpublish_command` (the hub products use `hub unpublish <slug>`).
+   The notice prints it verbatim in place of the studio's own command. That
+   value and `publish.public_url` are frozen on the launch row at publish, so
+   a notice re-sent by recovery or readopt says what the publish said.
+
+   `studio launch readopt --launch <id> [--json]` makes an `unpublished`
+   launch live again, without touching disk, when its directory already holds
+   exactly its `published_files` (by sha256) and nothing else — the state a
+   hub clone is left in when a successor's or a retraction's PR closed
+   unlanded and the clone was reset. A superseded launch is readopted as
+   `superseded`; one with no successor only if it is the newest launch that
+   went live there (`by_bytes`). Both refuse while any launch at the directory
+   is published. Exit `0` readopted, `2` refused (`not_unpublished`,
+   `no_publish_dir`, `launch_live`, `not_newest`, `bytes_differ`,
+   `foreign_file`), `1` not found or error.
+
 ```bash
 poetry install -E launch && poetry run playwright install chromium
 poetry run studio launch record qontinui-studio            # fetch + validate; exit 4 = no record yet
@@ -772,6 +795,7 @@ poetry run studio launch build products/qontinui-studio.yaml [--record-file F] [
 poetry run studio launch run products/qontinui-studio.yaml  # build + gated publish
 poetry run studio launch publish --launch ID
 poetry run studio launch unpublish --launch ID              # one step
+poetry run studio launch readopt --launch ID [--json]       # live again if the dir holds exactly its bytes
 poetry run studio launch list
 poetry run studio launch recover                            # replay interrupted publishes/unpublishes
 poetry run studio launch register-trigger --work-unit-slug <plan-slug> --product qontinui-studio
@@ -804,18 +828,21 @@ read-back lists the gate, and `5` when the read-back is absent or unreadable.
 the studio's own UI, the review page. `tests/test_launch_end_to_end.py` runs the
 whole kit offline, on a fixture build record and a local test site. That run
 includes the shipped product definition, Playwright capture and a short ffmpeg
-film. Two steps remain before the **live** self-launch:
+film.
 
-- Phase 1 must be deployed. The public build-record route answers 404 today,
-  which the kit reports as "no build record yet".
-- The operator must decide which public org/domain hosts build records and the
-  bundle. That decision sets `record.public_url`, `publish.public_url` and the
-  four D7 preview fields: `ui_bridge_url`, `preview_url`, `preview_dir` and
-  `preview_manifest_url`. Until those are declared, `studio launch run`
-  assembles the self-launch and then refuses to publish it
-  (`d7_page_health not_configured`, exit 2). This is deliberate: D7 is never
-  waived. For the same reason, `sites/qontinui-studio-launch.yaml` refuses
-  decoration until it has a preview.
+The host is decided: the bundle is served by the factory hub at
+`https://build.qontinui.io/qontinui-studio/` (plan
+`2026-10-17-build-qontinui-io-factory-hub`). The yaml publishes into the hub
+clone (`${STUDIO_HUB_CLONE}/public/qontinui-studio`), runs D7 on `hub preview`
+(`127.0.0.1:4330`), and sets `record.public_url`, `publish.public_url` and
+`publish.unpublish_command` for the hub. It is published by `hub publish
+qontinui-studio`, which runs `studio launch run` on a fresh hub branch and
+opens the hub PR; never run `studio launch run` on it directly (see the
+`launch-kit` skill's hub arm). The live self-launch still needs this tenant's
+build record to be public (`hub record-publish qontinui-studio`): until then
+the public route answers 404, which the kit reports as "no build record yet".
+`sites/qontinui-studio-launch.yaml` still declares no preview, so it refuses
+decoration; D7 is never waived.
 
 Bundle pages are static HTML, so they carry no UI Bridge of their own, and D7's
 image check needs the React auto-registration provider with media discovery on

@@ -39,6 +39,9 @@ publish:
   # <workspace-root>/.studio/hub-publish and .studio/hub-preview); loading
   # this file without them is refused, naming the variable.
   publish_dir: ${STUDIO_HUB_CLONE}/public/qontinui-studio
+  # Where the bundle is served once the hub PR lands: og:image is absolute
+  # under it, and the published notice names these pages, not the clone.
+  public_url: https://build.qontinui.io/qontinui-studio/
   commercial: false
   # D7 runs on `hub preview`: 127.0.0.1:4330 serves ${STUDIO_HUB_PREVIEW}/<slug>
   # at /<slug>/ and relays the preview tab's UI Bridge.

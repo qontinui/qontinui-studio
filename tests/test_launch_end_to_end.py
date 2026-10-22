@@ -203,6 +203,14 @@ def test_self_launch_with_the_shipped_product_definition(
     # The published notice names the hub's one-step retraction.
     notice = next(ws.notices_dir.glob(f"{run.launch_id}-published-*.md")).read_text()
     assert "hub unpublish qontinui-studio" in notice
+    # ...and the public pages on the hub (publish.public_url), not the clone.
+    assert "https://build.qontinui.io/qontinui-studio/index.html" in notice
+    assert str(published / "index.html") not in notice
+    # og:image is absolute, under the bundle's public URL.
+    assert (
+        "content='https://build.qontinui.io/qontinui-studio/social/"
+        in (published / "index.html").read_text()
+    )
     if FFMPEG:
         assert (published / "video" / "launch.mp4").is_file()
 
@@ -217,6 +225,7 @@ def test_shipped_product_definition_is_valid(
     assert product.publish.preview_dir == (tmp_path / "hub-preview" / "qontinui-studio")
     assert product.publish.has_preview and product.publish.page_scripts == ("/_hub/ui-bridge.js",)
     assert product.publish.unpublish_command == "hub unpublish qontinui-studio"
+    assert product.publish.public_url == "https://build.qontinui.io/qontinui-studio/"
     assert product.record.door == "public"
     assert product.slug == "qontinui-studio" and product.repos == ["qontinui/qontinui-studio"]
     assert product.capture is not None and product.capture.script.is_file()
@@ -260,7 +269,23 @@ def test_shipped_hub_product_definition_is_valid(
     assert product.publish.has_preview
     assert product.publish.preview_url == "http://127.0.0.1:4330/qontinui-factory-hub/"
     assert product.publish.unpublish_command == "hub unpublish qontinui-factory-hub"
+    assert product.publish.public_url == "https://build.qontinui.io/qontinui-factory-hub/"
     assert product.capture is None and product.brief is None
+
+
+@pytest.mark.parametrize("slug", ["qontinui-studio", "qontinui-factory-hub"])
+def test_shipped_hub_product_serves_its_footer_page_beside_the_bundle(
+    slug: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hub product's bundle is served at build.qontinui.io/<slug>/ and its
+    footer page sits beside it: without publish.public_url the published
+    notice would name files in the hub clone and og:image would be relative."""
+    monkeypatch.setenv("STUDIO_HUB_CLONE", str(tmp_path / "hub-publish"))
+    monkeypatch.setenv("STUDIO_HUB_PREVIEW", str(tmp_path / "hub-preview"))
+    product = load_product(REPO / "products" / f"{slug}.yaml")
+    base = f"https://build.qontinui.io/{slug}/"
+    assert product.publish.public_url == base
+    assert product.record_url() == base + "how-it-was-built.html"
 
 
 def test_cli_build_exits_4_without_a_record(
