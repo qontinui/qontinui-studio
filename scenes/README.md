@@ -228,10 +228,11 @@ The validator also checks that:
   it (by time, then by position in the trace), and each question is answered
   at most once;
 - a gate is registered, observed and cleared at most once each; it is
-  registered by a session that has not ended, observed and cleared only after
-  it is registered, observed (when it is) before it clears, and a
-  continuation starts only after its gate cleared (all by time, then by
-  position);
+  registered by a session that has not ended and has started (a session with
+  no start event runs from the beginning), observed and cleared only after it
+  is registered, observed (when it is) before it clears, and a continuation
+  starts only after its gate cleared, one continuation per gate (all by time,
+  then by position);
 - in the merge train, a resolution answers an unresolved conflict of the same
   PR, a conflicted PR is neither rebased nor landed until it is resolved, and
   a PR lands at most once;
