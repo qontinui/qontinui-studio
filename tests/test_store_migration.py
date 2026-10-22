@@ -283,3 +283,72 @@ def test_a_v6_database_without_compile_checkout_gains_it(tmp_path: Path) -> None
     again.close()
     third = connect(db)
     assert third.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
+COMPILE_COLUMNS = (
+    "compile_target",
+    "compile_slot",
+    "compile_spec_sha256",
+    "compile_inputs_json",
+    "compile_checkout",
+)
+LAUNCH_NOTICE_COLUMNS = ("unpublish_command", "public_url")
+
+
+def _assert_complete_v7(conn: sqlite3.Connection) -> None:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+    batches = {r[1] for r in conn.execute("PRAGMA table_info(batches)")}
+    assert set(COMPILE_COLUMNS) <= batches
+    launches = {r[1] for r in conn.execute("PRAGMA table_info(launches)")}
+    assert set(LAUNCH_NOTICE_COLUMNS) <= launches
+    indexes = {r[1] for r in conn.execute("PRAGMA index_list(batches)")}
+    assert "batches_compile" in indexes
+
+
+def _restamp(db: Path, version: int, *statements: str) -> None:
+    """A complete database taken back to an earlier shape, then stamped."""
+    conn = connect(db)
+    for sql in statements:
+        conn.execute(sql)
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+    conn.close()
+
+
+def test_a_main_v5_database_gains_the_compile_columns(tmp_path: Path) -> None:
+    """Main's v5 holds the launch notice columns and no compile columns; v6 and
+    v7 add the compile step on top of it."""
+    db = tmp_path / ".studio" / "studio.db"
+    _restamp(
+        db,
+        5,
+        "DROP INDEX batches_compile",
+        *(f"ALTER TABLE batches DROP COLUMN {c}" for c in COMPILE_COLUMNS),
+    )
+    _assert_complete_v7(connect(db))
+
+
+_DROP_LAUNCH_NOTICE = tuple(f"ALTER TABLE launches DROP COLUMN {c}" for c in LAUNCH_NOTICE_COLUMNS)
+
+
+@pytest.mark.parametrize(
+    ("version", "statements"),
+    [
+        pytest.param(
+            5,
+            ("ALTER TABLE batches DROP COLUMN compile_checkout", *_DROP_LAUNCH_NOTICE),
+            id="old-branch-v5-without-compile_checkout",
+        ),
+        pytest.param(5, _DROP_LAUNCH_NOTICE, id="old-branch-v5-with-compile_checkout"),
+        pytest.param(6, _DROP_LAUNCH_NOTICE, id="old-branch-v6"),
+    ],
+)
+def test_a_pre_rebase_compile_database_ends_complete(
+    tmp_path: Path, version: int, statements: tuple[str, ...]
+) -> None:
+    """This phase's commits before the rebase onto main's v5 stamped the compile
+    columns v5 and ``compile_checkout`` v6, and never ran main's v5. Each such
+    shape opens without error and ends with every column of v7."""
+    db = tmp_path / ".studio" / "studio.db"
+    _restamp(db, version, *statements)
+    _assert_complete_v7(connect(db))
