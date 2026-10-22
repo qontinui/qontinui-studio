@@ -19,7 +19,7 @@ from qontinui_studio import marker
 from qontinui_studio.adapters import AdapterSet, GenerationRequest, build_adapter, build_adapters
 from qontinui_studio.briefs import load_brief
 from qontinui_studio.errors import AdapterDisabledError, ProviderBusy, ProviderDeferred
-from qontinui_studio.gateway import GatewayState, read_gateway_state
+from qontinui_studio.gateway import GATEWAY_CAPABLE_SINCE_MS, GatewayState, read_gateway_state
 from qontinui_studio.pipeline import Context, _request_for, new_batch
 from qontinui_studio.providers import load_providers
 from qontinui_studio.store import SCHEMA_VERSION, connect
@@ -203,6 +203,35 @@ def test_a_404_from_an_identified_runner_is_not_declared(host: ImageHost) -> Non
         "route_absent",
         imagehost.RUNNER_GIT_SHA,
     )
+
+
+@pytest.mark.local_http
+@pytest.mark.parametrize(
+    ("build_id", "state", "source"),
+    [
+        (f"x-{GATEWAY_CAPABLE_SINCE_MS - 1}", "not_declared", "route_absent"),
+        (f"x-{GATEWAY_CAPABLE_SINCE_MS}", "unknown", "route_absent_gateway_capable"),
+        ("7764c4cd0-1792609379584", "unknown", "route_absent_gateway_capable"),
+        ("7764c4cd0", "unknown", "route_absent_gateway_capable"),
+        ("7764c4cd0-17926093", "unknown", "route_absent_gateway_capable"),
+    ],
+    ids=["just-before", "at-the-gateway", "this-fleet's-build", "no-stamp", "short-stamp"],
+)
+def test_a_404_reads_not_declared_only_from_a_build_that_predates_the_gateway(
+    host: ImageHost, build_id: str, state: str, source: str
+) -> None:
+    """qontinui-runner#2138 ships a model gateway but no HTTP read of it: a 404 from
+    a build that may carry it must fail closed, or a declared gateway is bypassed."""
+    host.queue(
+        imagehost.runner_health(build_id=build_id), imagehost.json_reply(404, {"error": "x"})
+    )
+    got = read_gateway_state(host.v1_url.removesuffix("/v1"))
+    assert (got.state, got.source, got.runner_git_sha) == (
+        state,
+        source,
+        imagehost.RUNNER_GIT_SHA,
+    )
+    assert (got.refusal() is None) == (state == "not_declared")
 
 
 @pytest.mark.local_http
