@@ -444,6 +444,46 @@ def test_page_health_gate() -> None:
     assert down.failed and "probe failed" in down.detail
 
 
+def _observation(status: str, summary: object = None) -> dict[str, object]:
+    """A page-health answer in UI Bridge's Observation envelope, as
+    @qontinui/ui-bridge 0.33's `sdk/page-health` producer serves it."""
+    data: dict[str, object] = {
+        "status": status,
+        "provenance": {"producer": {"id": "sdk/page-health"}},
+    }
+    if summary is not None:
+        data["value"] = {"summary": summary, "findings": []}
+    return {"success": True, "data": data}
+
+
+def test_page_health_gate_reads_the_observation_envelope() -> None:
+    site = _site(**PREVIEW)
+    for summary in ("OK", "WARNING"):
+        ok = d7_page_health(site, lambda u, s=summary: _observation("measured", s))
+        assert ok.outcome == "pass" and summary in ok.detail
+    crit = d7_page_health(site, lambda u: _observation("measured", "CRITICAL"))
+    assert crit.failed and "'CRITICAL'" in crit.detail
+
+
+def test_page_health_gate_refuses_an_unmeasured_observation() -> None:
+    """A bridge that could not see the page is UNKNOWN, never clean — even
+    when the envelope still carries a value that reads OK."""
+    site = _site(**PREVIEW)
+    for status in ("unmeasured", "unknown", "error", ""):
+        bad = d7_page_health(site, lambda u, s=status: _observation(s, "OK"))
+        assert bad.failed and "unreadable page-health answer" in bad.detail
+    no_value = d7_page_health(site, lambda u: _observation("measured"))
+    assert no_value.failed and "unreadable page-health answer" in no_value.detail
+    lower = d7_page_health(site, lambda u: _observation("measured", "ok"))
+    assert lower.outcome == "pass"
+    for data in ({"value": {"summary": "OK"}}, {"status": "measured", "value": "OK"}):
+        odd = d7_page_health(site, lambda u, d=data: {"success": True, "data": d})
+        assert odd.failed and "unreadable page-health answer" in odd.detail
+    wrapped = {**_observation("measured", "OK"), "success": False}
+    refused = d7_page_health(site, lambda u: wrapped)
+    assert refused.failed and "unreadable page-health answer" in refused.detail
+
+
 def test_d6_label_wording(records: tuple[AssetRecord, VariantRecord]) -> None:
     asset, variant = records
     deco = Slot(width=4, height=4, category="decorative")

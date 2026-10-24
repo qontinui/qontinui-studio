@@ -234,6 +234,25 @@ def _shown_summary(summary: str) -> str:
     return f"'{summary}'" if re.fullmatch(r"[A-Za-z_]{1,32}", summary) else omitted(summary)
 
 
+def _page_health_summary(data: object) -> object:
+    """The summary word in a page-health ``data`` payload, or ``None``.
+
+    UI Bridge answers page-health in the Observation envelope
+    (``{"status": "measured", "value": {"summary": ...}, "provenance": ...}``);
+    older bridges answered the bare value (``{"summary": ...}``). Only a
+    ``measured`` envelope carries a summary: any other status is the bridge
+    saying it could not see the page, which is UNKNOWN and so yields ``None``
+    (the gate refuses) rather than being read as clean."""
+    if not isinstance(data, dict):
+        return None
+    if "status" in data or "value" in data:
+        if data.get("status") != "measured":
+            return None
+        value = data.get("value")
+        return value.get("summary") if isinstance(value, dict) else None
+    return data.get("summary")
+
+
 def page_health_gate(
     subject: str,
     ui_bridge_url: str | None,
@@ -254,8 +273,7 @@ def page_health_gate(
         )
     if not isinstance(body, dict):
         return GateResult("d7_page_health", subject, "fail", "page-health answered a non-object")
-    data = body.get("data")
-    summary = data.get("summary") if isinstance(data, dict) else None
+    summary = _page_health_summary(body.get("data"))
     if body.get("success") is not True or not isinstance(summary, str):
         return GateResult(
             "d7_page_health", subject, "fail", f"unreadable page-health answer: {omitted(body)}"
