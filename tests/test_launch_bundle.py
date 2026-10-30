@@ -16,12 +16,13 @@ import pytest
 from PIL import Image
 
 from qontinui_studio.errors import ConfigError, JournalError
-from qontinui_studio.launch.bundle import FOOTER_TEXT, img_media_id
+from qontinui_studio.launch.bundle import FOOTER_TEXT, film_caption, img_media_id
 from qontinui_studio.launch.kit import KitOptions, run_kit
 from qontinui_studio.launch.posts import NETWORKS
 from qontinui_studio.launch.product import load_product
 from qontinui_studio.launch.publish import (
     LaunchNotPublished,
+    gate_public_text,
     publish_launch,
     recover_all_launches,
     recover_launches,
@@ -798,6 +799,33 @@ def test_landing_page_images_are_eager_with_sha_on_every_url(
     for path, sha in shas.items():
         for ref in re.findall(re.escape(path) + r"(\?sha=[0-9a-f]*)?['\"\s,]", index):
             assert ref == f"?sha={sha}", (path, ref)
+
+
+def test_film_caption_names_a_walkthrough_only_when_the_film_holds_one(
+    make_context: Callable[..., Context], studio_root: Path, record_file: Path
+) -> None:
+    """A capture-less launch's film is the build-record summary alone, so the
+    landing page may not call it a walkthrough, and the public_text gate's
+    re-render from the manifest must reproduce that caption."""
+    ctx = make_context(**preview_ctx(studio_root))
+    product_path = write_product(studio_root, capture=False)
+    run = run_kit(ctx, product_path, KitOptions(), public_client())
+    manifest = run.bundle.manifest
+    assert "walkthrough" in manifest["film"]["omitted"]
+    index = (run.bundle.out_dir / "index.html").read_text()
+    assert "<video " in index
+    assert "A summary of the product&#x27;s build record." in index
+    assert "walkthrough" not in index.lower()
+    gate = gate_public_text(run.bundle.out_dir, manifest, run.product)
+    assert gate.outcome == "pass", gate.detail
+
+    malformed = {**manifest, "film": {**manifest["film"], "segments": [1]}}
+    gate = gate_public_text(run.bundle.out_dir, malformed, run.product)
+    assert gate.outcome == "fail" and "cannot re-render" in gate.detail
+
+    assert "running product" in film_caption({"segments": [{"name": "walkthrough"}]})
+    assert "running product" in film_caption({"segments": [{"name": "walkthrough-stills"}]})
+    assert "running product" not in film_caption({"segments": [{"name": "summary"}]})
 
 
 @pytest.mark.parametrize("source", ["file", "authed", "unversioned"])

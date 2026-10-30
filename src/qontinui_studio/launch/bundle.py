@@ -267,12 +267,22 @@ def how_it_was_built(product: LaunchProduct, outcome: FetchOutcome, record_url: 
     )
 
 
+def film_caption(film: dict[str, Any]) -> str:
+    """The line under the film. It names a walkthrough only when a walkthrough
+    segment is in this film: a capture-less launch holds the build-record
+    summary alone, and the page must not claim otherwise (D6)."""
+    names = [str(s.get("name") or "") for s in film.get("segments") or []]
+    if any(name.startswith("walkthrough") for name in names):
+        return "A walkthrough of the running product and its build record."
+    return "A summary of the product's build record."
+
+
 def landing_page(
     product: LaunchProduct,
     facts: list[Fact],
     screenshots: list[tuple[str, str | None, str, tuple[int, int]]],
     hero: tuple[str, str, str, tuple[int, int]] | None,
-    video: str | None,
+    film: dict[str, Any] | None,
     record_url: str | None,
     og_image: str,
 ) -> str:
@@ -301,11 +311,12 @@ def landing_page(
         links.append(f"<a href='{_e(product.homepage)}'>Open {_e(product.title)}</a>")
     links += [f"<a href='https://github.com/{_e(r)}'>{_e(r)}</a>" for r in product.repos]
     parts.append("<p>" + " · ".join(links) + "</p>")
-    if video:
+    video = film.get("path") if film else None
+    if film and video:
         parts.append(
             "<h2>Watch</h2>"
             f"<video controls preload='metadata' src='{_e(video)}'></video>"
-            "<p class='src'>A walkthrough of the running product and its build record.</p>"
+            f"<p class='src'>{_e(film_caption(film))}</p>"
         )
     if screenshots:
         parts.append("<h2>Screenshots</h2><div class='grid'>")
@@ -365,10 +376,11 @@ def render_pages(
     product: LaunchProduct,
     outcome: FetchOutcome,
     images: list[dict[str, Any]],
-    video_rel: str | None,
+    film: dict[str, Any] | None,
 ) -> dict[str, str]:
     """The two pages, from exactly these inputs: the product definition, the
-    record (or its absence), the bundle's image entries and the film path.
+    record (or its absence), the bundle's image entries and the film's manifest
+    entry.
 
     It is the ONE renderer: assembly writes its output, and the public_text
     gate re-runs it — once to prove the bundle's pages are this render, and
@@ -403,7 +415,7 @@ def render_pages(
                 img_media_id(hero[0]),
                 image_size(out_dir / hero[0]),
             ),
-            video_rel,
+            film,
             record_url,
             image_ref(out_dir, "social/og.png"),
         ),
@@ -609,7 +621,6 @@ def _assemble_into(
     write_posts(out_dir / "posts", product, by_key, record_url)
 
     # ---- film ---------------------------------------------------------------------------
-    video_rel: str | None = None
     film: dict[str, Any] | None = None
     if make_video and isinstance(outcome, FetchedRecord):
         try:
@@ -624,7 +635,6 @@ def _assemble_into(
                 replay,
                 record_url,
             )
-            video_rel = "video/launch.mp4"
         except StudioError as e:
             notes.append(f"film not rendered: {e}")
     elif make_video:
@@ -638,7 +648,7 @@ def _assemble_into(
         image["sha256"] = sha256_file(out_dir / image["path"])
 
     # ---- pages ------------------------------------------------------------------------
-    for name, text in render_pages(out_dir, product, outcome, images, video_rel).items():
+    for name, text in render_pages(out_dir, product, outcome, images, film).items():
         (out_dir / name).write_text(text, encoding="utf-8")
 
     manifest: dict[str, Any] = {

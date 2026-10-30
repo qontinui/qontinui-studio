@@ -719,19 +719,19 @@ def gate_public_text(bundle: Path, manifest: dict[str, Any], product: LaunchProd
     hostname = socket.gethostname().lower()
     images = list(manifest.get("images") or [])
     film = manifest.get("film")
-    video_rel = film.get("path") if isinstance(film, dict) else None
+    film = film if isinstance(film, dict) else None
     problems: list[str] = []
     try:
         outcome = _bundle_outcome(bundle, manifest)
-        rendered = render_pages(bundle, product, outcome, images, video_rel)
+        rendered = render_pages(bundle, product, outcome, images, film)
         placeholder = render_pages(
             bundle,
             product,
             redacted(outcome) if isinstance(outcome, FetchedRecord) else outcome,
             images,
-            video_rel,
+            film,
         )
-    except (OSError, ValueError, KeyError, TypeError, StudioError) as e:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, StudioError) as e:
         return GateResult("public_text", subject, "fail", f"cannot re-render the pages: {e}")
     for page, text in rendered.items():
         try:
