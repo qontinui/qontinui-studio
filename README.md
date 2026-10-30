@@ -559,6 +559,10 @@ facade's loopback bind is.
   preference, number of variants and optional library `tags`. The
   `style-v1-*.yaml` briefs generate the `studio-style-v1` reference set. They
   are campaign-only, local GPU only, and use bulk priority.
+- `targets/*.yaml`: `studio compile` targets — a consumer repository
+  (`owner/name`), where its slot specs live in a checkout (`slots_dir`) and where
+  derivatives land (`publish_dir`), its providers, its N, its D7 preview and
+  per-slot routes. See "Image slots" below.
 - `schemas/import-manifest.schema.json`: the `library import` manifest contract.
 - `style/`: the studio style guide (plan
   `2026-10-09-qontinui-marketing-studio-animated-process-explainers`, D4).
@@ -974,6 +978,83 @@ is refused. The script reports the keys it set, never their values. Treat the
 file like a shell profile, because `STUDIO_FFMPEG` and `STUDIO_FFPROBE` name
 binaries that get run. Keep it writable by its owner only, and make it `0600`
 if it names a key.
+
+## Image slots: `studio compile` (plan 2026-10-13 Phase 19)
+
+`studio compile --slots <checkout>/frontend/image-slots/` compiles a consumer
+repository's image slots. A slot is an `ImageSlotSpec` YAML file (qontinui-schemas,
+plan Phase 14), read through the generated pydantic model in strict mode, with the
+Rust type's cross-field rules mirrored (`compiler/specs.py`) and its RFC 8785
+content hash reproduced exactly (`compiler/jcs.py`; the tests check every golden
+the Rust fixtures pin).
+
+**What compiles.** A slot whose checkout manifest holds no binding is `missing`.
+One whose binding was made for another spec hash, compile recipe, imagery
+treatment, exemplar set or LoRA is `stale`. An input that cannot be read (the
+imagery section from coord, a LoRA or facade recipe hash from the image licence
+manifest at `$STUDIO_IMAGEGEN_DIR`) makes the slot UNKNOWN: it is never treated
+as fresh and never re-rendered on a guess (exit 8). `--changed` re-renders only
+stale bindings, as a bulk job.
+
+**Select before generating** (`compiler/target.py`):
+
+| route | for | output |
+|---|---|---|
+| `lucide` | icons (`avatar_fallback`) | no image file: a manifest entry (`route: lucide`, the icon, a `selected` binding) the consumer renders the `lucide-react` component from, written once the icon is found in the checkout's installed package |
+| `svg` | simple illustrations, by target override | none: the calling session writes `<slots_dir>/<slot>.svg` (inline, `currentColor` and `var(--qontinui-*)` only, the spec hash on the root, the IPTC marker in `<metadata>`), and studio validates it |
+| `diffusion` | rich illustration, photography, texture, scenes (`hero`, `background`, `scene`, `feature`, `og_card`) | AVIF + WebP + a JPEG (photographic roles) or PNG fallback (an `og_card` is one PNG) |
+| `traced` | flat art (`empty_state`, `onboarding`) | an SVG vtracer traces from the generated raster |
+
+`logo` and `screenshot` slots are never compiled (an identity mark; a capture,
+D6). A target overrides a route per slot.
+
+**Generate and choose.** A slot's N candidates are one studio batch through the
+provider interface, under the image-generation dial: it is read before any batch
+exists (`off` refuses with no provider call, exit 6) and again before every
+provider call. Every candidate goes to qontinui-web's content-addressed store
+(`POST /api/v1/image-assets`, kind `candidate`) and is proposed for the slot
+(`PUT /api/v1/image-assets/slot-candidates`) — only under a credential proven to
+act for the tenant that owns the target's repository (coord's author-session probe;
+an unproven owner gets no write), and never to a door that is neither https nor
+loopback. The pick is the launch kit's lowest
+index, recorded as `pick: unjudged (Phase 20 not landed)`. A candidate whose
+provenance does not show a slot's LoRA applied, or a facade result with no recipe
+hash, is never bound. An `alt: required` slot waits (exit 7) for an alt text
+written for the pick (`--alt-texts`); its batch resumes without regenerating.
+
+**One publish path.** The target becomes a `kind: product` Site whose
+`publish_dir` is inside the checkout, and `publish_batch` publishes the pick:
+the slot's own id (`runs.active.idle`) is the site slot, every file's stem
+(`runs.active.idle.webp`) and the manifest key a consumer reads; a slot name is
+always one path component (no separator, no leading or doubled dot).
+D5/D6/D7 unchanged, the journalled swap, and `studio-manifest.json`, whose entry
+gains `slot_id`, `slot_spec_sha256`, the `binding` (an `ImageSlotProvenance`:
+asset, spec, recipe, imagery, exemplar and LoRA digests, alt text) and the `pick`.
+On a checkout site the manifest vouches for the files it records, so a slot
+another studio published (another machine, landed through a PR) is replaced, and
+a file it does not record is still a refused `foreign_file`. A checkout site's
+publications are scoped to THAT checkout's publish dir: compiling into one worktree
+never moves, deletes or supersedes what another worktree holds. Studio writes only
+into a linked worktree (never a shared primary checkout), and its lock lives in a
+per-user directory, so the checkout carries only derivatives and the manifest. An
+entry no spec declares any more is removed, with the files it names, in the same
+compile; a file holding other bytes is kept and reported. A compile batch is never driven by `jobs run`, and `publish` /
+`unpublish --batch` refuse it: it is reversed by reverting its PR.
+
+**Evidence and the PR.** Each run writes `.studio/compile/<target>/report.json`
+and `evidence.md` (the PR body: route, pick, binding, candidates, derivatives with
+the marker, gates). Before/after per breakpoint x theme (Phase 18 on Phase 9's
+capture matrix) and per-slot values (Phase 15) are typed UNKNOWN
+(`capability_unavailable_in_build`) naming those phases until they land. Studio
+runs no git or gh: the session commits the publish dir and opens the PR (the
+`image-compile` skill).
+
+**Overnight.** `studio compile-schedule --target <id> --install` registers one
+runner-scheduler task, `image-compile-<id>` (`--check`, `--uninstall`,
+`--dry-run`; never an OS cron). Nightly it spawns an agent session that allocates
+a worktree of the target and one of qontinui at origin/main (its `docker/imagegen`
+is the recipe and LoRA source; `--imagegen-dir` pins one instead), runs `studio
+compile --changed`, and opens the PR when anything changed; the facade defers bulk work outside its window and the batch resumes.
 
 ## Development
 

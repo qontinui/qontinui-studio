@@ -1,0 +1,62 @@
+# A feature illustration bound to a generated asset: expected German text in the
+# image, two explicit safe areas, every threshold override, an exemplar set, a
+# house LoRA, a requirement reference and a non-integer device pixel ratio. The
+# binding is current and meets every obligation a current binding has.
+# content-sha256: e3f54749f59d67e900bf6129590b5f2b01b64fb8de971c42174fdcf42abe8bf4
+slot: marketing.pricing.feature
+role: feature
+job: Show that one plan covers a whole team, with the tier name painted on the card.
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [375, 834, 1280]
+  themes: [dark, light]
+  dpr: [1, 2.625]
+aspect:
+  preferred: 3/2
+  allowed: [1/1, 4/5]
+safe_areas:
+  kind: explicit
+  regions:
+    - {x: 0, y: 0, width: 1, height: 0.25}
+    - {x: 0.6, y: 0.7, width: 0.4, height: 0.3}
+focal:
+  region: {x: 0.25, y: 0.3, width: 0.5, height: 0.45}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: marketing-features
+  lora: qontinui-house-v1
+content:
+  must:
+    - a stack of three cards
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: expected
+  text: Team
+  locale: de-CH
+alt:
+  kind: required
+thresholds:
+  kind: overrides
+  min_effective_resolution: 1
+  max_effective_resolution: 2.5
+  max_aspect_delta: 0.02
+  max_bytes: 180000
+  max_palette_delta_e: 12.5
+  min_palette_coverage: 0.85
+  min_text_over_image_contrast: 4.5
+  text_over_image_percentile: 5
+  min_transparent_edge_contrast: 3
+requirement_ref: REQ-PRICING-7
+provenance:
+  asset_sha256: 3a7da8fba9fa08b61398c280fed9e8ac91a7d67390343330dae4620053ca511b
+  spec_sha256: e3f54749f59d67e900bf6129590b5f2b01b64fb8de971c42174fdcf42abe8bf4
+  source: generated
+  ai_generated: true
+  recipe_sha256: 9133eb055c2fa96c1985a4def6c14568644f62cb331bc138e389517dfc304b1a
+  imagery_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81
+  exemplars_sha256: 6ab4661f7091fd33c9d8fcfec64dab0f74c19360f6f4716e8aa240aae5a4b398
+  lora_sha256: 80f9dae22f20c24da7251311e9f5807ac1f24dcc0ca555b07b21d706e155a0a0
+  alt_text: Three overlapping pricing cards, the front one labelled Team.

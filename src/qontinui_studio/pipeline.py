@@ -662,10 +662,12 @@ def resume_all(ctx: Context, publish: bool = True) -> list[BatchOutcome]:
     Recovery runs per site; a site that cannot be recovered only holds back
     the batches that target it. One bad batch never stops the others."""
     report = recover(ctx.conn, ctx.sites, ctx.notifier, root=ctx.workspace.root)
+    # A compile batch (``studio compile``) publishes only into the checkout a
+    # compile run names: it is resumed by ``studio compile``, never here.
     rows = ctx.conn.execute(
         "SELECT id, targets_json, status, no_publish FROM batches "
-        "WHERE status = 'generating' OR (status = 'generated' AND no_publish = 0) "
-        "ORDER BY created_at"
+        "WHERE (status = 'generating' OR (status = 'generated' AND no_publish = 0)) "
+        "AND compile_target IS NULL ORDER BY created_at"
     ).fetchall()
     outcomes: list[BatchOutcome] = []
     for r in rows:

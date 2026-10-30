@@ -26,9 +26,20 @@ SiteKind = Literal["demo", "real_business", "product"]
 SlotCategory = Literal[
     "decorative", "illustration", "food", "premises", "people", "product_screenshot"
 ]
-ExportFormat = Literal["webp", "avif", "png", "jpeg"]
+# ``svg`` is a vtracer trace of the slot's raster crop (``studio compile``'s
+# ``traced`` route, plan 2026-10-13 Phase 19 step 2).
+ExportFormat = Literal["webp", "avif", "png", "jpeg", "svg"]
 
 ID_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+# A slot name is a published file's stem (``<slot>.<ext>``) and a manifest key.
+# It admits every image-slot id the ImageSlotSpec contract allows (qontinui-schemas
+# SLUG_PATTERN: lowercase segments joined by '.', '-' or '_', e.g.
+# ``runs.active.idle``) as well as every name the ID pattern admits. A '.' is
+# always followed by a letter or digit, so a name is never '..'-anything, never ends
+# in '.', and never begins with one; '/' and '\\' never occur. It is therefore a
+# single path component that resolves inside the publish dir.
+SLOT_NAME = r"[a-z0-9](?:[a-z0-9_-]|\.[a-z0-9])*"
+SLOT_PATTERN = rf"^{SLOT_NAME}$"
 # GitHub ``owner/name``: coord refuses any other spelling of a repo for the
 # image_generation dial (``repo_not_owner_name``).
 REPO_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$"
@@ -178,6 +189,14 @@ class Site(BaseModel):
     # per-repo override governs generation for this site. Unset reads the
     # tenant-wide level (plan 2026-10-13 Phase 12 step 3).
     repo: str | None = Field(default=None, pattern=REPO_PATTERN)
+    # True for a ``studio compile`` target (plan 2026-10-13 Phase 19 step 4):
+    # ``publish_dir`` is inside a CHECKOUT of ``repo`` that the calling session
+    # allocated, and what "live" means there is what that checkout holds. The
+    # site's own ``studio-manifest.json`` there vouches for the bytes it
+    # records, so a slot file a studio publication placed — on this machine or
+    # another, reviewed and landed through a PR — is the studio's to replace.
+    # Never set in sites/*.yaml: a compile target is materialised per checkout.
+    checkout: bool = False
     # The label a demo/template site must show beside AI imagery (D6). On other
     # site kinds AI imagery still carries ``ai_label`` (EU synthetic-content
     # transparency).
@@ -219,8 +238,8 @@ class Site(BaseModel):
     @model_validator(mode="after")
     def _checks(self) -> Site:
         for name in self.slots:
-            if not re.fullmatch(ID_PATTERN, name):
-                raise ValueError(f"bad slot name '{name}' (must match {ID_PATTERN})")
+            if not re.fullmatch(SLOT_PATTERN, name):
+                raise ValueError(f"bad slot name '{name}' (must match {SLOT_PATTERN})")
         preview_fields = {
             "ui_bridge_url": self.ui_bridge_url,
             "preview_url": self.preview_url,
@@ -294,6 +313,11 @@ def load_site(path: Path) -> Site:
         raise ConfigError(f"cannot read {path}: {e}") from e
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: expected a mapping")
+    if "checkout" in raw:
+        raise ConfigError(
+            f"{path}: 'checkout' is never configured: a checkout site is a `studio compile` "
+            "target (targets/*.yaml), materialised for the checkout a run names"
+        )
     for key in ("publish_dir", "preview_dir"):
         value = raw.get(key)
         if isinstance(value, str) and not Path(value).is_absolute():
@@ -320,7 +344,7 @@ def load_sites(directory: Path, root: Path | None = None) -> dict[str, Site]:
         if site.id in sites:
             raise ConfigError(f"duplicate site id '{site.id}' ({path})")
         sites[site.id] = site
-    _check_cross_site(sites)
+    check_cross_site(sites)
     return sites
 
 
@@ -329,7 +353,7 @@ def _overlaps(a: Path, b: Path) -> bool:
     return a == b or a.is_relative_to(b) or b.is_relative_to(a)
 
 
-def _check_cross_site(sites: dict[str, Site]) -> None:
+def check_cross_site(sites: dict[str, Site]) -> None:
     """A preview dir is rewritten on every publish of its site, under that
     site's lock only, so it must not overlap ANY site's publish dir or another
     site's preview dir; publish dirs must not overlap each other either."""

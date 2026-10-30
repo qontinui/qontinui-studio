@@ -1,0 +1,42 @@
+# Bound to a generated asset. The pipeline wrote `provenance`, including the
+# text alternative the slot's `alt: required` asks for. `spec_sha256` is this
+# spec's own content hash, so the file is also a golden vector for any other
+# implementation of the hash.
+# content-sha256: 71d882ba7dc42635fe0328d2c933889db5de6c98410daa4a8fe95a4051eee4ab
+slot: onboarding.connect-runner
+role: onboarding
+job: Show that the desktop runner and the web dashboard are one system once connected.
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [768, 1280]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 3/2
+  allowed: []
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.2, y: 0.25, width: 0.6, height: 0.5}
+  must_survive_crop: false
+style:
+  imagery: domain_spec/visual-system#imagery
+content:
+  must:
+    - a desktop window linked to a browser window
+  must_not:
+    - people
+text_in_image:
+  kind: allowed
+alt:
+  kind: required
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: a0c985b46a58c60b0db92ef951994fc2bff66f5b51f817b890240a917af68ed3
+  spec_sha256: 71d882ba7dc42635fe0328d2c933889db5de6c98410daa4a8fe95a4051eee4ab
+  source: generated
+  ai_generated: true
+  recipe_sha256: b1173b23c56839e108cf789ef3545dff11d0a92c5ed63223849b1b9a48fa0e1f
+  imagery_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81
+  alt_text: A desktop window and a browser window joined by a glowing line.

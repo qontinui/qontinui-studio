@@ -1,0 +1,38 @@
+# A product screenshot bound to a capture of the running product, which is the
+# obligation a current screenshot binding has. Non-integer device pixel ratio.
+# content-sha256: ca9831a3ddfcd23ad41039a7865ca431bc33832150517b6063525037d9193d64
+slot: docs.runner.screenshot
+role: screenshot
+job: Show the runner's session list exactly as an operator sees it after connecting.
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [1280, 1920]
+  themes: [dark]
+  dpr: [1.25, 2]
+aspect:
+  preferred: 16/10
+  allowed: []
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0, y: 0, width: 1, height: 1}
+  must_survive_crop: false
+style:
+  imagery: domain_spec/visual-system#imagery
+content:
+  must:
+    - the runner session list
+  must_not:
+    - personal data
+text_in_image:
+  kind: allowed
+alt:
+  kind: text
+  text: The runner's session list with three sessions, one of them running.
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: e7c1023d8e8bac5af83b3cde38b6bed3e2bea33bc09db6ccf9dacd74a6cda112
+  spec_sha256: ca9831a3ddfcd23ad41039a7865ca431bc33832150517b6063525037d9193d64
+  source: captured
+  ai_generated: false
