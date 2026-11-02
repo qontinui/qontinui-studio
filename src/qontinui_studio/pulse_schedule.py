@@ -32,7 +32,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -78,6 +78,22 @@ def pulse_prompt(command: str) -> str:
         "other code = a setup step failed. You change no files yourself; do not start the script twice, do not "
         "retry, post nothing, open no PR, register no gate."
     )
+
+
+class TaskBody(Protocol):
+    """What :func:`install` / :func:`check` / :func:`drift` need of a task:
+    the pulse's :class:`Intended`, or ``studio compile``'s overnight task
+    (``qontinui_studio.compiler.schedule``)."""
+
+    @property
+    def cron(self) -> str: ...
+
+    @property
+    def enabled(self) -> bool: ...
+
+    def create_body(self) -> dict[str, Any]: ...
+
+    def update_body(self) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -147,7 +163,13 @@ def cron_for(at: str, day: str) -> str:
 
 
 class RunnerScheduler:
-    def __init__(self, base: str = DEFAULT_RUNNER, http: httpx.Client | None = None) -> None:
+    """The runner's scheduler API, for the ONE task named ``name`` (the upsert
+    key); it never reads or touches a task with any other name."""
+
+    def __init__(
+        self, base: str = DEFAULT_RUNNER, http: httpx.Client | None = None, name: str = TASK_NAME
+    ) -> None:
+        self.name = name
         self.base = base.rstrip("/")
         # The runner's /health has been sampled at 10 s on a loaded box; size for that tail.
         self.http = http or httpx.Client(timeout=20.0)
@@ -191,7 +213,7 @@ class RunnerScheduler:
                 EXIT_UNKNOWN,
                 "UNKNOWN -- GET /scheduler/tasks answered without the runner's {success, data: [...]} envelope",
             )
-        return [t for t in body["data"] if isinstance(t, dict) and t.get("name") == TASK_NAME]
+        return [t for t in body["data"] if isinstance(t, dict) and t.get("name") == self.name]
 
     def one(self) -> dict[str, Any] | None:
         tasks = self.named()
@@ -199,7 +221,7 @@ class RunnerScheduler:
             ids = ", ".join(str(t.get("id")) for t in tasks)
             raise ScheduleError(
                 EXIT_CONFLICT,
-                f"{len(tasks)} tasks are named {TASK_NAME} ({ids}); remove the extras with --uninstall and --install again",
+                f"{len(tasks)} tasks are named {self.name} ({ids}); remove the extras with --uninstall and --install again",
             )
         return tasks[0] if tasks else None
 
@@ -213,7 +235,7 @@ class RunnerScheduler:
         self._call("DELETE", f"/scheduler/tasks/{task_id}")
 
 
-def drift(task: dict[str, Any], intended: Intended) -> list[str]:
+def drift(task: dict[str, Any], intended: TaskBody) -> list[str]:
     """How the stored task differs from the intended body (empty: none)."""
     out: list[str] = []
     want = intended.update_body()
@@ -239,7 +261,7 @@ def drift(task: dict[str, Any], intended: Intended) -> list[str]:
     return out
 
 
-def install(scheduler: RunnerScheduler, intended: Intended) -> str:
+def install(scheduler: RunnerScheduler, intended: TaskBody) -> str:
     task = scheduler.one()
     if task is None:
         scheduler.create(intended.create_body())
@@ -247,7 +269,7 @@ def install(scheduler: RunnerScheduler, intended: Intended) -> str:
         if task is None:
             raise ScheduleError(
                 EXIT_CONFLICT,
-                "MISMATCH -- the create was accepted but no task named factory-pulse reads back",
+                f"MISMATCH -- the create was accepted but no task named {scheduler.name} reads back",
             )
         if not intended.enabled:
             scheduler.update(str(task["id"]), {"enabled": False})
@@ -268,12 +290,12 @@ def install(scheduler: RunnerScheduler, intended: Intended) -> str:
     return f"{verb} id={task.get('id')} enabled={task.get('enabled')} cron={intended.cron} next_run={task.get('nextRun')}"
 
 
-def check(scheduler: RunnerScheduler, intended: Intended) -> tuple[int, str]:
+def check(scheduler: RunnerScheduler, intended: TaskBody) -> tuple[int, str]:
     task = scheduler.one()
     if task is None:
         return (
             EXIT_ABSENT,
-            f"ABSENT -- no task named {TASK_NAME} (fix: studio pulse schedule --install)",
+            f"ABSENT -- no task named {scheduler.name} (fix: rerun with --install)",
         )
     lines = [
         f"PRESENT id={task.get('id')}",
@@ -292,9 +314,10 @@ def uninstall(scheduler: RunnerScheduler) -> str:
         scheduler.delete(str(t["id"]))
     if scheduler.named():
         raise ScheduleError(
-            EXIT_CONFLICT, "MISMATCH -- a task named factory-pulse is still listed after the delete"
+            EXIT_CONFLICT,
+            f"MISMATCH -- a task named {scheduler.name} is still listed after the delete",
         )
-    return f"REMOVED {len(tasks)} task(s) named {TASK_NAME}"
+    return f"REMOVED {len(tasks)} task(s) named {scheduler.name}"
 
 
 def dry_run(intended: Intended) -> str:

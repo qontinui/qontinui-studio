@@ -1,0 +1,47 @@
+# A binding left STALE by a later edit. The asset was bound to the earlier
+# version declared below, where `alt` was `decorative`: its spec_sha256 is that
+# version's hash, and it met every obligation then (a decorative image owes no
+# alt_text). `alt` has since become `required`. A current binding would owe an
+# alt_text; a stale one owes the spec only its own consistency, so this spec is
+# valid. The fixture test rebuilds the earlier version and checks all of that.
+# binding: stale
+# earlier-version: alt = {"kind": "decorative"}
+# content-sha256: bd6fb9e376a7885f5b98a365987fa98eb114bb399bdf16245e2217e6ecda8eeb
+slot: settings.runners.empty-state
+role: empty_state
+job: Tell an operator that no runner is connected yet, and point at how to connect one.
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [768, 1280]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 4/3
+  allowed: []
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.2, y: 0.2, width: 0.6, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+content:
+  must:
+    - an unplugged cable
+  must_not:
+    - people
+text_in_image:
+  kind: forbidden
+alt:
+  kind: required
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: 377c7e5edbbff643431e48982b6b3b8fcbca7b5584888786d70b533e1563829e
+  spec_sha256: f5ee4c1ed2e90e02b9d9470b17523a1d5977b7e2c833fe24d79743b936063fb2
+  source: generated
+  ai_generated: true
+  recipe_sha256: ff672a4af7ba8919391afa79feac64fde4f54394f2ef557b9ba69b9218f09f4b
+  imagery_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81
+  exemplars_sha256: 70258cfa680863e17853e0073f62080d7de54036a91ec1bc463e896814ee8b13

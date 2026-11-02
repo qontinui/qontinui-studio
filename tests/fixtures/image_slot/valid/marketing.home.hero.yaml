@@ -1,0 +1,47 @@
+# Every optional authored field in use: explicit safe areas under the headline,
+# expected copy in the image, a fixed text alternative, per-slot threshold
+# overrides, an exemplar set, a house LoRA and a requirement reference.
+# content-sha256: a57f9c8e1447aa5a41d5232ed04e83e98c1e4a2fd856f41942b4995792723781
+slot: marketing.home.hero
+role: hero
+job: Show one person calmly directing an automation run, so a visitor reads "this takes work off my hands".
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [390, 1024, 1440]
+  themes: [dark, light]
+  dpr: [1, 1.5, 2, 3]
+aspect:
+  preferred: 16/9
+  allowed: [4/5, 1/1]
+safe_areas:
+  kind: explicit
+  regions:
+    - {x: 0, y: 0, width: 0.45, height: 1}
+focal:
+  region: {x: 0.5, y: 0.15, width: 0.4, height: 0.7}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: marketing-heroes
+  lora: qontinui-house-v1
+content:
+  must:
+    - a laptop showing a workflow canvas
+    - one person, seen from behind
+  must_not:
+    - a recognisable face
+    - third-party logos
+text_in_image:
+  kind: expected
+  text: Ship it
+  locale: en
+alt:
+  kind: text
+  text: A person at a desk watches an automation run finish on a laptop.
+thresholds:
+  kind: overrides
+  min_effective_resolution: 1
+  max_bytes: 250000
+  min_text_over_image_contrast: 4.5
+  text_over_image_percentile: 5
+requirement_ref: REQ-MKT-12

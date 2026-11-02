@@ -1,7 +1,7 @@
 """Where a studio's config and state live, relative to one root directory.
 
-``<root>/providers.yaml``, ``<root>/sites/*.yaml``, ``<root>/briefs/*.yaml`` and
-``<root>/products/*.yaml``
+``<root>/providers.yaml``, ``<root>/sites/*.yaml``, ``<root>/briefs/*.yaml``,
+``<root>/products/*.yaml`` and ``<root>/targets/*.yaml`` (``studio compile``)
 are tracked config. ``<root>/.studio/`` is local state (gitignored): the SQLite
 file, raw downloads, processed variants, notices, the review page and
 assembled launch bundles.
@@ -62,6 +62,17 @@ class Workspace:
     @property
     def products_dir(self) -> Path:
         return self.root / "products"
+
+    @property
+    def targets_dir(self) -> Path:
+        """Compile targets: consumer repositories ``studio compile`` writes
+        image slots into (plan 2026-10-13 Phase 19)."""
+        return self.root / "targets"
+
+    def compile_dir(self, target_id: str) -> Path:
+        """A compile target's local state: its briefs, its last report and
+        its last PR evidence."""
+        return self.state_dir / "compile" / target_id
 
     @property
     def launches_dir(self) -> Path:

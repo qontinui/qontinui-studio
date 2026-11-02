@@ -1,0 +1,36 @@
+# The example spec of report 2026-10-13-image-generation-and-visual-judgment-brainstorm
+# (section 4.1), in the contract's own spelling. Unbound: no asset yet, so the UI
+# renders the slot's placeholder.
+# content-sha256: dea066ce133b8c37c3ac4b71ff6ebc1425178b835536305bc4595d52d9dc45ae
+slot: sessions.empty-state
+role: empty_state
+job: "Reassure a first-time operator that nothing is broken; point at 'Start a session'."
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 768, 1280, 1920]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 4/3
+  allowed: [1/1]
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.05, y: 0.2, width: 0.45, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+  lora: null
+content:
+  must:
+    - abstract terminal motif
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: forbidden
+alt:
+  kind: decorative
+thresholds:
+  kind: from_visual_system

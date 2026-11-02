@@ -1,5 +1,6 @@
 """Local, free post-processing: crop-to-slot, resize/upscale, WebP/AVIF export,
-background removal (optional ``rembg``), and ffmpeg trims/loops.
+SVG tracing (vtracer), background removal (optional ``rembg``), and ffmpeg
+trims/loops.
 
 Every missing tool is a typed error, never a silent skip.
 """
@@ -7,6 +8,7 @@ Every missing tool is a typed error, never a silent skip.
 from __future__ import annotations
 
 import hashlib
+import io
 import shutil
 import subprocess
 from pathlib import Path
@@ -64,6 +66,8 @@ def rembg_available() -> bool:
 
 
 def format_supported(fmt: str) -> bool:
+    if fmt == "svg":
+        return vtracer_available()
     if fmt not in _PIL_FORMAT:
         return False
     if fmt in ("avif", "webp"):
@@ -72,7 +76,66 @@ def format_supported(fmt: str) -> bool:
 
 
 _PIL_FORMAT = {"webp": "WEBP", "avif": "AVIF", "png": "PNG", "jpeg": "JPEG"}
-_EXT = {"webp": ".webp", "avif": ".avif", "png": ".png", "jpeg": ".jpg"}
+_EXT = {"webp": ".webp", "avif": ".avif", "png": ".png", "jpeg": ".jpg", "svg": ".svg"}
+
+# vtracer's parameters, written out as the image licence manifest's
+# ``empty-state`` recipe writes them (vtracer 0.6.15's documented defaults), so a
+# changed default in a later vtracer cannot change a trace unseen.
+TRACE_PARAMETERS: dict[str, object] = {
+    "colormode": "color",
+    "hierarchical": "stacked",
+    "mode": "spline",
+    "filter_speckle": 4,
+    "color_precision": 6,
+    "layer_difference": 16,
+    "corner_threshold": 60,
+    "length_threshold": 4.0,
+    "max_iterations": 10,
+    "splice_threshold": 45,
+    "path_precision": 8,
+}
+
+
+def vtracer_available() -> bool:
+    try:
+        import vtracer  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def trace_svg(img: Image.Image) -> str:
+    """Trace ``img`` to an SVG document with vtracer. Fully transparent pixels
+    are keyed out, so a matted subject carries no background into either
+    theme. The root gets a ``viewBox`` (so the trace scales to any box) beside
+    the pixel ``width``/``height`` vtracer writes (the intrinsic size a browser
+    reports as ``naturalWidth``)."""
+    try:
+        import vtracer
+    except ImportError as e:
+        raise FormatUnsupported("SVG tracing needs vtracer (a studio dependency)") from e
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    text = vtracer.convert_raw_image_to_svg(buf.getvalue(), img_format="png", **TRACE_PARAMETERS)
+    root = marker.svg_root(text.encode("utf-8"))
+    if root is None:
+        raise FormatUnsupported("vtracer did not return an SVG document")
+    root.set("viewBox", f"0 0 {img.width} {img.height}")
+    root.set("width", str(img.width))
+    root.set("height", str(img.height))
+    return marker.serialise_svg(root)
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    """(width, height) in pixels: Pillow's for a raster, the root's
+    ``width``/``height`` for an SVG trace."""
+    if path.suffix == ".svg":
+        root = marker.svg_root(path.read_bytes())
+        if root is None:
+            raise ValueError(f"{path} is not an SVG document")
+        return int(float(root.get("width", "0"))), int(float(root.get("height", "0")))
+    with Image.open(path) as img:
+        return img.size
 
 
 def export(
@@ -84,6 +147,10 @@ def export(
         raise FormatUnsupported(f"this Pillow build cannot encode '{fmt}'")
     dest = dest_stem.with_suffix(_EXT[fmt])
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "svg":
+        svg = trace_svg(img)
+        dest.write_text(marker.mark_svg(svg) if ai_generated else svg, encoding="utf-8")
+        return dest
     out = img
     if fmt == "jpeg" and out.mode not in ("RGB", "L"):
         out = out.convert("RGB")

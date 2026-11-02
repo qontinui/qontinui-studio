@@ -15,7 +15,7 @@ import yaml
 from PIL import Image
 
 from qontinui_studio.errors import ApprovalRefused, TagRefused
-from qontinui_studio.postprocess import sha256_file
+from qontinui_studio.postprocess import image_size, sha256_file
 from qontinui_studio.providers import Provider
 from qontinui_studio.sites import ID_PATTERN
 
@@ -258,8 +258,7 @@ class Library:
         created_at: datetime,
         commit: bool = True,
     ) -> VariantRecord:
-        with Image.open(path) as img:
-            width, height = img.size
+        width, height = image_size(path)
         self.conn.execute(
             "INSERT INTO variants (id, asset_uid, site, slot, campaign, format, path, width, height, "
             "sha256, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
