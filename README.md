@@ -640,7 +640,10 @@ launched in one step:
    slides, a replay slot, AI b-roll labelled in the frame, and a closing card.
    The **replay slot** is pluggable (`ReplaySegment`, or `--replay-clip FILE`).
    It holds the sibling plan's animated build-record scene. Until that scene's
-   renderer exists, the slot is omitted and `film.json` says why.
+   renderer exists, the slot is omitted and `film.json` says why. A launch with
+   no capture omits the walkthrough the same way. The caption on the landing
+   page comes from the film's segments, so it names a walkthrough only when the
+   film holds one.
 5. **Gates and publication (D7).** The pre-publication gates are:
    - `d1_record`, `d3_allowlist` and `integrity`;
    - `d1_current`: the public door is re-read at publish time, and it must still
@@ -666,7 +669,10 @@ launched in one step:
      `file://`). That covers the manifest, posts, `film.json`, captions and the
      page templates. Pages are judged by position, never by matching content:
      - the gate re-runs the one page renderer on the bundle's own inputs, which
-       proves the pages are exactly that render;
+       proves the pages are exactly that render. A launch whose pages a later
+       renderer change alters therefore fails here if it is published again,
+       naming the page. Re-run the kit to recover it. `readopt` compares bytes
+       and never renders, so it is unaffected;
      - it renders them again with every record string replaced by a
        placeholder, and scans that render.
      

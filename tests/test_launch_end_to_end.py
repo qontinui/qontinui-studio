@@ -103,6 +103,9 @@ def test_full_kit_on_a_served_static_site(
         # The replay slot is empty and says why — never faked.
         assert "sibling plan" in film["omitted"]["replay"]
         assert "video/launch.mp4" in index
+        # This film holds a walkthrough, so the page says so; the capture-less
+        # caption is pinned in test_launch_bundle.py.
+        assert "A walkthrough of the running product and its build record." in index
     else:
         assert any("film not rendered" in n for n in run.bundle.notes)
 
