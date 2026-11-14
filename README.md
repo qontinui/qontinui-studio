@@ -950,10 +950,22 @@ whose `pulse.yaml` names `products/qontinui-studio.yaml`). Before that, it keeps
 the shared checkout current by itself: on `main` with a clean tree it fetches
 `origin/main`, fast-forwards (`git merge --ff-only`) and re-runs the updated
 script once; on another branch, with uncommitted changes, or when the fetch or
-fast-forward fails, it says why and runs the current tree. It never stashes,
-resets or rebases. The task's
+fast-forward fails, it says why and runs the current tree. Untracked files
+(the runner's `.claude/` tooling, a peer's scratch) do not count as
+uncommitted changes; `git merge --ff-only` already refuses to overwrite one.
+It never stashes, resets or rebases. The task's
 working directory is the repo's primary checkout, so it runs whatever branch
 that checkout is on (normally `main`).
+
+The task inherits the runner's service `PATH`, which need not include a
+user-local install, so `poetry` and `pnpm` are looked up on `PATH` first and
+then in their installers' default homes (poetry: `$POETRY_HOME/bin`,
+`~/.local/bin`, `~/.local/share/pypoetry/venv/bin`; pnpm: `$PNPM_HOME`,
+`~/.local/share/pnpm`, `~/.local/bin`). The script's exit code is the pulse's
+own (0 it ran: ready, blocked or no-export; 1 it failed) or the failing setup
+step's: 2 a linked `scenes/node_modules` was refused, 3 the `pulse.env` file
+was refused, 4 `poetry` or `pnpm` was found in none of those places (the log
+names which).
 
 **Host settings: `pulse.env`.** The task's session inherits the runner's
 environment and nothing else, so the speech services are named in a
