@@ -1,0 +1,39 @@
+# refused-by: schema provenance.asset_sha256
+# A binding whose asset digest is not a sha256.
+slot: sessions.empty-state
+role: empty_state
+job: "Reassure a first-time operator that nothing is broken; point at 'Start a session'."
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 768, 1280, 1920]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 4/3
+  allowed: [1/1]
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.05, y: 0.2, width: 0.45, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+  lora: null
+content:
+  must:
+    - abstract terminal motif
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: forbidden
+alt:
+  kind: decorative
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: abc123
+  spec_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81
+  source: supplied
+  ai_generated: false

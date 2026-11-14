@@ -1,0 +1,41 @@
+# refused-by: rule provenance.ai_generated
+# A generated asset bound without the AI-generated marker.
+slot: sessions.empty-state
+role: empty_state
+job: "Reassure a first-time operator that nothing is broken; point at 'Start a session'."
+audience: audience_profile/external-operator
+contexts:
+  breakpoints: [360, 768, 1280, 1920]
+  themes: [dark]
+  dpr: [1, 2]
+aspect:
+  preferred: 4/3
+  allowed: [1/1]
+safe_areas:
+  kind: derived
+focal:
+  region: {x: 0.05, y: 0.2, width: 0.45, height: 0.6}
+  must_survive_crop: true
+style:
+  imagery: domain_spec/visual-system#imagery
+  exemplars: console-empty-states
+  lora: null
+content:
+  must:
+    - abstract terminal motif
+  must_not:
+    - people
+    - third-party logos
+text_in_image:
+  kind: forbidden
+alt:
+  kind: decorative
+thresholds:
+  kind: from_visual_system
+provenance:
+  asset_sha256: a0c985b46a58c60b0db92ef951994fc2bff66f5b51f817b890240a917af68ed3
+  spec_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81
+  source: generated
+  ai_generated: false
+  recipe_sha256: b1173b23c56839e108cf789ef3545dff11d0a92c5ed63223849b1b9a48fa0e1f
+  imagery_sha256: 4640a0de5eb6e934121f6615843871f4bfd33a023197946cb4577ac542e75c81

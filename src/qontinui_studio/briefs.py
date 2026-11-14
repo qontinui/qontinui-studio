@@ -13,7 +13,7 @@ from qontinui_studio import postprocess
 from qontinui_studio.errors import ConfigError
 from qontinui_studio.library import TAG_PATTERN, is_tag
 from qontinui_studio.providers import ProviderInventory
-from qontinui_studio.sites import ID_PATTERN, Site
+from qontinui_studio.sites import ID_PATTERN, SLOT_PATTERN, Site
 
 
 class Target(BaseModel):
@@ -24,7 +24,7 @@ class Target(BaseModel):
     # All three become path components of variant/published files, so they
     # share the id pattern (no separators, no "..", no NUL).
     site: str | None = Field(default=None, pattern=ID_PATTERN)
-    slot: str | None = Field(default=None, pattern=ID_PATTERN)
+    slot: str | None = Field(default=None, pattern=SLOT_PATTERN)
     campaign: str | None = Field(default=None, pattern=ID_PATTERN)
 
     @model_validator(mode="after")

@@ -13,9 +13,13 @@ Two writers, one reader:
   does not read as marked raises :class:`MarkerError`.
 * :func:`save_options` gives Pillow the arguments that embed the packet when a
   derivative is encoded (PNG via ``pnginfo``, WebP/AVIF/JPEG via ``xmp``).
+* :func:`mark_svg` writes it into an SVG document (a vtracer trace, plan
+  2026-10-13 Phase 19) as an ``x:xmpmeta`` element inside the root's
+  ``<metadata>``, the container XMP Part 3 names for SVG.
 * :func:`is_marked` reads the format's REAL XMP container — a PNG ``iTXt``
   chunk, a JPEG ``APP1`` segment (parsed here), a WebP/AVIF XMP item (through
-  Pillow) — never a ``tEXt`` chunk that merely borrows the keyword. It requires
+  Pillow), an SVG root's ``<metadata>`` — never a ``tEXt`` chunk that merely
+  borrows the keyword, nor an ``xmpmeta`` anywhere else in an SVG. It requires
   exactly one packet, whose ``DigitalSourceType`` property is the marker.
 
 Packets are parsed as XML (stdlib expat, with every DTD and entity declaration
@@ -62,6 +66,11 @@ XMP_PACKET = (
     "</rdf:RDF></x:xmpmeta>"
     '<?xpacket end="w"?>'
 ).encode()
+
+SVG_NS = "http://www.w3.org/2000/svg"
+_SVG_ROOT = f"{{{SVG_NS}}}svg"
+_SVG_METADATA = f"{{{SVG_NS}}}metadata"
+_XMPMETA = f"{{{_X_NS}}}xmpmeta"
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_XMP_KEYWORD = "XML:com.adobe.xmp"
@@ -214,7 +223,8 @@ def bytes_are_marked(data: bytes) -> bool:
     trainedAlgorithmicMedia. Two packets are ambiguous — readers disagree on
     which one wins — so they never count as marked."""
     try:
-        packets = _packets(data)
+        svg = svg_root(data)
+        packets = _svg_packets(svg) if svg is not None else _packets(data)
         if packets is None:
             with Image.open(io.BytesIO(data)) as img:
                 raw = img.info.get("xmp")
@@ -224,6 +234,56 @@ def bytes_are_marked(data: bytes) -> bool:
     except (MarkerError, UnidentifiedImageError, OSError, SyntaxError, ValueError):
         return False
     return len(packets) == 1 and _declares(packets[0])
+
+
+def svg_root(data: bytes) -> ET.Element | None:
+    """The root of an SVG document (parsed with every DTD and entity refused),
+    or None when ``data`` is not one."""
+    if data.lstrip()[:1] != b"<":
+        return None
+    root = _parse_packet(data)
+    return root if root is not None and root.tag == _SVG_ROOT else None
+
+
+def _svg_packets(root: ET.Element) -> list[bytes]:
+    """Every ``x:xmpmeta`` packet in the root's own ``<metadata>`` children."""
+    return [ET.tostring(x) for meta in root.findall(_SVG_METADATA) for x in meta.findall(_XMPMETA)]
+
+
+def serialise_svg(root: ET.Element) -> str:
+    """An SVG document's text, with SVG as the default namespace (unprefixed
+    elements, as browsers and every SVG tool expect) and the XMP prefixes
+    named. ElementTree's ``default_namespace`` cannot serialise SVG's
+    unqualified attributes, so the empty prefix is registered instead."""
+    for prefix, uri in (("", SVG_NS), ("x", _X_NS), ("rdf", RDF_NS), ("Iptc4xmpExt", IPTC_EXT_NS)):
+        ET.register_namespace(prefix, uri)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
+
+
+def mark_svg(text: str) -> str:
+    """``text`` (an SVG document) with the marker in its root ``<metadata>``,
+    merged into the packet already there (the document keeps exactly one).
+    Read back; raises :class:`MarkerError` for a document that is not SVG or
+    does not read as marked afterwards."""
+    root = svg_root(text.encode("utf-8"))
+    if root is None:
+        raise MarkerError("not an SVG document")
+    metas = root.findall(_SVG_METADATA)
+    existing = [x for meta in metas for x in meta.findall(_XMPMETA)]
+    packet = _parse_packet(merged_packet(ET.tostring(existing[-1]) if existing else None))
+    if packet is None:  # merged_packet always returns a well-formed packet
+        raise MarkerError("the merged XMP packet does not parse")
+    for meta in metas:
+        for x in meta.findall(_XMPMETA):
+            meta.remove(x)
+    holder = metas[0] if metas else ET.Element(_SVG_METADATA)
+    holder.append(packet)
+    if not metas:
+        root.insert(0, holder)
+    out = serialise_svg(root)
+    if not bytes_are_marked(out.encode("utf-8")):
+        raise MarkerError("the AI-generated marker did not read back after marking the SVG")
+    return out
 
 
 def is_marked(path: Path) -> bool:

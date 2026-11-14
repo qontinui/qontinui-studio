@@ -1,0 +1,30 @@
+# qontinui-web as a `studio compile` target (plan
+# 2026-10-13-image-generation-and-visual-judgment, Phase 19). Its image slots
+# are the ImageSlotSpec files under frontend/image-slots/ (Phase 14); compiled
+# derivatives and studio-manifest.json land in frontend/public/image-slots/,
+# which Next serves at /image-slots/.
+#
+#   poetry run studio compile --target qontinui-web --slots <worktree>/frontend/image-slots
+#
+# D7 is required with no waiver. This target declares no preview yet (the four
+# fields below: the preview's OWN UI Bridge, never the runner's or the
+# supervisor's), so every publication to it is REFUSED with
+# d7_page_health not_configured until one is declared — exactly as for a site.
+id: qontinui-web
+name: qontinui-web
+repo: qontinui/qontinui-web
+commercial: true
+# D5: the fleet's own GPU is this tenant's default provider; the dial's
+# local_only admits it alone.
+providers: [local-gpu]
+candidates: 4
+# ui_bridge_url:
+# preview_url:
+# preview_dir:
+# preview_manifest_url:
+#
+# Per-slot settings: a route other than the role's default, a lucide icon, a
+# facade recipe, a master width, a look (prompt fragment):
+# slots:
+#   settings.avatar: {route: lucide, icon: circle-user}
+#   onboarding.connect-runner: {route: svg}
