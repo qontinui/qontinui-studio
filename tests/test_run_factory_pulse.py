@@ -126,13 +126,13 @@ def test_a_dirty_tree_is_left_alone_and_the_current_tree_runs(
     seed, checkout, stubs = setup
     commit_script(seed, "two")
     git(seed, "push", "-q", "origin", "main")
-    (checkout / "notes.txt").write_text("a peer's work")
+    (checkout / "scenes" / ".keep").write_text("a peer's work")
     head = git(checkout, "rev-parse", "HEAD")
     done, _ = run(checkout, stubs, tmp_path)
     assert done.returncode == 0, done.stderr
     assert "uncommitted changes" in done.stderr and "version one" in done.stderr
     assert git(checkout, "rev-parse", "HEAD") == head
-    assert (checkout / "notes.txt").read_text() == "a peer's work"
+    assert (checkout / "scenes" / ".keep").read_text() == "a peer's work"
     assert git(checkout, "stash", "list") == ""
 
 
@@ -218,3 +218,125 @@ def test_an_inherited_git_dir_does_not_redirect_the_update(
     done, _ = run(checkout, stubs, tmp_path, {"GIT_DIR": str(elsewhere / ".git")})
     assert done.returncode == 0, done.stderr
     assert "fast-forwarded main" in done.stderr and "version two" in done.stderr
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_untracked_files_do_not_block_the_fast_forward(
+    setup: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """The runner drops untracked .claude/ tooling into every checkout; that
+    alone kept the primary 30 commits behind (2026-11-09 run)."""
+    seed, checkout, stubs = setup
+    commit_script(seed, "two")
+    git(seed, "push", "-q", "origin", "main")
+    (checkout / ".claude" / "skills").mkdir(parents=True)
+    (checkout / ".claude" / "skills" / "x.md").write_text("runner-provisioned")
+    done, _ = run(checkout, stubs, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "fast-forwarded main" in done.stderr and "version two" in done.stderr
+    assert (checkout / ".claude" / "skills" / "x.md").read_text() == "runner-provisioned"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_an_untracked_file_upstream_would_add_is_never_overwritten(
+    setup: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    seed, checkout, stubs = setup
+    (seed / "notes.txt").write_text("upstream")
+    git(seed, "add", "notes.txt")
+    git(seed, "commit", "-q", "-m", "add notes")
+    git(seed, "push", "-q", "origin", "main")
+    (checkout / "notes.txt").write_text("a peer's work")
+    head = git(checkout, "rev-parse", "HEAD")
+    done, _ = run(checkout, stubs, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "fast-forward to origin/main failed" in done.stderr
+    assert (checkout / "notes.txt").read_text() == "a peer's work"
+    assert git(checkout, "rev-parse", "HEAD") == head
+
+
+def _path_without_poetry(tmp_path: Path, stubs: Path) -> str:
+    """A PATH with every tool this machine's PATH offers (git, bash, coreutils,
+    ...) plus the pnpm stub, minus any poetry - independent of where the host
+    keeps either."""
+    only = tmp_path / "no-poetry-bin"
+    only.mkdir()
+    shutil.copy2(stubs / "pnpm", only / "pnpm")
+    for d in os.environ["PATH"].split(os.pathsep):
+        if not d or not os.path.isdir(d):
+            continue
+        for entry in os.scandir(d):
+            target = only / entry.name
+            if entry.name in ("poetry", "pnpm") or target.exists():
+                continue
+            if os.access(entry.path, os.X_OK) and not entry.is_dir():
+                target.symlink_to(entry.path)
+    return str(only)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_poetry_off_path_is_found_in_the_user_local_bin(
+    setup: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """The runner's service PATH has no ~/.local/bin, where poetry's installer
+    puts it: every scheduled run died with exit 127 until this."""
+    _, checkout, stubs = setup
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    shutil.copy2(stubs / "poetry", home / ".local" / "bin" / "poetry")
+    done, calls = run(
+        checkout,
+        stubs,
+        tmp_path,
+        {"PATH": _path_without_poetry(tmp_path, stubs), "HOME": str(home)},
+    )
+    assert done.returncode == 0, done.stderr
+    assert "poetry is not on PATH; using" in done.stderr
+    assert calls.count("poetry install") == 1 and "poetry run studio --root" in calls
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_poetry_found_nowhere_exits_4_naming_it(
+    setup: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _, checkout, stubs = setup
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    done, calls = run(
+        checkout,
+        stubs,
+        tmp_path,
+        {
+            "PATH": _path_without_poetry(tmp_path, stubs),
+            "HOME": str(home),
+            "POETRY_HOME": "",
+        },
+    )
+    assert done.returncode == 4, done.stderr
+    assert "poetry not found" in done.stderr
+    assert "poetry" not in calls
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_an_unset_home_does_not_end_the_run(setup: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    _, checkout, stubs = setup
+    log = tmp_path / "calls.log"
+    log.write_text("")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "HOME"}
+    env.update(
+        PATH=f"{stubs}:{os.environ['PATH']}",
+        STUB_LOG=str(log),
+        GIT_CONFIG_GLOBAL="/dev/null",
+        XDG_CONFIG_HOME=str(tmp_path / "config"),
+    )
+    env.pop("STUDIO_PULSE_ENV_FILE", None)
+    done = subprocess.run(
+        ["bash", str(checkout / "scripts" / "run-factory-pulse.sh")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "poetry run studio --root" in log.read_text()

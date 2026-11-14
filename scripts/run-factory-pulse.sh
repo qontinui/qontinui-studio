@@ -22,9 +22,20 @@
 # why and carries on with the current tree. It never stashes, resets or
 # rebases: someone else's work in a shared checkout is not its to move.
 #
+# Untracked files do not count as uncommitted changes: a shared checkout
+# routinely holds tooling the runner drops there (.claude/ skills and
+# commands), and `git merge --ff-only` already refuses to overwrite an
+# untracked file, so a peer's untracked work is never touched either way.
+#
+# Tools: the runner-scheduler task inherits the runner's service PATH, which
+# need not include a user-local install (poetry's installer puts it in
+# ~/.local/bin). So poetry and pnpm are looked up on PATH first, then in their
+# installers' default homes; a tool found in neither stops the run with exit 4
+# naming it, instead of a bare `command not found` (exit 127).
+#
 # Exit: the pulse's own (0 = it ran: ready, blocked or no-export; 1 = failed),
 # or the failing setup step's (2 = a linked scenes/node_modules was refused,
-# 3 = the pulse.env file was refused).
+# 3 = the pulse.env file was refused, 4 = poetry or pnpm was not found).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,7 +52,7 @@ keep_current() {
         note "not updating: the checkout is on ${branch:-a detached HEAD}, not main; running the current tree"
         return
     fi
-    if ! status="$(git status --porcelain)"; then
+    if ! status="$(git status --porcelain --untracked-files=no)"; then
         note "not updating: git status failed; running the current tree"
         return
     fi
@@ -82,6 +93,30 @@ fi
 # shellcheck source=scripts/lib/pulse-env.sh
 . "$here/scripts/lib/pulse-env.sh"
 pulse_env_load || exit 3
+
+# require_tool NAME DIR... - put NAME on PATH: as found, else from the first
+# DIR holding an executable NAME; exit 4 when there is none.
+require_tool() {
+    local name="$1" dir
+    shift
+    command -v "$name" > /dev/null 2>&1 && return 0
+    for dir in "$@"; do
+        [ -n "$dir" ] || continue
+        if [ -x "$dir/$name" ]; then
+            PATH="$dir:$PATH"
+            export PATH
+            note "$name is not on PATH; using $dir/$name"
+            return 0
+        fi
+    done
+    note "$name not found on PATH ($PATH) or in: $*"
+    exit 4
+}
+# A service environment may leave HOME unset; set -u must not end the run there.
+require_tool poetry ${POETRY_HOME:+"$POETRY_HOME/bin"} ${HOME:+"$HOME/.local/bin"} \
+    ${HOME:+"$HOME/.local/share/pypoetry/venv/bin"}
+require_tool pnpm ${PNPM_HOME:+"$PNPM_HOME"} ${HOME:+"$HOME/.local/share/pnpm"} \
+    ${HOME:+"$HOME/.local/bin"}
 
 poetry install --no-interaction --no-ansi --quiet
 (
